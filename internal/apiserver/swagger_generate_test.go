@@ -30,20 +30,22 @@ import (
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/hyperledger/firefly-common/pkg/config"
 	"github.com/hyperledger/firefly/internal/coreconfig"
-	"github.com/hyperledger/firefly/pkg/config"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestDownloadSwaggerYAML(t *testing.T) {
+	coreconfig.Reset()
 	config.Set(coreconfig.APIOASPanicOnMissingDescription, true)
 	as := &apiServer{}
-	handler := as.apiWrapper(as.swaggerHandler(as.swaggerGenerator(routes, "http://localhost:5000")))
+	hf := as.handlerFactory()
+	handler := hf.APIWrapper(as.swaggerHandler(as.swaggerGenerator(routes, "http://localhost:5000")))
 	s := httptest.NewServer(http.HandlerFunc(handler))
 	defer s.Close()
 
 	res, err := http.Get(fmt.Sprintf("http://%s/api/swagger.yaml", s.Listener.Addr()))
-	assert.NoError(t, err)
+	assert.Nil(t, err)
 	b, _ := ioutil.ReadAll(res.Body)
 	assert.Equal(t, 200, res.StatusCode, string(b))
 	doc, err := openapi3.NewLoader().LoadFromData(b)

@@ -21,11 +21,13 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -45,6 +47,8 @@ var (
 		"tx_id",
 		"blockchain_event",
 		"created",
+		"message_id",
+		"message_hash",
 	}
 	tokenApprovalFilterFieldMap = map[string]string{
 		"localid":         "local_id",
@@ -57,21 +61,27 @@ var (
 		"tx.id":           "tx_id",
 		"blockchainevent": "blockchain_event",
 		"created":         "created",
+		"message":         "message_id",
+		"messagehash":     "message_hash",
 	}
 )
 
-func (s *SQLCommon) UpsertTokenApproval(ctx context.Context, approval *fftypes.TokenApproval) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+const tokenapprovalTable = "tokenapproval"
+
+func (s *SQLCommon) UpsertTokenApproval(ctx context.Context, approval *core.TokenApproval) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
 
-	defer s.rollbackTx(ctx, tx, autoCommit)
-	rows, _, err := s.queryTx(ctx, tx,
+	defer s.RollbackTx(ctx, tx, autoCommit)
+	rows, _, err := s.QueryTx(ctx, tokenapprovalTable, tx,
 		sq.Select("seq").
-			From("tokenapproval").
-			Where(sq.Eq{"subject": approval.Subject}).
-			Where(sq.Eq{"pool_id": approval.Pool}),
+			From(tokenapprovalTable).
+			Where(sq.Eq{
+				"namespace":   approval.Namespace,
+				"protocol_id": approval.ProtocolID,
+			}),
 	)
 	if err != nil {
 		return err
@@ -80,33 +90,33 @@ func (s *SQLCommon) UpsertTokenApproval(ctx context.Context, approval *fftypes.T
 	rows.Close()
 
 	if existing {
-		if _, err = s.updateTx(ctx, tx,
-			sq.Update("tokenapproval").
+		if _, err = s.UpdateTx(ctx, tokenapprovalTable, tx,
+			sq.Update(tokenapprovalTable).
 				Set("local_id", approval.LocalID).
-				Set("protocol_id", approval.ProtocolID).
+				Set("subject", approval.Subject).
 				Set("active", approval.Active).
 				Set("key", approval.Key).
 				Set("operator_key", approval.Operator).
 				Set("pool_id", approval.Pool).
 				Set("connector", approval.Connector).
-				Set("namespace", approval.Namespace).
 				Set("approved", approval.Approved).
 				Set("info", approval.Info).
 				Set("tx_type", approval.TX.Type).
 				Set("tx_id", approval.TX.ID).
 				Set("blockchain_event", approval.BlockchainEvent).
-				Where(sq.Eq{"subject": approval.Subject}).
-				Where(sq.Eq{"pool_id": approval.Pool}),
+				Set("message_id", approval.Message).
+				Set("message_hash", approval.MessageHash).
+				Where(sq.Eq{"protocol_id": approval.ProtocolID}),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenApprovals, fftypes.ChangeEventTypeUpdated, approval.Namespace, approval.LocalID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenApprovals, core.ChangeEventTypeUpdated, approval.Namespace, approval.LocalID)
 			},
 		); err != nil {
 			return err
 		}
 	} else {
 		approval.Created = fftypes.Now()
-		if _, err = s.insertTx(ctx, tx,
-			sq.Insert("tokenapproval").
+		if _, err = s.InsertTx(ctx, tokenapprovalTable, tx,
+			sq.Insert(tokenapprovalTable).
 				Columns(tokenApprovalColumns...).
 				Values(
 					approval.LocalID,
@@ -124,19 +134,21 @@ func (s *SQLCommon) UpsertTokenApproval(ctx context.Context, approval *fftypes.T
 					approval.TX.ID,
 					approval.BlockchainEvent,
 					approval.Created,
+					approval.Message,
+					approval.MessageHash,
 				),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenApprovals, fftypes.ChangeEventTypeCreated, approval.Namespace, approval.LocalID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenApprovals, core.ChangeEventTypeCreated, approval.Namespace, approval.LocalID)
 			},
 		); err != nil {
 			return err
 		}
 	}
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) tokenApprovalResult(ctx context.Context, row *sql.Rows) (*fftypes.TokenApproval, error) {
-	approval := fftypes.TokenApproval{}
+func (s *SQLCommon) tokenApprovalResult(ctx context.Context, row *sql.Rows) (*core.TokenApproval, error) {
+	approval := core.TokenApproval{}
 	err := row.Scan(
 		&approval.LocalID,
 		&approval.ProtocolID,
@@ -153,17 +165,19 @@ func (s *SQLCommon) tokenApprovalResult(ctx context.Context, row *sql.Rows) (*ff
 		&approval.TX.ID,
 		&approval.BlockchainEvent,
 		&approval.Created,
+		&approval.Message,
+		&approval.MessageHash,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "tokenapproval")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, tokenapprovalTable)
 	}
 	return &approval, nil
 }
 
-func (s *SQLCommon) getTokenApprovalPred(ctx context.Context, desc string, pred interface{}) (*fftypes.TokenApproval, error) {
-	rows, _, err := s.query(ctx,
+func (s *SQLCommon) getTokenApprovalPred(ctx context.Context, desc string, pred interface{}) (*core.TokenApproval, error) {
+	rows, _, err := s.Query(ctx, tokenapprovalTable,
 		sq.Select(tokenApprovalColumns...).
-			From("tokenapproval").
+			From(tokenapprovalTable).
 			Where(pred),
 	)
 	if err != nil {
@@ -184,29 +198,32 @@ func (s *SQLCommon) getTokenApprovalPred(ctx context.Context, desc string, pred 
 	return approval, nil
 }
 
-func (s *SQLCommon) GetTokenApprovalByID(ctx context.Context, localID *fftypes.UUID) (*fftypes.TokenApproval, error) {
-	return s.getTokenApprovalPred(ctx, localID.String(), sq.Eq{"local_id": localID})
+func (s *SQLCommon) GetTokenApprovalByID(ctx context.Context, namespace string, localID *fftypes.UUID) (*core.TokenApproval, error) {
+	return s.getTokenApprovalPred(ctx, localID.String(), sq.Eq{"local_id": localID, "namespace": namespace})
 }
 
-func (s *SQLCommon) GetTokenApprovalByProtocolID(ctx context.Context, poolID *fftypes.UUID, protocolID string) (*fftypes.TokenApproval, error) {
+func (s *SQLCommon) GetTokenApprovalByProtocolID(ctx context.Context, namespace, connector, protocolID string) (*core.TokenApproval, error) {
 	return s.getTokenApprovalPred(ctx, protocolID, sq.And{
-		sq.Eq{"pool_id": poolID},
+		sq.Eq{"namespace": namespace},
+		sq.Eq{"connector": connector},
 		sq.Eq{"protocol_id": protocolID},
 	})
 }
 
-func (s *SQLCommon) GetTokenApprovals(ctx context.Context, filter database.Filter) (approvals []*fftypes.TokenApproval, fr *database.FilterResult, err error) {
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(tokenApprovalColumns...).From("tokenapproval"), filter, tokenApprovalFilterFieldMap, []interface{}{"seq"})
+func (s *SQLCommon) GetTokenApprovals(ctx context.Context, namespace string, filter ffapi.Filter) (approvals []*core.TokenApproval, fr *ffapi.FilterResult, err error) {
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(tokenApprovalColumns...).From(tokenapprovalTable),
+		filter, tokenApprovalFilterFieldMap, []interface{}{"seq"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, tokenapprovalTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
+	approvals = []*core.TokenApproval{}
 	for rows.Next() {
 		d, err := s.tokenApprovalResult(ctx, rows)
 		if err != nil {
@@ -215,30 +232,30 @@ func (s *SQLCommon) GetTokenApprovals(ctx context.Context, filter database.Filte
 		approvals = append(approvals, d)
 	}
 
-	return approvals, s.queryRes(ctx, tx, "tokenapproval", fop, fi), err
+	return approvals, s.QueryRes(ctx, tokenapprovalTable, tx, fop, fi), err
 }
 
-func (s *SQLCommon) UpdateTokenApprovals(ctx context.Context, filter database.Filter, update database.Update) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+func (s *SQLCommon) UpdateTokenApprovals(ctx context.Context, filter ffapi.Filter, update ffapi.Update) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	query, err := s.buildUpdate(sq.Update("tokenapproval"), update, tokenApprovalFilterFieldMap)
-	if err != nil {
-		return err
-	}
-
-	query, err = s.filterUpdate(ctx, query, filter, tokenApprovalFilterFieldMap)
+	query, err := s.BuildUpdate(sq.Update(tokenapprovalTable), update, tokenApprovalFilterFieldMap)
 	if err != nil {
 		return err
 	}
 
-	_, err = s.updateTx(ctx, tx, query, nil /* no change events filter based update */)
+	query, err = s.FilterUpdate(ctx, query, filter, tokenApprovalFilterFieldMap)
 	if err != nil {
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	_, err = s.UpdateTx(ctx, tokenapprovalTable, tx, query, nil /* no change events filter based update */)
+	if err != nil {
+		return err
+	}
+
+	return s.CommitTx(ctx, tx, autoCommit)
 }

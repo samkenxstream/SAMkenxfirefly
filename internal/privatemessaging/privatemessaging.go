@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,91 +20,88 @@ import (
 	"context"
 	"sync"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
 	"github.com/hyperledger/firefly/internal/batch"
-	"github.com/hyperledger/firefly/internal/batchpin"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
 	"github.com/hyperledger/firefly/internal/data"
 	"github.com/hyperledger/firefly/internal/identity"
 	"github.com/hyperledger/firefly/internal/metrics"
+	"github.com/hyperledger/firefly/internal/multiparty"
 	"github.com/hyperledger/firefly/internal/operations"
-	"github.com/hyperledger/firefly/internal/retry"
 	"github.com/hyperledger/firefly/internal/syncasync"
-	"github.com/hyperledger/firefly/internal/sysmessaging"
 	"github.com/hyperledger/firefly/pkg/blockchain"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
 	"github.com/hyperledger/firefly/pkg/dataexchange"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
-	"github.com/karlseguin/ccache"
 )
 
 const pinnedPrivateDispatcherName = "pinned_private"
 const unpinnedPrivateDispatcherName = "unpinned_private"
 
 type Manager interface {
-	fftypes.Named
+	core.Named
 	GroupManager
 
-	Start() error
-	NewMessage(ns string, msg *fftypes.MessageInOut) sysmessaging.MessageSender
-	SendMessage(ctx context.Context, ns string, in *fftypes.MessageInOut, waitConfirm bool) (out *fftypes.Message, err error)
-	RequestReply(ctx context.Context, ns string, request *fftypes.MessageInOut) (reply *fftypes.MessageInOut, err error)
+	NewMessage(msg *core.MessageInOut) syncasync.Sender
+	SendMessage(ctx context.Context, in *core.MessageInOut, waitConfirm bool) (out *core.Message, err error)
+	RequestReply(ctx context.Context, request *core.MessageInOut) (reply *core.MessageInOut, err error)
 
 	// From operations.OperationHandler
-	PrepareOperation(ctx context.Context, op *fftypes.Operation) (*fftypes.PreparedOperation, error)
-	RunOperation(ctx context.Context, op *fftypes.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error)
+	PrepareOperation(ctx context.Context, op *core.Operation) (*core.PreparedOperation, error)
+	RunOperation(ctx context.Context, op *core.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error)
 }
 
 type privateMessaging struct {
 	groupManager
 
 	ctx                   context.Context
+	namespace             *core.Namespace
 	database              database.Plugin
 	identity              identity.Manager
 	exchange              dataexchange.Plugin
 	blockchain            blockchain.Plugin
-	batch                 batch.Manager
 	data                  data.Manager
 	syncasync             syncasync.Bridge
-	batchpin              batchpin.Submitter
+	multiparty            multiparty.Manager
 	retry                 retry.Retry
-	localNodeName         string
-	localNodeID           *fftypes.UUID // lookup and cached on first use, as might not be registered at startup
 	maxBatchPayloadLength int64
 	metrics               metrics.Manager
 	operations            operations.Manager
-	orgFirstNodes         map[fftypes.UUID]*fftypes.Identity
+	orgFirstNodes         map[string]*core.Identity
 }
 
 type blobTransferTracker struct {
 	dataID   *fftypes.UUID
 	blobHash *fftypes.Bytes32
-	op       *fftypes.PreparedOperation
+	op       *core.PreparedOperation
 }
 
-func NewPrivateMessaging(ctx context.Context, di database.Plugin, im identity.Manager, dx dataexchange.Plugin, bi blockchain.Plugin, ba batch.Manager, dm data.Manager, sa syncasync.Bridge, bp batchpin.Submitter, mm metrics.Manager, om operations.Manager) (Manager, error) {
-	if di == nil || im == nil || dx == nil || bi == nil || ba == nil || dm == nil || mm == nil || om == nil {
-		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError)
+func NewPrivateMessaging(ctx context.Context, ns *core.Namespace, di database.Plugin, dx dataexchange.Plugin, bi blockchain.Plugin, im identity.Manager, ba batch.Manager, dm data.Manager, sa syncasync.Bridge, mult multiparty.Manager, mm metrics.Manager, om operations.Manager, cacheManager cache.Manager) (Manager, error) {
+	if di == nil || im == nil || dx == nil || bi == nil || ba == nil || dm == nil || mm == nil || om == nil || mult == nil {
+		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError, "PrivateMessaging")
 	}
 
 	pm := &privateMessaging{
-		ctx:           ctx,
-		database:      di,
-		identity:      im,
-		exchange:      dx,
-		blockchain:    bi,
-		batch:         ba,
-		data:          dm,
-		syncasync:     sa,
-		batchpin:      bp,
-		localNodeName: config.GetString(coreconfig.NodeName),
+		ctx:        ctx,
+		namespace:  ns,
+		database:   di,
+		identity:   im,
+		exchange:   dx,
+		blockchain: bi,
+		data:       dm,
+		syncasync:  sa,
+		multiparty: mult,
 		groupManager: groupManager{
-			database:      di,
-			data:          dm,
-			groupCacheTTL: config.GetDuration(coreconfig.GroupCacheTTL),
+			namespace: ns,
+			database:  di,
+			identity:  im,
+			data:      dm,
 		},
 		retry: retry.Retry{
 			InitialDelay: config.GetDuration(coreconfig.PrivateMessagingRetryInitDelay),
@@ -114,16 +111,25 @@ func NewPrivateMessaging(ctx context.Context, di database.Plugin, im identity.Ma
 		maxBatchPayloadLength: config.GetByteSize(coreconfig.PrivateMessagingBatchPayloadLimit),
 		metrics:               mm,
 		operations:            om,
-		orgFirstNodes:         make(map[fftypes.UUID]*fftypes.Identity),
+		orgFirstNodes:         make(map[string]*core.Identity),
 	}
-	pm.groupManager.groupCache = ccache.New(
-		// We use a LRU cache with a size-aware max
-		ccache.Configure().
-			MaxSize(config.GetByteSize(coreconfig.GroupCacheSize)),
+
+	groupCache, err := cacheManager.GetCache(
+		cache.NewCacheConfig(
+			ctx,
+			coreconfig.CacheGroupLimit,
+			coreconfig.CacheGroupTTL,
+			ns.Name,
+		),
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	pm.groupManager.groupCache = groupCache
 
 	bo := batch.DispatcherOptions{
-		BatchType:      fftypes.BatchTypePrivate,
+		BatchType:      core.BatchTypePrivate,
 		BatchMaxSize:   config.GetUint(coreconfig.PrivateMessagingBatchSize),
 		BatchMaxBytes:  pm.maxBatchPayloadLength,
 		BatchTimeout:   config.GetDuration(coreconfig.PrivateMessagingBatchTimeout),
@@ -131,24 +137,32 @@ func NewPrivateMessaging(ctx context.Context, di database.Plugin, im identity.Ma
 	}
 
 	ba.RegisterDispatcher(pinnedPrivateDispatcherName,
-		fftypes.TransactionTypeBatchPin,
-		[]fftypes.MessageType{
-			fftypes.MessageTypeGroupInit,
-			fftypes.MessageTypePrivate,
-			fftypes.MessageTypeTransferPrivate,
+		core.TransactionTypeBatchPin,
+		[]core.MessageType{
+			core.MessageTypeGroupInit,
+			core.MessageTypePrivate,
+			core.MessageTypeDeprecatedTransferPrivate,
+			core.MessageTypeDeprecatedApprovalPrivate,
+		},
+		pm.dispatchPinnedBatch, bo)
+
+	ba.RegisterDispatcher(pinnedPrivateDispatcherName,
+		core.TransactionTypeContractInvokePin,
+		[]core.MessageType{
+			core.MessageTypePrivate,
 		},
 		pm.dispatchPinnedBatch, bo)
 
 	ba.RegisterDispatcher(unpinnedPrivateDispatcherName,
-		fftypes.TransactionTypeUnpinned,
-		[]fftypes.MessageType{
-			fftypes.MessageTypePrivate,
+		core.TransactionTypeUnpinned,
+		[]core.MessageType{
+			core.MessageTypePrivate,
 		},
 		pm.dispatchUnpinnedBatch, bo)
 
-	om.RegisterHandler(ctx, pm, []fftypes.OpType{
-		fftypes.OpTypeDataExchangeSendBlob,
-		fftypes.OpTypeDataExchangeSendBatch,
+	om.RegisterHandler(ctx, pm, []core.OpType{
+		core.OpTypeDataExchangeSendBlob,
+		core.OpTypeDataExchangeSendBatch,
 	})
 
 	return pm, nil
@@ -158,27 +172,24 @@ func (pm *privateMessaging) Name() string {
 	return "PrivateMessaging"
 }
 
-func (pm *privateMessaging) Start() error {
-	return pm.exchange.Start()
-}
-
-func (pm *privateMessaging) dispatchPinnedBatch(ctx context.Context, state *batch.DispatchState) error {
-	err := pm.dispatchBatchCommon(ctx, state)
+func (pm *privateMessaging) dispatchPinnedBatch(ctx context.Context, payload *batch.DispatchPayload) error {
+	err := pm.dispatchBatchCommon(ctx, payload)
 	if err != nil {
 		return err
 	}
 
-	log.L(ctx).Infof("Pinning private batch %s with author=%s key=%s group=%s", state.Persisted.ID, state.Persisted.Author, state.Persisted.Key, state.Persisted.Group)
-	return pm.batchpin.SubmitPinnedBatch(ctx, &state.Persisted, state.Pins, "" /* no payloadRef for private */)
+	log.L(ctx).Infof("Pinning private batch %s with author=%s key=%s group=%s", payload.Batch.ID, payload.Batch.Author, payload.Batch.Key, payload.Batch.Group)
+	return pm.multiparty.SubmitBatchPin(ctx, &payload.Batch, payload.Pins, "" /* no payloadRef for private */)
 }
 
-func (pm *privateMessaging) dispatchUnpinnedBatch(ctx context.Context, state *batch.DispatchState) error {
-	return pm.dispatchBatchCommon(ctx, state)
+func (pm *privateMessaging) dispatchUnpinnedBatch(ctx context.Context, payload *batch.DispatchPayload) error {
+	return pm.dispatchBatchCommon(ctx, payload)
 }
 
-func (pm *privateMessaging) dispatchBatchCommon(ctx context.Context, state *batch.DispatchState) error {
-	batch := state.Persisted.GenInflight(state.Messages, state.Data)
-	tw := &fftypes.TransportWrapper{
+func (pm *privateMessaging) dispatchBatchCommon(ctx context.Context, payload *batch.DispatchPayload) error {
+	batch := payload.Batch.GenInflight(payload.Messages, payload.Data)
+	batch.Namespace = pm.namespace.NetworkName
+	tw := &core.TransportWrapper{
 		Batch: batch,
 	}
 
@@ -188,7 +199,7 @@ func (pm *privateMessaging) dispatchBatchCommon(ctx context.Context, state *batc
 		return err
 	}
 
-	if batch.Payload.TX.Type == fftypes.TransactionTypeUnpinned {
+	if !core.IsPinned(batch.Payload.TX.Type) {
 		// In the case of an un-pinned message we cannot be sure the group has been broadcast via the blockchain.
 		// So we have to take the hit of sending it along with every message.
 		tw.Group = group
@@ -197,7 +208,7 @@ func (pm *privateMessaging) dispatchBatchCommon(ctx context.Context, state *batc
 	return pm.sendData(ctx, tw, nodes)
 }
 
-func (pm *privateMessaging) prepareBlobTransfers(ctx context.Context, data fftypes.DataArray, txid *fftypes.UUID, node *fftypes.Identity) ([]*blobTransferTracker, error) {
+func (pm *privateMessaging) prepareBlobTransfers(ctx context.Context, data core.DataArray, txid *fftypes.UUID, node *core.Identity) ([]*blobTransferTracker, error) {
 
 	operations := make([]*blobTransferTracker, 0)
 
@@ -208,21 +219,22 @@ func (pm *privateMessaging) prepareBlobTransfers(ctx context.Context, data fftyp
 				if d.Blob.Hash == nil {
 					return i18n.NewError(ctx, coremsgs.MsgDataMissingBlobHash, d.ID)
 				}
-
-				blob, err := pm.database.GetBlobMatchingHash(ctx, d.Blob.Hash)
+				fb := database.BlobQueryFactory.NewFilter(ctx)
+				blobs, _, err := pm.database.GetBlobs(ctx, pm.namespace.Name, fb.And(fb.Eq("data_id", d.ID), fb.Eq("hash", d.Blob.Hash)))
 				if err != nil {
 					return err
 				}
-				if blob == nil {
-					return i18n.NewError(ctx, coremsgs.MsgBlobNotFound, d.Blob)
+				if len(blobs) == 0 || blobs[0] == nil {
+					return i18n.NewError(ctx, coremsgs.MsgBlobNotFound, d.Blob.Hash)
 				}
+				blob := blobs[0]
 
-				op := fftypes.NewOperation(
+				op := core.NewOperation(
 					pm.exchange,
-					d.Namespace,
+					pm.namespace.Name,
 					txid,
-					fftypes.OpTypeDataExchangeSendBlob)
-				addTransferBlobInputs(op, node.ID, blob.Hash)
+					core.OpTypeDataExchangeSendBlob)
+				addTransferBlobInputs(op, node.ID, blob.Hash, d.ID)
 				if err = pm.operations.AddOrReuseOperation(ctx, op); err != nil {
 					return err
 				}
@@ -263,12 +275,12 @@ func (pm *privateMessaging) submitBlobTransfersToDX(ctx context.Context, tracker
 	return firstError
 }
 
-func (pm *privateMessaging) sendData(ctx context.Context, tw *fftypes.TransportWrapper, nodes []*fftypes.Identity) (err error) {
+func (pm *privateMessaging) sendData(ctx context.Context, tw *core.TransportWrapper, nodes []*core.Identity) (err error) {
 	l := log.L(ctx)
 	batch := tw.Batch
 
-	// Lookup the local org
-	localOrg, err := pm.identity.GetNodeOwnerOrg(ctx)
+	// Lookup the local node
+	localNode, err := pm.identity.GetLocalNode(ctx)
 	if err != nil {
 		return err
 	}
@@ -276,15 +288,15 @@ func (pm *privateMessaging) sendData(ctx context.Context, tw *fftypes.TransportW
 	// Write it to the dataexchange for each member
 	for i, node := range nodes {
 
-		if node.Parent.Equals(localOrg.ID) {
-			l.Debugf("Skipping send of batch for local node %s:%s for group=%s node=%s (%d/%d)", batch.Namespace, batch.ID, batch.Group, node.ID, i+1, len(nodes))
+		if node.ID.Equals(localNode.ID) {
+			l.Debugf("Skipping send of batch for local node %s for group=%s node=%s (%d/%d)", batch.ID, batch.Group, node.ID, i+1, len(nodes))
 			continue
 		}
 
-		l.Debugf("Sending batch %s:%s to group=%s node=%s (%d/%d)", batch.Namespace, batch.ID, batch.Group, node.ID, i+1, len(nodes))
+		l.Debugf("Sending batch %s to group=%s node=%s (%d/%d)", batch.ID, batch.Group, node.ID, i+1, len(nodes))
 
 		var blobTrackers []*blobTransferTracker
-		var sendBatchOp *fftypes.PreparedOperation
+		var sendBatchOp *core.PreparedOperation
 
 		// Use a DB group for preparing all the operations needed for this batch
 		err := pm.database.RunAsGroup(ctx, func(ctx context.Context) (err error) {
@@ -293,11 +305,11 @@ func (pm *privateMessaging) sendData(ctx context.Context, tw *fftypes.TransportW
 				return err
 			}
 
-			op := fftypes.NewOperation(
+			op := core.NewOperation(
 				pm.exchange,
-				batch.Namespace,
+				pm.namespace.Name,
 				batch.Payload.TX.ID,
-				fftypes.OpTypeDataExchangeSendBatch)
+				core.OpTypeDataExchangeSendBatch)
 			addBatchSendInputs(op, node.ID, batch.Group, batch.ID)
 			if err = pm.operations.AddOrReuseOperation(ctx, op); err != nil {
 				return err

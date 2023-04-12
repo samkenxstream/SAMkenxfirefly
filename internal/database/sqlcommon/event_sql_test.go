@@ -1,4 +1,4 @@
-// Copyright © 2021 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -24,8 +24,9 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -38,23 +39,23 @@ func TestEventE2EWithDB(t *testing.T) {
 
 	// Create a new event entry
 	eventID := fftypes.NewUUID()
-	event := &fftypes.Event{
+	event := &core.Event{
 		ID:         eventID,
 		Namespace:  "ns1",
-		Type:       fftypes.EventTypeMessageConfirmed,
+		Type:       core.EventTypeMessageConfirmed,
 		Reference:  fftypes.NewUUID(),
 		Correlator: fftypes.NewUUID(),
 		Topic:      "topic1",
 		Created:    fftypes.Now(),
 	}
 
-	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, fftypes.ChangeEventTypeCreated, "ns1", eventID, mock.Anything).Return()
+	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, core.ChangeEventTypeCreated, "ns1", eventID, mock.Anything).Return()
 
 	err := s.InsertEvent(ctx, event)
 	assert.NoError(t, err)
 
 	// Check we get the exact same event back
-	eventRead, err := s.GetEventByID(ctx, eventID)
+	eventRead, err := s.GetEventByID(ctx, "ns1", eventID)
 	// The generated sequence will have been added
 	event.Sequence = eventRead.Sequence
 	assert.NoError(t, err)
@@ -69,7 +70,7 @@ func TestEventE2EWithDB(t *testing.T) {
 		fb.Eq("id", eventRead.ID.String()),
 		fb.Eq("reference", eventRead.Reference.String()),
 	)
-	events, res, err := s.GetEvents(ctx, filter.Count(true))
+	events, res, err := s.GetEvents(ctx, "ns1", filter.Count(true))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(events))
 	assert.Equal(t, int64(1), *res.TotalCount)
@@ -81,25 +82,9 @@ func TestEventE2EWithDB(t *testing.T) {
 		fb.Eq("id", eventRead.ID.String()),
 		fb.Eq("reference", fftypes.NewUUID().String()),
 	)
-	events, _, err = s.GetEvents(ctx, filter)
+	events, _, err = s.GetEvents(ctx, "ns1", filter)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(events))
-
-	// Update
-	newUUID := fftypes.NewUUID()
-	up := database.EventQueryFactory.NewUpdate(ctx).
-		Set("reference", newUUID)
-	err = s.UpdateEvent(ctx, eventRead.ID, up)
-	assert.NoError(t, err)
-
-	// Test find updated value
-	filter = fb.And(
-		fb.Eq("id", eventRead.ID.String()),
-		fb.Eq("reference", newUUID),
-	)
-	events, _, err = s.GetEvents(ctx, filter)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(events))
 
 	s.callbacks.AssertExpectations(t)
 }
@@ -107,31 +92,31 @@ func TestEventE2EWithDB(t *testing.T) {
 func TestInsertEventFailBegin(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.InsertEvent(context.Background(), &fftypes.Event{})
-	assert.Regexp(t, "FF10114", err)
+	err := s.InsertEvent(context.Background(), &core.Event{})
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestInsertEventFailLock(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnError(fmt.Errorf("pop"))
+	mock.ExpectExec("<acquire lock ns1>").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
 	eventID := fftypes.NewUUID()
-	err := s.InsertEvent(context.Background(), &fftypes.Event{ID: eventID})
-	assert.Regexp(t, "FF10345", err)
+	err := s.InsertEvent(context.Background(), &core.Event{ID: eventID, Namespace: "ns1"})
+	assert.Regexp(t, "FF00187", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestInsertEventFailInsert(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnResult(driver.ResultNoRows)
+	mock.ExpectExec("<acquire lock ns1>").WillReturnResult(driver.ResultNoRows)
 	mock.ExpectExec("INSERT .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
 	eventID := fftypes.NewUUID()
-	err := s.InsertEvent(context.Background(), &fftypes.Event{ID: eventID})
-	assert.Regexp(t, "FF10116", err)
+	err := s.InsertEvent(context.Background(), &core.Event{ID: eventID, Namespace: "ns1"})
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -139,68 +124,79 @@ func TestInsertEventFailCommit(t *testing.T) {
 	s, mock := newMockProvider().init()
 	eventID := fftypes.NewUUID()
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnResult(driver.ResultNoRows)
+	mock.ExpectExec("<acquire lock ns1>").WillReturnResult(driver.ResultNoRows)
 	mock.ExpectExec("INSERT .*").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit().WillReturnError(fmt.Errorf("pop"))
-	err := s.InsertEvent(context.Background(), &fftypes.Event{ID: eventID})
-	assert.Regexp(t, "FF10119", err)
+	err := s.InsertEvent(context.Background(), &core.Event{ID: eventID, Namespace: "ns1"})
+	assert.Regexp(t, "FF00180", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestInsertEventsPreCommitMultiRowOK(t *testing.T) {
-	s, mock := newMockProvider().init()
-	s.features.MultiRowInsert = true
+	s := newMockProvider()
+	s.multiRowInsert = true
 	s.fakePSQLInsert = true
+	s, mock := s.init()
 
-	ev1 := &fftypes.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
-	ev2 := &fftypes.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
-	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, fftypes.ChangeEventTypeCreated, "ns1", ev1.ID, int64(1001))
-	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, fftypes.ChangeEventTypeCreated, "ns1", ev2.ID, int64(1002))
+	ev1 := &core.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
+	ev2 := &core.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
+	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, core.ChangeEventTypeCreated, "ns1", ev1.ID, int64(1001))
+	s.callbacks.On("OrderedUUIDCollectionNSEvent", database.CollectionEvents, core.ChangeEventTypeCreated, "ns1", ev2.ID, int64(1002))
 
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnResult(driver.ResultNoRows)
-	mock.ExpectQuery("INSERT.*").WillReturnRows(sqlmock.NewRows([]string{sequenceColumn}).
+	mock.ExpectExec("<acquire lock ns1>").WillReturnResult(driver.ResultNoRows)
+	mock.ExpectQuery("INSERT.*").WillReturnRows(sqlmock.NewRows([]string{s.SequenceColumn()}).
 		AddRow(int64(1001)).
 		AddRow(int64(1002)),
 	)
 	mock.ExpectCommit()
-	ctx, tx, autoCommit, err := s.beginOrUseTx(context.Background())
-	tx.preCommitEvents = []*fftypes.Event{ev1, ev2}
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(context.Background())
+	tx.SetPreCommitAccumulator(&eventsPCA{
+		s:      &s.SQLCommon,
+		events: []*core.Event{ev1, ev2},
+	})
 	assert.NoError(t, err)
-	err = s.commitTx(ctx, tx, autoCommit)
+	err = s.CommitTx(ctx, tx, autoCommit)
 	assert.NoError(t, err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 	s.callbacks.AssertExpectations(t)
 }
 
 func TestInsertEventsPreCommitMultiRowFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	s.features.MultiRowInsert = true
+	s := newMockProvider()
+	s.multiRowInsert = true
 	s.fakePSQLInsert = true
-	ev1 := &fftypes.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
+	s, mock := s.init()
+	ev1 := &core.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnResult(driver.ResultNoRows)
+	mock.ExpectExec("<acquire lock ns1>").WillReturnResult(driver.ResultNoRows)
 	mock.ExpectQuery("INSERT.*").WillReturnError(fmt.Errorf("pop"))
-	ctx, tx, autoCommit, err := s.beginOrUseTx(context.Background())
-	tx.preCommitEvents = []*fftypes.Event{ev1}
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(context.Background())
+	tx.SetPreCommitAccumulator(&eventsPCA{
+		s:      &s.SQLCommon,
+		events: []*core.Event{ev1},
+	})
 	assert.NoError(t, err)
-	err = s.commitTx(ctx, tx, autoCommit)
-	assert.Regexp(t, "FF10116", err)
+	err = s.CommitTx(ctx, tx, autoCommit)
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 	s.callbacks.AssertExpectations(t)
 }
 
 func TestInsertEventsPreCommitSingleRowFail(t *testing.T) {
 	s, mock := newMockProvider().init()
-	ev1 := &fftypes.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
+	ev1 := &core.Event{ID: fftypes.NewUUID(), Namespace: "ns1"}
 	mock.ExpectBegin()
-	mock.ExpectExec("LOCK .*").WillReturnResult(driver.ResultNoRows)
+	mock.ExpectExec("<acquire lock ns1>").WillReturnResult(driver.ResultNoRows)
 	mock.ExpectExec("INSERT.*").WillReturnError(fmt.Errorf("pop"))
-	ctx, tx, autoCommit, err := s.beginOrUseTx(context.Background())
-	tx.preCommitEvents = []*fftypes.Event{ev1}
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(context.Background())
+	tx.SetPreCommitAccumulator(&eventsPCA{
+		s:      &s.SQLCommon,
+		events: []*core.Event{ev1},
+	})
 	assert.NoError(t, err)
-	err = s.commitTx(ctx, tx, autoCommit)
-	assert.Regexp(t, "FF10116", err)
+	err = s.CommitTx(ctx, tx, autoCommit)
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 	s.callbacks.AssertExpectations(t)
 }
@@ -209,8 +205,8 @@ func TestGetEventByIDSelectFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	eventID := fftypes.NewUUID()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
-	_, err := s.GetEventByID(context.Background(), eventID)
-	assert.Regexp(t, "FF10115", err)
+	_, err := s.GetEventByID(context.Background(), "ns1", eventID)
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -218,7 +214,7 @@ func TestGetEventByIDNotFound(t *testing.T) {
 	s, mock := newMockProvider().init()
 	eventID := fftypes.NewUUID()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	msg, err := s.GetEventByID(context.Background(), eventID)
+	msg, err := s.GetEventByID(context.Background(), "ns1", eventID)
 	assert.NoError(t, err)
 	assert.Nil(t, msg)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -228,7 +224,7 @@ func TestGetEventByIDScanFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	eventID := fftypes.NewUUID()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("only one"))
-	_, err := s.GetEventByID(context.Background(), eventID)
+	_, err := s.GetEventByID(context.Background(), "ns1", eventID)
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -237,15 +233,15 @@ func TestGetEventsQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
 	f := database.EventQueryFactory.NewFilter(context.Background()).Eq("id", "")
-	_, _, err := s.GetEvents(context.Background(), f)
-	assert.Regexp(t, "FF10115", err)
+	_, _, err := s.GetEvents(context.Background(), "ns1", f)
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGetEventsBuildQueryFail(t *testing.T) {
 	s, _ := newMockProvider().init()
 	f := database.EventQueryFactory.NewFilter(context.Background()).Eq("id", map[bool]bool{true: false})
-	_, _, err := s.GetEvents(context.Background(), f)
+	_, _, err := s.GetEvents(context.Background(), "ns1", f)
 	assert.Regexp(t, "FF00143.*id", err)
 }
 
@@ -253,33 +249,7 @@ func TestGettEventsReadMessageFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("only one"))
 	f := database.EventQueryFactory.NewFilter(context.Background()).Eq("id", "")
-	_, _, err := s.GetEvents(context.Background(), f)
+	_, _, err := s.GetEvents(context.Background(), "ns1", f)
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestEventUpdateBeginFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	u := database.EventQueryFactory.NewUpdate(context.Background()).Set("id", "anything")
-	err := s.UpdateEvent(context.Background(), fftypes.NewUUID(), u)
-	assert.Regexp(t, "FF10114", err)
-}
-
-func TestEventUpdateBuildQueryFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectBegin()
-	u := database.EventQueryFactory.NewUpdate(context.Background()).Set("id", map[bool]bool{true: false})
-	err := s.UpdateEvent(context.Background(), fftypes.NewUUID(), u)
-	assert.Regexp(t, "FF00143.*id", err)
-}
-
-func TestEventUpdateFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectBegin()
-	mock.ExpectExec("UPDATE .*").WillReturnError(fmt.Errorf("pop"))
-	mock.ExpectRollback()
-	u := database.EventQueryFactory.NewUpdate(context.Background()).Set("id", fftypes.NewUUID())
-	err := s.UpdateEvent(context.Background(), fftypes.NewUUID(), u)
-	assert.Regexp(t, "FF10117", err)
 }

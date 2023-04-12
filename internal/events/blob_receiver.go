@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -22,16 +22,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
 	"github.com/hyperledger/firefly/internal/coreconfig"
-	"github.com/hyperledger/firefly/internal/retry"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 type blobNotification struct {
-	blob       *fftypes.Blob
+	blob       *core.Blob
 	onComplete func()
 }
 
@@ -201,11 +202,11 @@ func (br *blobReceiver) insertNewBlobs(ctx context.Context, notifications []*blo
 	// even if the hash of that data is the same.
 	fb := database.BlobQueryFactory.NewFilter(ctx)
 	filter := fb.In("hash", allHashes)
-	existingBlobs, _, err := br.database.GetBlobs(ctx, filter)
+	existingBlobs, _, err := br.database.GetBlobs(ctx, br.aggregator.namespace, filter)
 	if err != nil {
 		return nil, err
 	}
-	newBlobs := make([]*fftypes.Blob, 0, len(existingBlobs))
+	newBlobs := make([]*core.Blob, 0, len(existingBlobs))
 	newHashes := make([]*fftypes.Bytes32, 0, len(existingBlobs))
 	for _, notification := range notifications {
 		foundExisting := false

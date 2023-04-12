@@ -1,49 +1,59 @@
 {
   "ethconnect": {
     "image": "ghcr.io/hyperledger/firefly-ethconnect",
-    "tag": "v3.1.7",
-    "sha": "4164574b7c4568ff6da4718c1a918ab2913c3f7ba8833f5375574a7030dcd9e5"
+    "tag": "v3.2.9",
+    "sha": "a9aed053d57d56532084e8d0229d3a6e8843054006cd82bb48c4800dcccc6449"
+  },
+  "evmconnect": {
+    "image": "ghcr.io/hyperledger/firefly-evmconnect",
+    "tag": "v1.2.6-20230403-44",
+    "sha": "7181937056fc056cace8e2797e51ad5809a4dde93ea1f075a8ad258dde22a1d1"
   },
   "fabconnect": {
     "image": "ghcr.io/hyperledger/firefly-fabconnect",
-    "tag": "v0.9.13",
-    "sha": "d6de00e7377ba9a510f8f8caedcce32cdef471070008d28e7d166c4acb7d617f"
+    "tag": "v0.9.17-20230308-31",
+    "sha": "fb84889f063477924320970dab8a2e6ad709e9dc0bf0ba8f1419bb05c37d93fe"
   },
   "dataexchange-https": {
     "image": "ghcr.io/hyperledger/firefly-dataexchange-https",
-    "tag": "v0.11.1",
-    "sha": "c02c7e9cf283ae84f21eca473614b0f88f9766754339ee58ec5e951fcbe180cf"
+    "tag": "v1.2.0",
+    "sha": "4ac765f7a07b9d17ab5648b3c789875791db364659c975a23626ec5921f11ce4"
   },
   "tokens-erc1155": {
     "image": "ghcr.io/hyperledger/firefly-tokens-erc1155",
-    "tag": "v0.10.9",
-    "sha": "878eb8c62d5a174ae3cd29b9d8b7c6dc36541f53e292bd8a23c38e6b568e26c2"
+    "tag": "v1.2.1",
+    "sha": "c9c4cf768e336ab73f5b8ab5c2872bf4cd1216b5c0de9a1bee811c8aeaf91a43"
   },
   "tokens-erc20-erc721": {
     "image": "ghcr.io/hyperledger/firefly-tokens-erc20-erc721",
-    "tag": "v0.3.0",
-    "sha": "8fcf93f09a2c2c4cfd10ae7b1c22629358b093b935a99478da512ff3ed16bd66"
+    "tag": "v1.2.1",
+    "sha": "401d4fbe3fcf26e63bdfc889d6eac46fde346d90ed091da558ac5fcb97d243c8"
+  },
+  "signer": {
+    "image": "ghcr.io/hyperledger/firefly-signer",
+    "tag": "v1.1.5",
+    "sha": "4ee8549d12339f6d4224a277faf143da1749a51a5994e074224c95e3cce64670"
   },
   "build": {
     "firefly-builder": {
-      "image": "golang:1.16-alpine3.15"
+      "image": "golang:1.18-alpine3.16"
     },
     "fabric-builder": {
-      "image": "golang:1.16-alpine3.15",
+      "image": "golang:1.18-alpine3.16",
       "platform": "linux/x86_64"
     },
     "solidity-builder": {
       "image": "ethereum/solc:0.8.11-alpine"
     },
     "base": {
-      "image": "alpine:3.15"
+      "image": "alpine:3.16"
     }
   },
   "ui": {
-    "tag": "v0.7.1",
-    "release": "v0.7.1_3e6c358"
+    "tag": "v1.2.0",
+    "release": "v1.2.0"
   },
   "cli": {
-    "tag": "v0.0.48"
+    "tag": "v1.2.1"
   }
 }

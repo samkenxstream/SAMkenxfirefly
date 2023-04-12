@@ -15,7 +15,7 @@ The FireFly API for digital assets, data flows, and blockchain transactions make
 
 The best place to learn about FireFly is in the [documentation](https://hyperledger.github.io/firefly).
 
-There you will find our [Getting Started Guide](https://hyperledger.github.io/firefly/gettingstarted/gettingstarted.html),
+There you will find our [Getting Started Guide](https://hyperledger.github.io/firefly/gettingstarted/),
 which will get you a running FireFly network of Supernodes on your local machine in a few minutes.
 
 Your development environment will come with:
@@ -30,20 +30,20 @@ FireFly CLI                   |  FireFly Explorer UI                | FireFly Sa
 
 ## Technical architecture
 
-Hyperledger FireFly has a pluggable microservices architecture. Everything is pluggable, from the the Blockchain technology,
+Hyperledger FireFly has a pluggable microservices architecture. Everything is pluggable, from the Blockchain technology,
 token ERC standards, and custom smart contracts, all the way to the event distribution layer and private database.
 
 So if there aren't yet instructions for making FireFly a Supernode for your favorite blockchain technology -
-don't worry. There is almost certainly a straightforward path to plugging it in that will save you re-building
+don't worry. There is almost certainly a straightforward path to plugging it in that will save you from re-building
 all the plumbing for your blockchain application from scratch.
 
-[![Hyperledger FireFly Architecture Overview](./images/firefly_technical_architecture.jpg)](https://raw.githubusercontent.com/kaleido-io/firefly/readme/images/firefly_technical_architecture.jpg)
+[![Hyperledger FireFly Architecture Overview](./docs/images/firefly_architecture_overview.jpg)](https://raw.githubusercontent.com/kaleido-io/firefly/main/docs/images/firefly_architecture_overview.jpg)
 
 ## Start contributing to Hyperledger FireFy
 
 There are lots of places you can contribute, regardless of whether your skills are front-end, backend-end, or full-stack.
 
-Check out our [Contributor Guide](https://hyperledger.github.io/firefly/contributors/contributors.html), and **welcome!**.
+Check out our [Contributor Guide](https://hyperledger.github.io/firefly/contributors/), and **welcome!**.
 
 ## Other repos
 
@@ -51,24 +51,40 @@ You are currently in the "core" repository, which is written in Go and hosts the
 engine. Here you will find plugin interfaces to microservice connectors written in a variety of languages like
 TypeScript and Java, as well as heavy-lifting runtime components.
 
-Other repositories you might be interested in containing those microservice components, user experiences, CLIs and samples:
+Other repositories you might be interested in containing those microservice components, user experiences, CLIs and samples.
+
+> Note that only open source repositories and plugins are listed below
+
+### Blockchain connectivity
+
+- Transaction Manager - https://github.com/hyperledger/firefly-transaction-manager
+- RLP & ABI encoding, KeystoreV3 utilities and secp256k1 signer runtime -  https://github.com/hyperledger/firefly-signer
+- FFCAPI reference connector for EVM Chains - https://github.com/hyperledger/firefly-evmconnect
+  - Public EVM compatible chains: Learn more in the [documentation](https://hyperledger.github.io/firefly)
+- Permissioned Ethereum connector - https://github.com/hyperledger/firefly-ethconnect
+  - Private/permissioned: Hyperledger Besu / Quorum
+- Hyperledger Fabric connector - https://github.com/hyperledger/firefly-fabconnect
+- Corda connector starter: https://github.com/hyperledger/firefly-cordaconnect
+  - CorDapp specific customization is required
+
+### Token standards
+
+- Tokens ERC20/ERC721 - https://github.com/hyperledger/firefly-tokens-erc20-erc721
+- Tokens ERC1155 - https://github.com/hyperledger/firefly-tokens-erc1155
+
+### Private data bus connectivity
+
+- HTTPS Data Exchange - https://github.com/hyperledger/firefly-dataexchange-https
+
+### Developer ecosystem
 
 - Command Line Interface (CLI) - https://github.com/hyperledger/firefly-cli
 - Explorer UI - https://github.com/hyperledger/firefly-ui
 - Node.js SDK - https://github.com/hyperledger/firefly-sdk-nodejs
 - Sandbox / Exerciser - https://github.com/hyperledger/firefly-sandbox
 - Samples - https://github.com/hyperledger/firefly-samples
-- Transaction Manager - https://github.com/hyperledger/firefly-transaction-manager
-- Tokens ERC20/ERC721 - https://github.com/hyperledger/firefly-tokens-erc20-erc721
-- Tokens ERC1155 - https://github.com/hyperledger/firefly-tokens-erc1155
-- HTTPS Data Exchange - https://github.com/hyperledger/firefly-dataexchange-https
-- Hyperledger Fabric connector - https://github.com/hyperledger/firefly-fabconnect
-- Ethereum connector - https://github.com/hyperledger/firefly-ethconnect
-  - Private/permissioned: Hyperledger Besu / Quorum
-  - Public EVM compatible chains: Learn more in the [documentation](https://hyperledger.github.io/firefly)
-- Corda connector starter: https://github.com/hyperledger/firefly-cordaconnect
-  - CorDapp specific customization is required
-- Firefly Performance CLI: https://github.com/hyperledger/firefly-perf-cli
+- FireFly Performance CLI: https://github.com/hyperledger/firefly-perf-cli
+- Helm Charts for Deploying to Kubernetes: https://github.com/hyperledger/firefly-helm-charts
 
 ## FireFly Core code hierarchy
 
@@ -246,13 +262,13 @@ Plugins: Each plugin comprises a Go shim, plus a remote agent microservice runti
   │           │ ERC-20 / ERC-721  ├───┤ ERC-1155 ├───┤  Simple framework for building token connectors
   │           └───────────────────┘   └──────────┘   └─ 
   │
-  │           ┌───────────────┐  - P2P Content Addresssed Filesystem
+  │           ┌───────────────┐  - P2P Content Addressed Filesystem
   ├───────────┤ shared    [Si]│    * Payload upload / download
   │           │ storage       │    * Payload reference management
   │           │ interface     │
   │           └─────┬─────────┘
   │                 │
-  │                 ├───────── ... extensible to any shared storage sytem, accessible to all members
+  │                 ├───────── ... extensible to any shared storage system, accessible to all members
   │           ┌─────┴─────────┐
   │           │ ipfs          │
   │           └───────────────┘
@@ -302,7 +318,7 @@ Plugins: Each plugin comprises a Go shim, plus a remote agent microservice runti
   │           └───────────────┘     └────────────────┘
   │  ... more TBD
 
-  Additional utility framworks
+  Additional utility frameworks
               ┌───────────────┐  - REST API client
               │ rest      [Re]│    * Provides convenience and logging
               │ client        │    * Standardizes auth, config and retry logic

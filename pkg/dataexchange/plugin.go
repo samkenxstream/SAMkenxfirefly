@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,8 +20,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/hyperledger/firefly/pkg/config"
-	"github.com/hyperledger/firefly/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 // Plugin is the interface implemented by each data exchange plugin
@@ -46,21 +47,28 @@ import (
 // - Can be stored and retrieved separately from their transfer
 // - Transfers are initiated via reference (not in-line data)
 // - Are hashed by the DX plugin using the same hashing algorithm as FireFly (SHA256)
-// - DX plugins can mainain their own internal IDs for Blobs within the following requirements:
+// - DX plugins can maintain their own internal IDs for Blobs within the following requirements:
 //   - Given a namespace and ID, map to a "payloadRef" string (<1024chars) that allows that same payload to be retrieved using only that payloadRef
-//     - Example would be a logical filesystem path like "local/namespace/ID"
-//   - When data is recevied from other members in the network, be able to return the hash when provided with the remote peerID string, namespace and ID
-//     - Could be done by having a data store to resolve the transfers, or simply a deterministic path to metadata like "receive/peerID/namespace/ID"
+//   - Example would be a logical filesystem path like "local/namespace/ID"
+//   - When data is received from other members in the network, be able to return the hash when provided with the remote peerID string, namespace and ID
+//   - Could be done by having a data store to resolve the transfers, or simply a deterministic path to metadata like "receive/peerID/namespace/ID"
 //   - Events triggered for arrival of blobs must contain the payloadRef, and the hash
-//
 type Plugin interface {
-	fftypes.Named
+	core.Named
 
-	// InitPrefix initializes the set of configuration options that are valid, with defaults. Called on all plugins.
-	InitPrefix(prefix config.Prefix)
+	// InitConfig initializes the set of configuration options that are valid, with defaults. Called on all plugins.
+	InitConfig(config config.Section)
 
 	// Init initializes the plugin, with configuration
-	Init(ctx context.Context, prefix config.Prefix, nodes []fftypes.JSONObject, callbacks Callbacks) error
+	Init(ctx context.Context, cancelCtx context.CancelFunc, config config.Section) error
+
+	// SetHandler registers a handler to receive callbacks
+	// Plugin will attempt (but is not guaranteed) to deliver events only for the given namespace and node
+	SetHandler(networkNamespace, nodeName string, handler Callbacks)
+
+	// SetOperationHandler registers a handler to receive async operation status
+	// If namespace is set, plugin will attempt to deliver only events for that namespace
+	SetOperationHandler(namespace string, handler core.OperationCallbacks)
 
 	// Data exchange interface must not deliver any events until start is called
 	Start() error
@@ -69,10 +77,11 @@ type Plugin interface {
 	Capabilities() *Capabilities
 
 	// GetEndpointInfo returns the information about the local endpoint
-	GetEndpointInfo(ctx context.Context) (peer fftypes.JSONObject, err error)
+	GetEndpointInfo(ctx context.Context, nodeName string) (peer fftypes.JSONObject, err error)
 
-	// AddPeer translates the configuration published by another peer, into a reference string that is used between DX and FireFly to refer to the peer
-	AddPeer(ctx context.Context, peer fftypes.JSONObject) (err error)
+	// AddNode registers details on a node in the multiparty network
+	// This may be information loaded from the database at init, or received in flight while running
+	AddNode(ctx context.Context, networkNamespace, nodeName string, peer fftypes.JSONObject) (err error)
 
 	// UploadBlob streams a blob to storage, and returns the hash to confirm the hash calculated in Core matches the hash calculated in the plugin
 	UploadBlob(ctx context.Context, ns string, id fftypes.UUID, content io.Reader) (payloadRef string, hash *fftypes.Bytes32, size int64, err error)
@@ -80,58 +89,55 @@ type Plugin interface {
 	// DownloadBlob streams a received blob out of storage
 	DownloadBlob(ctx context.Context, payloadRef string) (content io.ReadCloser, err error)
 
-	// CheckBlobReceived confirms that a blob with the specified hash has been received from the specified peer
-	CheckBlobReceived(ctx context.Context, peerID, ns string, id fftypes.UUID) (hash *fftypes.Bytes32, size int64, err error)
+	// DeleteBlob streams a deletes a blob from the local DB and DX
+	DeleteBlob(ctx context.Context, payloadRef string) (err error)
 
 	// SendMessage sends an in-line package of data to another network node.
-	// Should return as quickly as possible for parallelsim, then report completion asynchronously via the operation ID
-	SendMessage(ctx context.Context, opID *fftypes.UUID, peerID string, data []byte) (err error)
+	// Should return as quickly as possible for parallelism, then report completion asynchronously via the operation ID
+	SendMessage(ctx context.Context, nsOpID string, peer, sender fftypes.JSONObject, data []byte) (err error)
 
-	// TransferBlob initiates a transfer of a previoiusly stored blob to another node
-	TransferBlob(ctx context.Context, opID *fftypes.UUID, peerID string, payloadRef string) (err error)
+	// TransferBlob initiates a transfer of a previously stored blob to another node
+	TransferBlob(ctx context.Context, nsOpID string, peer, sender fftypes.JSONObject, payloadRef string) (err error)
+
+	// GetPeerID extracts the peer ID from the peer JSON
+	GetPeerID(peer fftypes.JSONObject) string
 }
 
 // Callbacks is the interface provided to the data exchange plugin, to allow it to pass events back to firefly.
 type Callbacks interface {
 	// Event has sub-types as defined below, and can be processed and ack'd asynchronously
-	DXEvent(event DXEvent)
+	DXEvent(plugin Plugin, event DXEvent)
 }
 
 type DXEventType int
 
 // DXEvent is a single interface that can be passed to all events
 type DXEvent interface {
-	ID() string
+	EventID() string
 	Ack()
 	AckWithManifest(manifest string)
 	Type() DXEventType
 	MessageReceived() *MessageReceived
 	PrivateBlobReceived() *PrivateBlobReceived
-	TransferResult() *TransferResult
 }
 
 const (
 	DXEventTypeMessageReceived DXEventType = iota
 	DXEventTypePrivateBlobReceived
-	DXEventTypeTransferResult
 )
 
 type MessageReceived struct {
-	PeerID string
-	Data   []byte
+	PeerID    string
+	Transport *core.TransportWrapper
 }
 
 type PrivateBlobReceived struct {
+	Namespace  string
 	PeerID     string
 	Hash       fftypes.Bytes32
 	Size       int64
 	PayloadRef string
-}
-
-type TransferResult struct {
-	TrackingID string
-	Status     fftypes.OpStatus
-	fftypes.TransportStatusUpdate
+	DataID     string
 }
 
 // Capabilities the supported featureset of the data exchange

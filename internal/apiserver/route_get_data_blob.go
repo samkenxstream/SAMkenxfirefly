@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,20 +20,19 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/hyperledger/firefly/internal/coreconfig"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/internal/oapispec"
+	"github.com/hyperledger/firefly/internal/orchestrator"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 )
 
-var getDataBlob = &oapispec.Route{
+var getDataBlob = &ffapi.Route{
 	Name:   "getDataBlob",
-	Path:   "namespaces/{ns}/data/{dataid}/blob",
+	Path:   "data/{dataid}/blob",
 	Method: http.MethodGet,
-	PathParams: []*oapispec.PathParam{
-		{Name: "ns", ExampleFromConf: coreconfig.NamespacesDefault, Description: coremsgs.APIParamsNamespace},
-		{Name: "dataid", Description: coremsgs.APIParamsBlobID},
+	PathParams: []*ffapi.PathParam{
+		{Name: "dataid", Description: coremsgs.APIParamsDataID},
 	},
 	QueryParams:     nil,
 	FilterFactory:   database.MessageQueryFactory,
@@ -41,14 +40,19 @@ var getDataBlob = &oapispec.Route{
 	JSONInputValue:  nil,
 	JSONOutputValue: func() interface{} { return []byte{} },
 	JSONOutputCodes: []int{http.StatusOK},
-	JSONHandler: func(r *oapispec.APIRequest) (output interface{}, err error) {
-		blob, reader, err := getOr(r.Ctx).Data().DownloadBlob(r.Ctx, r.PP["ns"], r.PP["dataid"])
-		if err == nil {
-			r.ResponseHeaders.Set(fftypes.HTTPHeadersBlobHashSHA256, blob.Hash.String())
-			if blob.Size > 0 {
-				r.ResponseHeaders.Set(fftypes.HTTPHeadersBlobSize, strconv.FormatInt(blob.Size, 10))
+	Extensions: &coreExtensions{
+		EnabledIf: func(or orchestrator.Orchestrator) bool {
+			return or.Data().BlobsEnabled()
+		},
+		CoreJSONHandler: func(r *ffapi.APIRequest, cr *coreRequest) (output interface{}, err error) {
+			blob, reader, err := cr.or.Data().DownloadBlob(cr.ctx, r.PP["dataid"])
+			if err == nil {
+				r.ResponseHeaders.Set(core.HTTPHeadersBlobHashSHA256, blob.Hash.String())
+				if blob.Size > 0 {
+					r.ResponseHeaders.Set(core.HTTPHeadersBlobSize, strconv.FormatInt(blob.Size, 10))
+				}
 			}
-		}
-		return reader, nil
+			return reader, nil
+		},
 	},
 }

@@ -21,11 +21,13 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -43,17 +45,22 @@ var (
 	}
 )
 
-func (s *SQLCommon) UpsertContractAPI(ctx context.Context, api *fftypes.ContractAPI) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+const contractapisTable = "contractapis"
+
+func (s *SQLCommon) UpsertContractAPI(ctx context.Context, api *core.ContractAPI) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	rows, _, err := s.queryTx(ctx, tx,
+	rows, _, err := s.QueryTx(ctx, contractapisTable, tx,
 		sq.Select("id").
-			From("contractapis").
-			Where(sq.And{sq.Eq{"namespace": api.Namespace}, sq.Eq{"name": api.Name}}),
+			From(contractapisTable).
+			Where(sq.Eq{
+				"namespace": api.Namespace,
+				"name":      api.Name,
+			}),
 	)
 	if err != nil {
 		return err
@@ -72,23 +79,22 @@ func (s *SQLCommon) UpsertContractAPI(ctx context.Context, api *fftypes.Contract
 	rows.Close()
 
 	if existing {
-		if _, err = s.updateTx(ctx, tx,
-			sq.Update("contractapis").
+		if _, err = s.UpdateTx(ctx, contractapisTable, tx,
+			sq.Update(contractapisTable).
 				Set("id", api.ID).
 				Set("interface_id", api.Interface.ID).
 				Set("location", api.Location).
 				Set("name", api.Name).
-				Set("namespace", api.Namespace).
 				Set("message_id", api.Message),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionContractAPIs, fftypes.ChangeEventTypeUpdated, api.Namespace, api.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionContractAPIs, core.ChangeEventTypeUpdated, api.Namespace, api.ID)
 			},
 		); err != nil {
 			return err
 		}
 	} else {
-		if _, err = s.insertTx(ctx, tx,
-			sq.Insert("contractapis").
+		if _, err = s.InsertTx(ctx, contractapisTable, tx,
+			sq.Insert(contractapisTable).
 				Columns(contractAPIsColumns...).
 				Values(
 					api.ID,
@@ -99,18 +105,18 @@ func (s *SQLCommon) UpsertContractAPI(ctx context.Context, api *fftypes.Contract
 					api.Message,
 				),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionContractAPIs, fftypes.ChangeEventTypeCreated, api.Namespace, api.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionContractAPIs, core.ChangeEventTypeCreated, api.Namespace, api.ID)
 			},
 		); err != nil {
 			return err
 		}
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) contractAPIResult(ctx context.Context, row *sql.Rows) (*fftypes.ContractAPI, error) {
-	api := fftypes.ContractAPI{
+func (s *SQLCommon) contractAPIResult(ctx context.Context, row *sql.Rows) (*core.ContractAPI, error) {
+	api := core.ContractAPI{
 		Interface: &fftypes.FFIReference{},
 	}
 	err := row.Scan(
@@ -127,10 +133,10 @@ func (s *SQLCommon) contractAPIResult(ctx context.Context, row *sql.Rows) (*ffty
 	return &api, nil
 }
 
-func (s *SQLCommon) getContractAPIPred(ctx context.Context, desc string, pred interface{}) (*fftypes.ContractAPI, error) {
-	rows, _, err := s.query(ctx,
+func (s *SQLCommon) getContractAPIPred(ctx context.Context, desc string, pred interface{}) (*core.ContractAPI, error) {
+	rows, _, err := s.Query(ctx, contractapisTable,
 		sq.Select(contractAPIsColumns...).
-			From("contractapis").
+			From(contractapisTable).
 			Where(pred),
 	)
 	if err != nil {
@@ -151,20 +157,21 @@ func (s *SQLCommon) getContractAPIPred(ctx context.Context, desc string, pred in
 	return api, nil
 }
 
-func (s *SQLCommon) GetContractAPIs(ctx context.Context, ns string, filter database.AndFilter) (contractAPIs []*fftypes.ContractAPI, res *database.FilterResult, err error) {
+func (s *SQLCommon) GetContractAPIs(ctx context.Context, namespace string, filter ffapi.AndFilter) (contractAPIs []*core.ContractAPI, res *ffapi.FilterResult, err error) {
 
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(contractAPIsColumns...).From("contractapis").Where(sq.Eq{"namespace": ns}), filter, contractAPIsFilterFieldMap, []interface{}{"sequence"})
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(contractAPIsColumns...).From(contractapisTable),
+		filter, contractAPIsFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, contractapisTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	apis := []*fftypes.ContractAPI{}
+	apis := []*core.ContractAPI{}
 	for rows.Next() {
 		api, err := s.contractAPIResult(ctx, rows)
 		if err != nil {
@@ -173,14 +180,14 @@ func (s *SQLCommon) GetContractAPIs(ctx context.Context, ns string, filter datab
 		apis = append(apis, api)
 	}
 
-	return apis, s.queryRes(ctx, tx, "contract_interfaces", fop, fi), err
+	return apis, s.QueryRes(ctx, contractapisTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) GetContractAPIByID(ctx context.Context, id *fftypes.UUID) (*fftypes.ContractAPI, error) {
-	return s.getContractAPIPred(ctx, id.String(), sq.Eq{"id": id})
+func (s *SQLCommon) GetContractAPIByID(ctx context.Context, namespace string, id *fftypes.UUID) (*core.ContractAPI, error) {
+	return s.getContractAPIPred(ctx, id.String(), sq.Eq{"id": id, "namespace": namespace})
 }
 
-func (s *SQLCommon) GetContractAPIByName(ctx context.Context, ns, name string) (*fftypes.ContractAPI, error) {
-	return s.getContractAPIPred(ctx, ns+":"+name, sq.And{sq.Eq{"namespace": ns}, sq.Eq{"name": name}})
+func (s *SQLCommon) GetContractAPIByName(ctx context.Context, namespace, name string) (*core.ContractAPI, error) {
+	return s.getContractAPIPred(ctx, namespace+":"+name, sq.Eq{"namespace": namespace, "name": name})
 }

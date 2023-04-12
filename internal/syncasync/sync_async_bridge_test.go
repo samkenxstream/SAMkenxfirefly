@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/datamocks"
-	"github.com/hyperledger/firefly/mocks/sysmessagingmocks"
-	"github.com/hyperledger/firefly/pkg/fftypes"
+	"github.com/hyperledger/firefly/mocks/operationmocks"
+	"github.com/hyperledger/firefly/mocks/systemeventmocks"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -34,8 +36,9 @@ func newTestSyncAsyncBridge(t *testing.T) (*syncAsyncBridge, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mdi := &databasemocks.Plugin{}
 	mdm := &datamocks.Manager{}
-	mse := &sysmessagingmocks.SystemEvents{}
-	sa := NewSyncAsyncBridge(ctx, mdi, mdm)
+	mom := &operationmocks.Manager{}
+	mse := &systemeventmocks.EventInterface{}
+	sa := NewSyncAsyncBridge(ctx, "ns1", mdi, mdm, mom)
 	sa.Init(mse)
 	return sa.(*syncAsyncBridge), cancel
 }
@@ -49,19 +52,19 @@ func TestRequestReplyOk(t *testing.T) {
 	replyID := fftypes.NewUUID()
 	dataID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetMessageByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
 		gmid.ReturnArguments = mock.Arguments{
-			&fftypes.Message{
-				Header: fftypes.MessageHeader{
+			&core.Message{
+				Header: core.MessageHeader{
 					ID:  replyID,
 					CID: requestID,
 				},
-				Data: fftypes.DataRefs{
+				Data: core.DataRefs{
 					{ID: dataID},
 				},
 			}, nil,
@@ -69,17 +72,17 @@ func TestRequestReplyOk(t *testing.T) {
 	}
 
 	mdm := sa.data.(*datamocks.Manager)
-	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(fftypes.DataArray{
+	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(core.DataArray{
 		{ID: dataID, Value: fftypes.JSONAnyPtr(`"response data"`)},
 	}, true, nil)
 
-	reply, err := sa.WaitForReply(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	reply, err := sa.WaitForReply(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:         fftypes.NewUUID(),
-						Type:       fftypes.EventTypeMessageConfirmed,
+						Type:       core.EventTypeMessageConfirmed,
 						Reference:  replyID,
 						Correlator: requestID,
 						Namespace:  "ns1",
@@ -103,33 +106,33 @@ func TestAwaitConfirmationOk(t *testing.T) {
 	requestID := fftypes.NewUUID()
 	dataID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetMessageByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
-		msgSent := &fftypes.Message{}
+		msgSent := &core.Message{}
 		msgSent.Header.ID = requestID
 		msgSent.Confirmed = fftypes.Now()
-		msgSent.State = fftypes.MessageStateConfirmed
+		msgSent.State = core.MessageStateConfirmed
 		gmid.ReturnArguments = mock.Arguments{
 			msgSent, nil,
 		}
 	}
 
 	mdm := sa.data.(*datamocks.Manager)
-	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(fftypes.DataArray{
+	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(core.DataArray{
 		{ID: dataID, Value: fftypes.JSONAnyPtr(`"response data"`)},
 	}, true, nil)
 
-	reply, err := sa.WaitForMessage(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	reply, err := sa.WaitForMessage(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeMessageConfirmed,
+						Type:      core.EventTypeMessageConfirmed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -151,33 +154,33 @@ func TestAwaitConfirmationRejected(t *testing.T) {
 	requestID := fftypes.NewUUID()
 	dataID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetMessageByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
-		msgSent := &fftypes.Message{}
+		msgSent := &core.Message{}
 		msgSent.Header.ID = requestID
 		msgSent.Confirmed = fftypes.Now()
-		msgSent.State = fftypes.MessageStateConfirmed
+		msgSent.State = core.MessageStateConfirmed
 		gmid.ReturnArguments = mock.Arguments{
 			msgSent, nil,
 		}
 	}
 
 	mdm := sa.data.(*datamocks.Manager)
-	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(fftypes.DataArray{
+	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(core.DataArray{
 		{ID: dataID, Value: fftypes.JSONAnyPtr(`"response data"`)},
 	}, true, nil)
 
-	_, err := sa.WaitForMessage(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForMessage(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeMessageRejected,
+						Type:      core.EventTypeMessageRejected,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -194,10 +197,10 @@ func TestRequestReplyTimeout(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	_, err := sa.WaitForReply(sa.ctx, "ns1", fftypes.NewUUID(), func(ctx context.Context) error {
+	_, err := sa.WaitForReply(sa.ctx, fftypes.NewUUID(), func(ctx context.Context) error {
 		return nil
 	})
 	assert.Regexp(t, "FF10260", err)
@@ -208,10 +211,10 @@ func TestRequestSetupSystemListenerFail(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(fmt.Errorf("pop"))
 
-	_, err := sa.WaitForReply(sa.ctx, "ns1", fftypes.NewUUID(), func(ctx context.Context) error {
+	_, err := sa.WaitForReply(sa.ctx, fftypes.NewUUID(), func(ctx context.Context) error {
 		return nil
 	})
 	assert.Regexp(t, "pop", err)
@@ -223,16 +226,16 @@ func TestEventCallbackNotInflight(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: fftypes.NewUUID(),
-				Type:      fftypes.EventTypeMessageConfirmed,
+				Type:      core.EventTypeMessageConfirmed,
 			},
 		},
 	})
@@ -240,22 +243,24 @@ func TestEventCallbackNotInflight(t *testing.T) {
 
 	sa.addInFlight("ns1", fftypes.NewUUID(), messageConfirm)
 
-	for _, eventType := range []fftypes.EventType{
-		fftypes.EventTypeMessageConfirmed,
-		fftypes.EventTypeMessageRejected,
-		fftypes.EventTypePoolConfirmed,
-		fftypes.EventTypeTransferConfirmed,
-		fftypes.EventTypeApprovalConfirmed,
-		fftypes.EventTypePoolOpFailed,
-		fftypes.EventTypeTransferOpFailed,
-		fftypes.EventTypeApprovalOpFailed,
-		fftypes.EventTypeIdentityConfirmed,
-		fftypes.EventTypeBlockchainInvokeOpSucceeded,
-		fftypes.EventTypeBlockchainInvokeOpFailed,
+	for _, eventType := range []core.EventType{
+		core.EventTypeMessageConfirmed,
+		core.EventTypeMessageRejected,
+		core.EventTypePoolConfirmed,
+		core.EventTypeTransferConfirmed,
+		core.EventTypeApprovalConfirmed,
+		core.EventTypePoolOpFailed,
+		core.EventTypeTransferOpFailed,
+		core.EventTypeApprovalOpFailed,
+		core.EventTypeIdentityConfirmed,
+		core.EventTypeBlockchainInvokeOpSucceeded,
+		core.EventTypeBlockchainInvokeOpFailed,
+		core.EventTypeBlockchainContractDeployOpSucceeded,
+		core.EventTypeBlockchainContractDeployOpFailed,
 	} {
-		err := sa.eventCallback(&fftypes.EventDelivery{
-			EnrichedEvent: fftypes.EnrichedEvent{
-				Event: fftypes.Event{
+		err := sa.eventCallback(&core.EventDelivery{
+			EnrichedEvent: core.EnrichedEvent{
+				Event: core.Event{
 					Namespace: "ns1",
 					ID:        fftypes.NewUUID(),
 					Reference: fftypes.NewUUID(),
@@ -280,13 +285,13 @@ func TestEventCallbackWrongType(t *testing.T) {
 		},
 	}
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: fftypes.NewUUID(),
-				Type:      fftypes.EventTypeIdentityUpdated, // We use the message for this one, so no sync/async handler
+				Type:      core.EventTypeIdentityUpdated, // We use the message for this one, so no sync/async handler
 			},
 		},
 	})
@@ -309,15 +314,15 @@ func TestEventCallbackMsgLookupFail(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeMessageConfirmed,
+				Type:      core.EventTypeMessageConfirmed,
 			},
 		},
 	})
@@ -340,15 +345,15 @@ func TestEventCallbackTokenPoolLookupFail(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenPoolByID", sa.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetTokenPoolByID", sa.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypePoolConfirmed,
+				Type:      core.EventTypePoolConfirmed,
 			},
 		},
 	})
@@ -371,15 +376,15 @@ func TestEventCallbackIdentityLookupFail(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", sa.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetIdentityByID", sa.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeIdentityConfirmed,
+				Type:      core.EventTypeIdentityConfirmed,
 			},
 		},
 	})
@@ -402,15 +407,15 @@ func TestEventCallbackIdentityLookupNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetIdentityByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeIdentityConfirmed,
+				Type:      core.EventTypeIdentityConfirmed,
 			},
 		},
 	})
@@ -433,15 +438,15 @@ func TestEventCallbackTokenTransferLookupFail(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenTransferByID", sa.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetTokenTransferByID", sa.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeTransferConfirmed,
+				Type:      core.EventTypeTransferConfirmed,
 			},
 		},
 	})
@@ -463,15 +468,15 @@ func TestEventCallbackTokenApprovalLookupFail(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenApprovalByID", sa.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetTokenApprovalByID", sa.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeApprovalConfirmed,
+				Type:      core.EventTypeApprovalConfirmed,
 			},
 		},
 	})
@@ -494,15 +499,15 @@ func TestEventCallbackMsgNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeMessageConfirmed,
+				Type:      core.EventTypeMessageConfirmed,
 			},
 		},
 	})
@@ -530,16 +535,16 @@ func TestEventCallbackRejectedMsgNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace:  "ns1",
 				ID:         fftypes.NewUUID(),
 				Reference:  responseID,
 				Correlator: correlationID,
-				Type:       fftypes.EventTypeMessageRejected,
+				Type:       core.EventTypeMessageRejected,
 			},
 		},
 	})
@@ -563,15 +568,15 @@ func TestEventCallbackTokenPoolNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenPoolByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetTokenPoolByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypePoolConfirmed,
+				Type:      core.EventTypePoolConfirmed,
 			},
 		},
 	})
@@ -595,15 +600,15 @@ func TestEventCallbackTokenTransferNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenTransferByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetTokenTransferByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeTransferConfirmed,
+				Type:      core.EventTypeTransferConfirmed,
 			},
 		},
 	})
@@ -627,15 +632,15 @@ func TestEventCallbackTokenApprovalNotFound(t *testing.T) {
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetTokenApprovalByID", sa.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetTokenApprovalByID", sa.ctx, "ns1", mock.Anything).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace: "ns1",
 				ID:        fftypes.NewUUID(),
 				Reference: responseID,
-				Type:      fftypes.EventTypeApprovalConfirmed,
+				Type:      core.EventTypeApprovalConfirmed,
 			},
 		},
 	})
@@ -658,26 +663,26 @@ func TestEventCallbackTokenPoolRejectedNoData(t *testing.T) {
 		},
 	}
 
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	msg := &core.Message{
+		Header: core.MessageHeader{
 			ID:   fftypes.NewUUID(),
-			Type: fftypes.MessageTypeDefinition,
-			Tag:  fftypes.SystemTagDefinePool,
+			Type: core.MessageTypeDefinition,
+			Tag:  core.SystemTagDefinePool,
 		},
-		Data: fftypes.DataRefs{},
+		Data: core.DataRefs{},
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, mock.Anything).Return(msg, nil)
+	mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything).Return(msg, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace:  "ns1",
 				ID:         fftypes.NewUUID(),
 				Reference:  fftypes.NewUUID(),
 				Correlator: responseID,
-				Type:       fftypes.EventTypeMessageRejected,
+				Type:       core.EventTypeMessageRejected,
 			},
 		},
 	})
@@ -705,29 +710,29 @@ func TestEventCallbackTokenPoolRejectedDataError(t *testing.T) {
 	}
 
 	dataID := fftypes.NewUUID()
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	msg := &core.Message{
+		Header: core.MessageHeader{
 			ID:   fftypes.NewUUID(),
-			Type: fftypes.MessageTypeDefinition,
-			Tag:  fftypes.SystemTagDefinePool,
+			Type: core.MessageTypeDefinition,
+			Tag:  core.SystemTagDefinePool,
 		},
-		Data: fftypes.DataRefs{
+		Data: core.DataRefs{
 			{ID: dataID},
 		},
 	}
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, mock.Anything).Return(msg, nil)
-	mdi.On("GetDataByID", sa.ctx, dataID, true).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetMessageByID", sa.ctx, "ns1", mock.Anything).Return(msg, nil)
+	mdi.On("GetDataByID", sa.ctx, "ns1", dataID, true).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				Namespace:  "ns1",
 				ID:         fftypes.NewUUID(),
 				Reference:  responseID,
 				Correlator: correlationID,
-				Type:       fftypes.EventTypeMessageRejected,
+				Type:       core.EventTypeMessageRejected,
 			},
 		},
 	})
@@ -744,8 +749,8 @@ func TestEventCallbackMsgDataLookupFail(t *testing.T) {
 	mdm := sa.data.(*datamocks.Manager)
 	mdm.On("GetMessageDataCached", sa.ctx, mock.Anything).Return(nil, false, fmt.Errorf("pop"))
 
-	sa.resolveReply(&inflightRequest{}, &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	sa.resolveReply(&inflightRequest{}, &core.Message{
+		Header: core.MessageHeader{
 			ID:  fftypes.NewUUID(),
 			CID: fftypes.NewUUID(),
 		},
@@ -761,13 +766,13 @@ func TestAwaitTokenPoolConfirmation(t *testing.T) {
 
 	requestID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetTokenPoolByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetTokenPoolByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
-		pool := &fftypes.TokenPool{
+		pool := &core.TokenPool{
 			ID:   requestID,
 			Name: "my-pool",
 		}
@@ -776,13 +781,13 @@ func TestAwaitTokenPoolConfirmation(t *testing.T) {
 		}
 	}
 
-	reply, err := sa.WaitForTokenPool(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	reply, err := sa.WaitForTokenPool(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypePoolConfirmed,
+						Type:      core.EventTypePoolConfirmed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -801,10 +806,10 @@ func TestAwaitTokenPoolConfirmationSendFail(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	_, err := sa.WaitForTokenPool(sa.ctx, "ns1", fftypes.NewUUID(), func(ctx context.Context) error {
+	_, err := sa.WaitForTokenPool(sa.ctx, fftypes.NewUUID(), func(ctx context.Context) error {
 		return fmt.Errorf("pop")
 	})
 	assert.EqualError(t, err, "pop")
@@ -815,41 +820,41 @@ func TestAwaitTokenPoolConfirmationRejected(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	pool := &fftypes.TokenPoolAnnouncement{
-		Pool: &fftypes.TokenPool{
+	pool := &core.TokenPoolAnnouncement{
+		Pool: &core.TokenPool{
 			ID: fftypes.NewUUID(),
 		},
 	}
 	poolJSON, _ := json.Marshal(pool)
-	data := &fftypes.Data{
+	data := &core.Data{
 		ID:    fftypes.NewUUID(),
 		Value: fftypes.JSONAnyPtrBytes(poolJSON),
 	}
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	msg := &core.Message{
+		Header: core.MessageHeader{
 			ID:   fftypes.NewUUID(),
-			Type: fftypes.MessageTypeDefinition,
-			Tag:  fftypes.SystemTagDefinePool,
+			Type: core.MessageTypeDefinition,
+			Tag:  core.SystemTagDefinePool,
 		},
-		Data: fftypes.DataRefs{
+		Data: core.DataRefs{
 			{ID: data.ID},
 		},
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetMessageByID", sa.ctx, msg.Header.ID).Return(msg, nil)
-	mdi.On("GetDataByID", sa.ctx, data.ID, true).Return(data, nil)
+	mdi.On("GetMessageByID", sa.ctx, "ns1", msg.Header.ID).Return(msg, nil)
+	mdi.On("GetDataByID", sa.ctx, "ns1", data.ID, true).Return(data, nil)
 
-	_, err := sa.WaitForTokenPool(sa.ctx, "ns1", pool.Pool.ID, func(ctx context.Context) error {
+	_, err := sa.WaitForTokenPool(sa.ctx, pool.Pool.ID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:         fftypes.NewUUID(),
-						Type:       fftypes.EventTypeMessageRejected,
+						Type:       core.EventTypeMessageRejected,
 						Reference:  msg.Header.ID,
 						Correlator: pool.Pool.ID,
 						Namespace:  "ns1",
@@ -869,13 +874,13 @@ func TestAwaitTokenTransferConfirmation(t *testing.T) {
 
 	requestID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetTokenTransferByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetTokenTransferByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
-		transfer := &fftypes.TokenTransfer{
+		transfer := &core.TokenTransfer{
 			LocalID:    requestID,
 			ProtocolID: "abc",
 		}
@@ -884,13 +889,13 @@ func TestAwaitTokenTransferConfirmation(t *testing.T) {
 		}
 	}
 
-	reply, err := sa.WaitForTokenTransfer(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	reply, err := sa.WaitForTokenTransfer(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeTransferConfirmed,
+						Type:      core.EventTypeTransferConfirmed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -911,13 +916,13 @@ func TestAwaitTokenApprovalConfirmation(t *testing.T) {
 
 	requestID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	gmid := mdi.On("GetTokenApprovalByID", sa.ctx, mock.Anything)
+	gmid := mdi.On("GetTokenApprovalByID", sa.ctx, "ns1", mock.Anything)
 	gmid.RunFn = func(a mock.Arguments) {
-		approval := &fftypes.TokenApproval{
+		approval := &core.TokenApproval{
 			LocalID: requestID,
 			Subject: "abc",
 		}
@@ -926,13 +931,13 @@ func TestAwaitTokenApprovalConfirmation(t *testing.T) {
 		}
 	}
 
-	reply, err := sa.WaitForTokenApproval(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	reply, err := sa.WaitForTokenApproval(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeApprovalConfirmed,
+						Type:      core.EventTypeApprovalConfirmed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -951,10 +956,10 @@ func TestAwaitTokenApprovalConfirmationSendFail(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	_, err := sa.WaitForTokenApproval(sa.ctx, "ns1", fftypes.NewUUID(), func(ctx context.Context) error {
+	_, err := sa.WaitForTokenApproval(sa.ctx, fftypes.NewUUID(), func(ctx context.Context) error {
 		return fmt.Errorf("pop")
 	})
 	assert.EqualError(t, err, "pop")
@@ -965,10 +970,10 @@ func TestAwaitTokenTransferConfirmationSendFail(t *testing.T) {
 	sa, cancel := newTestSyncAsyncBridge(t)
 	defer cancel()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	_, err := sa.WaitForTokenTransfer(sa.ctx, "ns1", fftypes.NewUUID(), func(ctx context.Context) error {
+	_, err := sa.WaitForTokenTransfer(sa.ctx, fftypes.NewUUID(), func(ctx context.Context) error {
 		return fmt.Errorf("pop")
 	})
 	assert.EqualError(t, err, "pop")
@@ -980,7 +985,7 @@ func TestAwaitFailedTokenPool(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
@@ -988,19 +993,19 @@ func TestAwaitFailedTokenPool(t *testing.T) {
 		Error: "pop",
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	_, err := sa.WaitForTokenPool(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForTokenPool(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:         fftypes.NewUUID(),
-						Type:       fftypes.EventTypePoolOpFailed,
+						Type:       core.EventTypePoolOpFailed,
 						Reference:  op.ID,
 						Correlator: requestID,
 						Namespace:  "ns1",
@@ -1019,7 +1024,7 @@ func TestAwaitFailedTokenTransfer(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
@@ -1027,19 +1032,19 @@ func TestAwaitFailedTokenTransfer(t *testing.T) {
 		Error: "pop",
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	_, err := sa.WaitForTokenTransfer(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForTokenTransfer(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:         fftypes.NewUUID(),
-						Type:       fftypes.EventTypeTransferOpFailed,
+						Type:       core.EventTypeTransferOpFailed,
 						Reference:  op.ID,
 						Correlator: requestID,
 						Namespace:  "ns1",
@@ -1058,7 +1063,7 @@ func TestAwaitFailedTokenApproval(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
@@ -1066,19 +1071,19 @@ func TestAwaitFailedTokenApproval(t *testing.T) {
 		Error: "pop",
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	_, err := sa.WaitForTokenApproval(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForTokenApproval(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:         fftypes.NewUUID(),
-						Type:       fftypes.EventTypeApprovalOpFailed,
+						Type:       core.EventTypeApprovalOpFailed,
 						Reference:  op.ID,
 						Correlator: requestID,
 						Namespace:  "ns1",
@@ -1105,21 +1110,21 @@ func TestFailedTokenTransferOpError(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
 		},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(nil, fmt.Errorf("pop"))
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeTransferOpFailed,
+				Type:       core.EventTypeTransferOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1128,7 +1133,7 @@ func TestFailedTokenTransferOpError(t *testing.T) {
 	})
 	assert.EqualError(t, err, "pop")
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenApprovalOpError(t *testing.T) {
@@ -1145,21 +1150,21 @@ func TestFailedTokenApprovalOpError(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
 		},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(nil, fmt.Errorf("pop"))
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeApprovalOpFailed,
+				Type:       core.EventTypeApprovalOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1168,7 +1173,7 @@ func TestFailedTokenApprovalOpError(t *testing.T) {
 	})
 	assert.EqualError(t, err, "pop")
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenPoolOpNotFound(t *testing.T) {
@@ -1185,21 +1190,21 @@ func TestFailedTokenPoolOpNotFound(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
 		},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(nil, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypePoolOpFailed,
+				Type:       core.EventTypePoolOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1208,7 +1213,7 @@ func TestFailedTokenPoolOpNotFound(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenApprovalOpNotFound(t *testing.T) {
@@ -1225,21 +1230,21 @@ func TestFailedTokenApprovalOpNotFound(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
 		},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(nil, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeApprovalOpFailed,
+				Type:       core.EventTypeApprovalOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1248,7 +1253,7 @@ func TestFailedTokenApprovalOpNotFound(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenApprovalIDLookupFail(t *testing.T) {
@@ -1265,19 +1270,19 @@ func TestFailedTokenApprovalIDLookupFail(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID:    fftypes.NewUUID(),
 		Input: fftypes.JSONObject{},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeApprovalOpFailed,
+				Type:       core.EventTypeApprovalOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1286,7 +1291,7 @@ func TestFailedTokenApprovalIDLookupFail(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenTransferOpNotFound(t *testing.T) {
@@ -1303,21 +1308,21 @@ func TestFailedTokenTransferOpNotFound(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID: fftypes.NewUUID(),
 		Input: fftypes.JSONObject{
 			"localId": requestID.String(),
 		},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(nil, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(nil, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeTransferOpFailed,
+				Type:       core.EventTypeTransferOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1326,7 +1331,7 @@ func TestFailedTokenTransferOpNotFound(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestFailedTokenTransferIDLookupFail(t *testing.T) {
@@ -1343,19 +1348,19 @@ func TestFailedTokenTransferIDLookupFail(t *testing.T) {
 		},
 	}
 
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID:    fftypes.NewUUID(),
 		Input: fftypes.JSONObject{},
 	}
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, op.ID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:         fftypes.NewUUID(),
-				Type:       fftypes.EventTypeTransferOpFailed,
+				Type:       core.EventTypeTransferOpFailed,
 				Reference:  op.ID,
 				Correlator: requestID,
 				Namespace:  "ns1",
@@ -1364,7 +1369,7 @@ func TestFailedTokenTransferIDLookupFail(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestAwaitIdentityConfirmed(t *testing.T) {
@@ -1373,25 +1378,25 @@ func TestAwaitIdentityConfirmed(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	identity := &fftypes.Identity{
-		IdentityBase: fftypes.IdentityBase{
+	identity := &core.Identity{
+		IdentityBase: core.IdentityBase{
 			ID: requestID,
 		},
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
 	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", sa.ctx, requestID).Return(identity, nil)
+	mdi.On("GetIdentityByID", sa.ctx, "ns1", requestID).Return(identity, nil)
 
-	retIdentity, err := sa.WaitForIdentity(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	retIdentity, err := sa.WaitForIdentity(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeIdentityConfirmed,
+						Type:      core.EventTypeIdentityConfirmed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -1411,13 +1416,151 @@ func TestAwaitIdentityFail(t *testing.T) {
 
 	requestID := fftypes.NewUUID()
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	_, err := sa.WaitForIdentity(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForIdentity(sa.ctx, requestID, func(ctx context.Context) error {
 		return fmt.Errorf("pop")
 	})
 	assert.Regexp(t, "pop", err)
+}
+
+func TestAwaitDeployOpSucceeded(t *testing.T) {
+
+	sa, cancel := newTestSyncAsyncBridge(t)
+	defer cancel()
+
+	requestID := fftypes.NewUUID()
+	op := &core.Operation{
+		ID:     requestID,
+		Status: core.OpStatusSucceeded,
+	}
+
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
+	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
+
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
+
+	ret, err := sa.WaitForDeployOperation(sa.ctx, requestID, func(ctx context.Context) error {
+		go func() {
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
+						ID:        fftypes.NewUUID(),
+						Type:      core.EventTypeBlockchainContractDeployOpSucceeded,
+						Reference: requestID,
+						Namespace: "ns1",
+					},
+				},
+			})
+		}()
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, ret, op)
+}
+
+func TestAwaitDeployOpSucceededLookupFail(t *testing.T) {
+
+	sa, cancel := newTestSyncAsyncBridge(t)
+	defer cancel()
+
+	requestID := fftypes.NewUUID()
+	sa.inflight = map[string]map[fftypes.UUID]*inflightRequest{
+		"ns1": {
+			*requestID: &inflightRequest{
+				reqType: deployOperationConfirm,
+			},
+		},
+	}
+
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
+	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
+
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
+
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
+				ID:        fftypes.NewUUID(),
+				Type:      core.EventTypeBlockchainContractDeployOpSucceeded,
+				Reference: requestID,
+				Namespace: "ns1",
+			},
+		},
+	})
+	assert.EqualError(t, err, "pop")
+}
+
+func TestAwaitDeployOpFailed(t *testing.T) {
+
+	sa, cancel := newTestSyncAsyncBridge(t)
+	defer cancel()
+
+	requestID := fftypes.NewUUID()
+	op := &core.Operation{
+		ID:     requestID,
+		Status: core.OpStatusFailed,
+		Error:  "pop",
+	}
+
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
+	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
+
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
+
+	_, err := sa.WaitForDeployOperation(sa.ctx, requestID, func(ctx context.Context) error {
+		go func() {
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
+						ID:        fftypes.NewUUID(),
+						Type:      core.EventTypeBlockchainContractDeployOpFailed,
+						Reference: requestID,
+						Namespace: "ns1",
+					},
+				},
+			})
+		}()
+		return nil
+	})
+	assert.EqualError(t, err, "pop")
+}
+
+func TestAwaitDeployOpFailedLookupFail(t *testing.T) {
+
+	sa, cancel := newTestSyncAsyncBridge(t)
+	defer cancel()
+
+	requestID := fftypes.NewUUID()
+	sa.inflight = map[string]map[fftypes.UUID]*inflightRequest{
+		"ns1": {
+			*requestID: &inflightRequest{
+				reqType: deployOperationConfirm,
+			},
+		},
+	}
+
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
+	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
+
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
+
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
+				ID:        fftypes.NewUUID(),
+				Type:      core.EventTypeBlockchainContractDeployOpFailed,
+				Reference: requestID,
+				Namespace: "ns1",
+			},
+		},
+	})
+	assert.EqualError(t, err, "pop")
 }
 
 func TestAwaitInvokeOpSucceeded(t *testing.T) {
@@ -1426,24 +1569,24 @@ func TestAwaitInvokeOpSucceeded(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID:     requestID,
-		Status: fftypes.OpStatusSucceeded,
+		Status: core.OpStatusSucceeded,
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, requestID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	ret, err := sa.WaitForInvokeOperation(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	ret, err := sa.WaitForInvokeOperation(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeBlockchainInvokeOpSucceeded,
+						Type:      core.EventTypeBlockchainInvokeOpSucceeded,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -1470,17 +1613,17 @@ func TestAwaitInvokeOpSucceededLookupFail(t *testing.T) {
 		},
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:        fftypes.NewUUID(),
-				Type:      fftypes.EventTypeBlockchainInvokeOpSucceeded,
+				Type:      core.EventTypeBlockchainInvokeOpSucceeded,
 				Reference: requestID,
 				Namespace: "ns1",
 			},
@@ -1495,25 +1638,25 @@ func TestAwaitInvokeOpFailed(t *testing.T) {
 	defer cancel()
 
 	requestID := fftypes.NewUUID()
-	op := &fftypes.Operation{
+	op := &core.Operation{
 		ID:     requestID,
-		Status: fftypes.OpStatusFailed,
+		Status: core.OpStatusFailed,
 		Error:  "pop",
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, requestID).Return(op, nil)
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, op.ID).Return(op, nil)
 
-	_, err := sa.WaitForInvokeOperation(sa.ctx, "ns1", requestID, func(ctx context.Context) error {
+	_, err := sa.WaitForInvokeOperation(sa.ctx, requestID, func(ctx context.Context) error {
 		go func() {
-			sa.eventCallback(&fftypes.EventDelivery{
-				EnrichedEvent: fftypes.EnrichedEvent{
-					Event: fftypes.Event{
+			sa.eventCallback(&core.EventDelivery{
+				EnrichedEvent: core.EnrichedEvent{
+					Event: core.Event{
 						ID:        fftypes.NewUUID(),
-						Type:      fftypes.EventTypeBlockchainInvokeOpFailed,
+						Type:      core.EventTypeBlockchainInvokeOpFailed,
 						Reference: requestID,
 						Namespace: "ns1",
 					},
@@ -1539,17 +1682,17 @@ func TestAwaitInvokeOpFailedLookupFail(t *testing.T) {
 		},
 	}
 
-	mse := sa.sysevents.(*sysmessagingmocks.SystemEvents)
+	mse := sa.sysevents.(*systemeventmocks.EventInterface)
 	mse.On("AddSystemEventListener", "ns1", mock.Anything).Return(nil)
 
-	mdi := sa.database.(*databasemocks.Plugin)
-	mdi.On("GetOperationByID", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
+	mom := sa.operations.(*operationmocks.Manager)
+	mom.On("GetOperationByIDCached", sa.ctx, requestID).Return(nil, fmt.Errorf("pop"))
 
-	err := sa.eventCallback(&fftypes.EventDelivery{
-		EnrichedEvent: fftypes.EnrichedEvent{
-			Event: fftypes.Event{
+	err := sa.eventCallback(&core.EventDelivery{
+		EnrichedEvent: core.EnrichedEvent{
+			Event: core.Event{
 				ID:        fftypes.NewUUID(),
-				Type:      fftypes.EventTypeBlockchainInvokeOpFailed,
+				Type:      core.EventTypeBlockchainInvokeOpFailed,
 				Reference: requestID,
 				Namespace: "ns1",
 			},

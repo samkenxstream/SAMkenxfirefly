@@ -19,14 +19,16 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
 	migratedb "github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/dbsql"
 	"github.com/hyperledger/firefly/internal/database/sqlcommon"
-	"github.com/hyperledger/firefly/pkg/config"
 	"github.com/hyperledger/firefly/pkg/database"
 
 	// Import pq driver
@@ -37,25 +39,42 @@ type Postgres struct {
 	sqlcommon.SQLCommon
 }
 
-func (psql *Postgres) Init(ctx context.Context, prefix config.Prefix, callbacks database.Callbacks) error {
+func (psql *Postgres) Init(ctx context.Context, config config.Section) error {
 	capabilities := &database.Capabilities{}
-	return psql.SQLCommon.Init(ctx, psql, prefix, callbacks, capabilities)
+	return psql.SQLCommon.Init(ctx, psql, config, capabilities)
+}
+
+func (psql *Postgres) SetHandler(namespace string, handler database.Callbacks) {
+	psql.SQLCommon.SetHandler(namespace, handler)
 }
 
 func (psql *Postgres) Name() string {
 	return "postgres"
 }
 
+func (psql *Postgres) SequenceColumn() string {
+	return "seq"
+}
+
 func (psql *Postgres) MigrationsDir() string {
 	return psql.Name()
 }
 
-func (psql *Postgres) Features() sqlcommon.SQLFeatures {
-	features := sqlcommon.DefaultSQLProviderFeatures()
+// Attempt to create a unique 64-bit int from the given name, by selecting 4 bytes from the
+// beginning and end of the string.
+func lockIndex(lockName string) int64 {
+	if len(lockName) >= 4 {
+		lockName = lockName[0:4] + lockName[len(lockName)-4:]
+	}
+	return big.NewInt(0).SetBytes([]byte(lockName)).Int64()
+}
+
+func (psql *Postgres) Features() dbsql.SQLFeatures {
+	features := dbsql.DefaultSQLProviderFeatures()
 	features.PlaceholderFormat = sq.Dollar
 	features.UseILIKE = false // slower than lower()
-	features.ExclusiveTableLockSQL = func(table string) string {
-		return fmt.Sprintf(`LOCK TABLE "%s" IN EXCLUSIVE MODE;`, table)
+	features.AcquireLock = func(lockName string) string {
+		return fmt.Sprintf(`SELECT pg_advisory_xact_lock(%d);`, lockIndex(lockName))
 	}
 	features.MultiRowInsert = true
 	return features

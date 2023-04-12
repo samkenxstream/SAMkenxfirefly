@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -23,14 +23,19 @@ import (
 	"fmt"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/hyperledger/firefly-common/pkg/ffresty"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-signer/pkg/abi"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/ffresty"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 type streamManager struct {
 	client *resty.Client
+	cache  cache.CInterface
 }
 
 type eventStream struct {
@@ -45,12 +50,26 @@ type eventStream struct {
 }
 
 type subscription struct {
-	ID        string               `json:"id"`
-	Name      string               `json:"name,omitempty"`
-	Stream    string               `json:"stream"`
-	FromBlock string               `json:"fromBlock"`
-	Address   string               `json:"address"`
-	Event     ABIElementMarshaling `json:"event"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name,omitempty"`
+	Stream           string            `json:"stream"`
+	FromBlock        string            `json:"fromBlock"`
+	EthCompatAddress string            `json:"address,omitempty"`
+	EthCompatEvent   *abi.Entry        `json:"event,omitempty"`
+	Filters          []fftypes.JSONAny `json:"filters"`
+	subscriptionCheckpoint
+}
+
+type subscriptionCheckpoint struct {
+	Checkpoint ListenerCheckpoint `json:"checkpoint,omitempty"`
+	Catchup    bool               `json:"catchup,omitempty"`
+}
+
+func newStreamManager(client *resty.Client, cache cache.CInterface) *streamManager {
+	return &streamManager{
+		client: client,
+		cache:  cache,
+	}
 }
 
 func (s *streamManager) getEventStreams(ctx context.Context) (streams []*eventStream, err error) {
@@ -59,51 +78,49 @@ func (s *streamManager) getEventStreams(ctx context.Context) (streams []*eventSt
 		SetResult(&streams).
 		Get("/eventstreams")
 	if err != nil || !res.IsSuccess() {
-		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
 	return streams, nil
 }
 
-func (s *streamManager) createEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
-	stream := eventStream{
+func buildEventStream(topic string, batchSize, batchTimeout uint) *eventStream {
+	return &eventStream{
 		Name:           topic,
 		ErrorHandling:  "block",
 		BatchSize:      batchSize,
 		BatchTimeoutMS: batchTimeout,
 		Type:           "websocket",
-		WebSocket:      eventStreamWebsocket{Topic: topic},
-		Timestamps:     true,
+		// Some implementations require a "topic" to be set separately, while others rely only on the name.
+		// We set them to the same thing for cross compatibility.
+		WebSocket:  eventStreamWebsocket{Topic: topic},
+		Timestamps: true,
 	}
+}
+
+func (s *streamManager) createEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
+	stream := buildEventStream(topic, batchSize, batchTimeout)
 	res, err := s.client.R().
 		SetContext(ctx).
-		SetBody(&stream).
-		SetResult(&stream).
+		SetBody(stream).
+		SetResult(stream).
 		Post("/eventstreams")
 	if err != nil || !res.IsSuccess() {
-		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
-	return &stream, nil
+	return stream, nil
 }
 
 func (s *streamManager) updateEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint, eventStreamID string) (*eventStream, error) {
-	stream := eventStream{
-		Name:           topic,
-		ErrorHandling:  "block",
-		BatchSize:      batchSize,
-		BatchTimeoutMS: batchTimeout,
-		Type:           "websocket",
-		WebSocket:      eventStreamWebsocket{Topic: topic},
-		Timestamps:     true,
-	}
+	stream := buildEventStream(topic, batchSize, batchTimeout)
 	res, err := s.client.R().
 		SetContext(ctx).
-		SetBody(&stream).
-		SetResult(&stream).
+		SetBody(stream).
+		SetResult(stream).
 		Patch("/eventstreams/" + eventStreamID)
 	if err != nil || !res.IsSuccess() {
-		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
-	return &stream, nil
+	return stream, nil
 }
 
 func (s *streamManager) ensureEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
@@ -112,7 +129,7 @@ func (s *streamManager) ensureEventStream(ctx context.Context, topic string, bat
 		return nil, err
 	}
 	for _, stream := range existingStreams {
-		if stream.WebSocket.Topic == topic {
+		if stream.Name == topic {
 			stream, err = s.updateEventStream(ctx, topic, batchSize, batchTimeout, stream.ID)
 			if err != nil {
 				return nil, err
@@ -129,48 +146,82 @@ func (s *streamManager) getSubscriptions(ctx context.Context) (subs []*subscript
 		SetResult(&subs).
 		Get("/subscriptions")
 	if err != nil || !res.IsSuccess() {
-		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
 	return subs, nil
 }
 
-func (s *streamManager) createSubscription(ctx context.Context, location *Location, stream, subName, fromBlock string, abi ABIElementMarshaling) (*subscription, error) {
+func (s *streamManager) getSubscription(ctx context.Context, subID string, okNotFound bool) (sub *subscription, err error) {
+	res, err := s.client.R().
+		SetContext(ctx).
+		SetResult(&sub).
+		Get(fmt.Sprintf("/subscriptions/%s", subID))
+	if err != nil || !res.IsSuccess() {
+		if okNotFound && res.StatusCode() == 404 {
+			return nil, nil
+		}
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
+	}
+	return sub, nil
+}
+
+func (s *streamManager) getSubscriptionName(ctx context.Context, subID string) (string, error) {
+	if cachedValue := s.cache.GetString("sub:" + subID); cachedValue != "" {
+		return cachedValue, nil
+	}
+
+	sub, err := s.getSubscription(ctx, subID, false)
+	if err != nil {
+		return "", err
+	}
+	s.cache.SetString("sub:"+subID, sub.Name)
+	return sub.Name, nil
+}
+
+func (s *streamManager) createSubscription(ctx context.Context, location *Location, stream, subName, firstEvent string, abi *abi.Entry) (*subscription, error) {
 	// Map FireFly "firstEvent" values to Ethereum "fromBlock" values
-	switch fromBlock {
-	case string(fftypes.SubOptsFirstEventOldest):
-		fromBlock = "0"
-	case string(fftypes.SubOptsFirstEventNewest):
-		fromBlock = "latest"
+	switch firstEvent {
+	case string(core.SubOptsFirstEventOldest):
+		firstEvent = "0"
+	case string(core.SubOptsFirstEventNewest):
+		firstEvent = "latest"
 	}
 	sub := subscription{
-		Name:      subName,
-		Stream:    stream,
-		FromBlock: fromBlock,
-		Address:   location.Address,
-		Event:     abi,
+		Name:           subName,
+		Stream:         stream,
+		FromBlock:      firstEvent,
+		EthCompatEvent: abi,
 	}
+
+	if location != nil {
+		sub.EthCompatAddress = location.Address
+	}
+
 	res, err := s.client.R().
 		SetContext(ctx).
 		SetBody(&sub).
 		SetResult(&sub).
 		Post("/subscriptions")
 	if err != nil || !res.IsSuccess() {
-		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
 	return &sub, nil
 }
 
-func (s *streamManager) deleteSubscription(ctx context.Context, subID string) error {
+func (s *streamManager) deleteSubscription(ctx context.Context, subID string, okNotFound bool) error {
 	res, err := s.client.R().
 		SetContext(ctx).
 		Delete("/subscriptions/" + subID)
 	if err != nil || !res.IsSuccess() {
-		return ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthconnectRESTErr)
+		if okNotFound && res.StatusCode() == 404 {
+			return nil
+		}
+		return ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgEthConnectorRESTErr)
 	}
 	return nil
 }
 
-func (s *streamManager) ensureSubscription(ctx context.Context, instancePath, stream string, abi ABIElementMarshaling) (sub *subscription, err error) {
+func (s *streamManager) ensureFireFlySubscription(ctx context.Context, namespace string, version int, instancePath, firstEvent, stream string, abi *abi.Entry) (sub *subscription, err error) {
 	// Include a hash of the instance path in the subscription, so if we ever point at a different
 	// contract configuration, we re-subscribe from block 0.
 	// We don't need full strength hashing, so just use the first 16 chars for readability.
@@ -181,28 +232,40 @@ func (s *streamManager) ensureSubscription(ctx context.Context, instancePath, st
 		return nil, err
 	}
 
-	subName := fmt.Sprintf("%s_%s", abi.Name, instanceUniqueHash)
+	legacyName := abi.Name
+	v1Name := fmt.Sprintf("%s_%s", abi.Name, instanceUniqueHash)
+	v2Name := fmt.Sprintf("%s_%s_%s", namespace, abi.Name, instanceUniqueHash)
 
 	for _, s := range existingSubs {
-		if s.Stream == stream && (s.Name == subName ||
-			/* Check for the plain name we used to use originally, before adding uniqueness qualifier.
-			   If one of these very early environments needed a new subscription, the existing one would need to
+		if s.Stream == stream {
+			/* Check for the deprecated names, before adding namespace uniqueness qualifier.
+			   NOTE: If one of these early environments needed a new subscription, the existing one would need to
 				 be deleted manually. */
-			s.Name == abi.Name) {
-			sub = s
+			if version == 1 {
+				if s.Name == legacyName {
+					log.L(ctx).Warnf("Subscription %s uses a legacy name format '%s' - expected '%s' instead", s.ID, legacyName, v1Name)
+					return s, nil
+				} else if s.Name == v1Name {
+					return s, nil
+				}
+			} else {
+				if s.Name == legacyName || s.Name == v1Name {
+					return nil, i18n.NewError(ctx, coremsgs.MsgInvalidSubscriptionForNetwork, s.Name, version)
+				} else if s.Name == v2Name {
+					return s, nil
+				}
+			}
 		}
 	}
 
-	location := &Location{
-		Address: instancePath,
+	name := v2Name
+	if version == 1 {
+		name = v1Name
 	}
-
-	if sub == nil {
-		if sub, err = s.createSubscription(ctx, location, stream, subName, string(fftypes.SubOptsFirstEventOldest), abi); err != nil {
-			return nil, err
-		}
+	location := &Location{Address: instancePath}
+	if sub, err = s.createSubscription(ctx, location, stream, name, firstEvent, abi); err != nil {
+		return nil, err
 	}
-
 	log.L(ctx).Infof("%s subscription: %s", abi.Name, sub.ID)
 	return sub, nil
 }

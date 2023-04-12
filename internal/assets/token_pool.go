@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,113 +19,130 @@ package assets
 import (
 	"context"
 
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/internal/database/sqlcommon"
 	"github.com/hyperledger/firefly/internal/txcommon"
-	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
-func (am *assetManager) CreateTokenPool(ctx context.Context, ns string, pool *fftypes.TokenPool, waitConfirm bool) (*fftypes.TokenPool, error) {
-	if err := am.data.VerifyNamespaceExists(ctx, ns); err != nil {
-		return nil, err
-	}
+func (am *assetManager) CreateTokenPool(ctx context.Context, pool *core.TokenPoolInput, waitConfirm bool) (*core.TokenPool, error) {
 	if err := fftypes.ValidateFFNameFieldNoUUID(ctx, pool.Name, "name"); err != nil {
 		return nil, err
 	}
-	if existing, err := am.database.GetTokenPool(ctx, ns, pool.Name); err != nil {
+	if existing, err := am.database.GetTokenPool(ctx, am.namespace, pool.Name); err != nil {
 		return nil, err
 	} else if existing != nil {
 		return nil, i18n.NewError(ctx, coremsgs.MsgTokenPoolDuplicate, pool.Name)
 	}
 	pool.ID = fftypes.NewUUID()
-	pool.Namespace = ns
+	pool.Namespace = am.namespace
 
 	if pool.Connector == "" {
-		connector, err := am.getTokenConnectorName(ctx, ns)
+		connector, err := am.getDefaultTokenConnector(ctx)
 		if err != nil {
 			return nil, err
 		}
 		pool.Connector = connector
 	}
 
+	if pool.Interface != nil {
+		if err := am.contracts.ResolveFFIReference(ctx, pool.Interface); err != nil {
+			return nil, err
+		}
+	}
+
 	var err error
-	pool.Key, err = am.identity.NormalizeSigningKey(ctx, pool.Key, am.keyNormalization)
+	pool.Key, err = am.identity.ResolveInputSigningKey(ctx, pool.Key, am.keyNormalization)
 	if err != nil {
 		return nil, err
 	}
 	return am.createTokenPoolInternal(ctx, pool, waitConfirm)
 }
 
-func (am *assetManager) createTokenPoolInternal(ctx context.Context, pool *fftypes.TokenPool, waitConfirm bool) (*fftypes.TokenPool, error) {
+func (am *assetManager) createTokenPoolInternal(ctx context.Context, pool *core.TokenPoolInput, waitConfirm bool) (*core.TokenPool, error) {
 	plugin, err := am.selectTokenPlugin(ctx, pool.Connector)
 	if err != nil {
 		return nil, err
 	}
 
 	if waitConfirm {
-		return am.syncasync.WaitForTokenPool(ctx, pool.Namespace, pool.ID, func(ctx context.Context) error {
+		return am.syncasync.WaitForTokenPool(ctx, pool.ID, func(ctx context.Context) error {
 			_, err := am.createTokenPoolInternal(ctx, pool, false)
 			return err
 		})
 	}
 
-	var op *fftypes.Operation
+	var newOperation *core.Operation
+	var resubmittedOperation *core.Operation
 	err = am.database.RunAsGroup(ctx, func(ctx context.Context) (err error) {
-		txid, err := am.txHelper.SubmitNewTransaction(ctx, pool.Namespace, fftypes.TransactionTypeTokenPool)
+		txid, err := am.txHelper.SubmitNewTransaction(ctx, core.TransactionTypeTokenPool, pool.IdempotencyKey)
 		if err != nil {
+			var resubmitErr error
+
+			// Check if we've clashed on idempotency key. There might be operations still in "Initialized" state that need
+			// submitting to their handlers.
+			if idemErr, ok := err.(*sqlcommon.IdempotencyError); ok {
+				resubmittedOperation, resubmitErr = am.operations.ResubmitOperations(ctx, idemErr.ExistingTXID)
+				if resubmitErr != nil {
+					// Error doing resubmit, return the new error
+					return resubmitErr
+				}
+			}
 			return err
 		}
 
 		pool.TX.ID = txid
-		pool.TX.Type = fftypes.TransactionTypeTokenPool
+		pool.TX.Type = core.TransactionTypeTokenPool
 
-		op = fftypes.NewOperation(
+		newOperation = core.NewOperation(
 			plugin,
-			pool.Namespace,
+			am.namespace,
 			txid,
-			fftypes.OpTypeTokenCreatePool)
-		if err = txcommon.AddTokenPoolCreateInputs(op, pool); err == nil {
-			err = am.database.InsertOperation(ctx, op)
+			core.OpTypeTokenCreatePool)
+		if err = txcommon.AddTokenPoolCreateInputs(newOperation, &pool.TokenPool); err == nil {
+			err = am.operations.AddOrReuseOperation(ctx, newOperation)
 		}
 		return err
 	})
+	if resubmittedOperation != nil {
+		// We resubmitted a previously initialized operation, don't run a new one
+		return &pool.TokenPool, nil
+	}
 	if err != nil {
+		// Any other error? Return the error unchanged
 		return nil, err
 	}
 
-	_, err = am.operations.RunOperation(ctx, opCreatePool(op, pool))
-	return pool, err
+	_, err = am.operations.RunOperation(ctx, opCreatePool(newOperation, &pool.TokenPool))
+	return &pool.TokenPool, err
 }
 
-func (am *assetManager) ActivateTokenPool(ctx context.Context, pool *fftypes.TokenPool) error {
+func (am *assetManager) ActivateTokenPool(ctx context.Context, pool *core.TokenPool) error {
 	plugin, err := am.selectTokenPlugin(ctx, pool.Connector)
 	if err != nil {
 		return err
 	}
 
-	var op *fftypes.Operation
+	var op *core.Operation
 	err = am.database.RunAsGroup(ctx, func(ctx context.Context) (err error) {
-		fb := database.OperationQueryFactory.NewFilter(ctx)
-		filter := fb.And(
-			fb.Eq("tx", pool.TX.ID),
-			fb.Eq("type", fftypes.OpTypeTokenActivatePool),
-		)
-		if existing, _, err := am.database.GetOperations(ctx, filter); err != nil {
+		if existing, err := am.txHelper.FindOperationInTransaction(ctx, pool.TX.ID, core.OpTypeTokenActivatePool); err != nil {
 			return err
-		} else if len(existing) > 0 {
+		} else if existing != nil {
 			log.L(ctx).Debugf("Dropping duplicate token pool activation request for pool %s", pool.ID)
 			return nil
 		}
 
-		op = fftypes.NewOperation(
+		op = core.NewOperation(
 			plugin,
-			pool.Namespace,
+			am.namespace,
 			pool.TX.ID,
-			fftypes.OpTypeTokenActivatePool)
+			core.OpTypeTokenActivatePool)
 		txcommon.AddTokenPoolActivateInputs(op, pool.ID)
-		return am.database.InsertOperation(ctx, op)
+		return am.operations.AddOrReuseOperation(ctx, op)
 	})
 	if err != nil || op == nil {
 		return err
@@ -135,24 +152,18 @@ func (am *assetManager) ActivateTokenPool(ctx context.Context, pool *fftypes.Tok
 	return err
 }
 
-func (am *assetManager) GetTokenPools(ctx context.Context, ns string, filter database.AndFilter) ([]*fftypes.TokenPool, *database.FilterResult, error) {
-	if err := fftypes.ValidateFFNameField(ctx, ns, "namespace"); err != nil {
-		return nil, nil, err
-	}
-	return am.database.GetTokenPools(ctx, am.scopeNS(ns, filter))
+func (am *assetManager) GetTokenPools(ctx context.Context, filter ffapi.AndFilter) ([]*core.TokenPool, *ffapi.FilterResult, error) {
+	return am.database.GetTokenPools(ctx, am.namespace, filter)
 }
 
-func (am *assetManager) GetTokenPool(ctx context.Context, ns, connector, poolName string) (*fftypes.TokenPool, error) {
+func (am *assetManager) GetTokenPool(ctx context.Context, connector, poolName string) (*core.TokenPool, error) {
 	if _, err := am.selectTokenPlugin(ctx, connector); err != nil {
-		return nil, err
-	}
-	if err := fftypes.ValidateFFNameField(ctx, ns, "namespace"); err != nil {
 		return nil, err
 	}
 	if err := fftypes.ValidateFFNameFieldNoUUID(ctx, poolName, "name"); err != nil {
 		return nil, err
 	}
-	pool, err := am.database.GetTokenPool(ctx, ns, poolName)
+	pool, err := am.database.GetTokenPool(ctx, am.namespace, poolName)
 	if err != nil {
 		return nil, err
 	}
@@ -162,26 +173,34 @@ func (am *assetManager) GetTokenPool(ctx context.Context, ns, connector, poolNam
 	return pool, nil
 }
 
-func (am *assetManager) GetTokenPoolByNameOrID(ctx context.Context, ns, poolNameOrID string) (*fftypes.TokenPool, error) {
-	if err := fftypes.ValidateFFNameField(ctx, ns, "namespace"); err != nil {
-		return nil, err
-	}
-
-	var pool *fftypes.TokenPool
+func (am *assetManager) GetTokenPoolByNameOrID(ctx context.Context, poolNameOrID string) (*core.TokenPool, error) {
+	var pool *core.TokenPool
 
 	poolID, err := fftypes.ParseUUID(ctx, poolNameOrID)
 	if err != nil {
 		if err := fftypes.ValidateFFNameField(ctx, poolNameOrID, "name"); err != nil {
 			return nil, err
 		}
-		if pool, err = am.database.GetTokenPool(ctx, ns, poolNameOrID); err != nil {
+		if pool, err = am.database.GetTokenPool(ctx, am.namespace, poolNameOrID); err != nil {
 			return nil, err
 		}
-	} else if pool, err = am.database.GetTokenPoolByID(ctx, poolID); err != nil {
+	} else if pool, err = am.database.GetTokenPoolByID(ctx, am.namespace, poolID); err != nil {
 		return nil, err
 	}
 	if pool == nil {
 		return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 	}
 	return pool, nil
+}
+
+func (am *assetManager) ResolvePoolMethods(ctx context.Context, pool *core.TokenPool) error {
+	plugin, err := am.selectTokenPlugin(ctx, pool.Connector)
+	if err == nil && pool.Interface != nil && pool.Interface.ID != nil && am.contracts != nil {
+		var methods []*fftypes.FFIMethod
+		methods, err = am.contracts.GetFFIMethods(ctx, pool.Interface.ID)
+		if err == nil {
+			pool.Methods, err = plugin.CheckInterface(ctx, pool, methods)
+		}
+	}
+	return err
 }

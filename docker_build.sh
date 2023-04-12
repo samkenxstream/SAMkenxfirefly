@@ -35,8 +35,11 @@ echo SOLIDITY_BUILDER_TAG=$SOLIDITY_BUILDER_TAG
 echo BASE_TAG=$BASE_TAG
 echo UI_TAG=$UI_TAG
 echo UI_RELEASE=$UI_RELEASE
+echo BUILD_VERSION=$BUILD_VERSION
+echo GIT_REF=$GIT_REF
 
-docker build \
+docker buildx create --name firefly --use
+docker buildx build \
     -t hyperledger/firefly \
     --build-arg FIREFLY_BUILDER_TAG=$FIREFLY_BUILDER_TAG \
     --build-arg FABRIC_BUILDER_TAG=$FABRIC_BUILDER_TAG \
@@ -45,5 +48,8 @@ docker build \
     --build-arg BASE_TAG=$BASE_TAG \
     --build-arg UI_TAG=$UI_TAG \
     --build-arg UI_RELEASE=$UI_RELEASE \
+    --build-arg BUILD_VERSION=$BUILD_VERSION \
+    --build-arg GIT_REF=$GIT_REF \
     $@ \
     .
+docker buildx rm firefly --keep-state

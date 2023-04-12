@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,9 +19,10 @@ package events
 import (
 	"context"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/pkg/blockchain"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 // BatchPinComplete is called in-line with a particular ledger's stream of events, so while we
@@ -30,14 +31,22 @@ import (
 //
 // We must block here long enough to get the payload from the sharedstorage, persist the messages in the correct
 // sequence, and also persist all the data.
-func (em *eventManager) BatchPinComplete(bi blockchain.Plugin, batchPin *blockchain.BatchPin, signingKey *fftypes.VerifierRef) error {
+func (em *eventManager) BatchPinComplete(namespace string, batchPin *blockchain.BatchPin, signingKey *core.VerifierRef) error {
+	if em.multiparty == nil {
+		log.L(em.ctx).Errorf("Ignoring batch pin from non-multiparty network!")
+		return nil
+	}
 	if batchPin.TransactionID == nil {
 		log.L(em.ctx).Errorf("Invalid BatchPin transaction - ID is nil")
 		return nil // move on
 	}
-	if err := fftypes.ValidateFFNameField(em.ctx, batchPin.Namespace, "namespace"); err != nil {
-		log.L(em.ctx).Errorf("Invalid transaction ID='%s' - invalid namespace '%s': %a", batchPin.TransactionID, batchPin.Namespace, err)
+	if namespace != em.namespace.Name {
+		log.L(em.ctx).Debugf("Ignoring batch pin from different namespace '%s'", namespace)
 		return nil // move on
+	}
+
+	if batchPin.TransactionType == "" {
+		batchPin.TransactionType = core.TransactionTypeBatchPin
 	}
 
 	log.L(em.ctx).Infof("-> BatchPinComplete batch=%s txn=%s signingIdentity=%s", batchPin.BatchID, batchPin.Event.ProtocolID, signingKey.Value)
@@ -55,12 +64,12 @@ func (em *eventManager) BatchPinComplete(bi blockchain.Plugin, batchPin *blockch
 			if err := em.persistBatchTransaction(ctx, batchPin); err != nil {
 				return err
 			}
-			chainEvent := buildBlockchainEvent(batchPin.Namespace, nil, &batchPin.Event, &fftypes.BlockchainTransactionRef{
-				Type:         fftypes.TransactionTypeBatchPin,
+			chainEvent := buildBlockchainEvent(em.namespace.Name, nil, &batchPin.Event, &core.BlockchainTransactionRef{
+				Type:         batchPin.TransactionType,
 				ID:           batchPin.TransactionID,
 				BlockchainID: batchPin.Event.BlockchainTXID,
 			})
-			if err := em.maybePersistBlockchainEvent(ctx, chainEvent); err != nil {
+			if err := em.maybePersistBlockchainEvent(ctx, chainEvent, nil); err != nil {
 				return err
 			}
 			em.emitBlockchainEventMetric(&batchPin.Event)
@@ -68,9 +77,17 @@ func (em *eventManager) BatchPinComplete(bi blockchain.Plugin, batchPin *blockch
 			if err := em.persistContexts(ctx, batchPin, signingKey, private); err != nil {
 				return err
 			}
-			// Kick off a download for broadcast batches
-			if !private {
-				if err := em.sharedDownload.InitiateDownloadBatch(ctx, batchPin.Namespace, batchPin.TransactionID, batchPin.BatchPayloadRef); err != nil {
+
+			batch, _, err := em.aggregator.GetBatchForPin(ctx, &core.Pin{
+				Batch:     batchPin.BatchID,
+				BatchHash: batchPin.BatchHash,
+			})
+			if err != nil {
+				return err
+			}
+			// Kick off a download for broadcast batches if the batch isn't already persisted
+			if !private && batch == nil {
+				if err := em.sharedDownload.InitiateDownloadBatch(ctx, batchPin.TransactionID, batchPin.BatchPayloadRef); err != nil {
 					return err
 				}
 			}
@@ -81,14 +98,15 @@ func (em *eventManager) BatchPinComplete(bi blockchain.Plugin, batchPin *blockch
 }
 
 func (em *eventManager) persistBatchTransaction(ctx context.Context, batchPin *blockchain.BatchPin) error {
-	_, err := em.txHelper.PersistTransaction(ctx, batchPin.Namespace, batchPin.TransactionID, fftypes.TransactionTypeBatchPin, batchPin.Event.BlockchainTXID)
+	_, err := em.txHelper.PersistTransaction(ctx, batchPin.TransactionID, batchPin.TransactionType, batchPin.Event.BlockchainTXID)
 	return err
 }
 
-func (em *eventManager) persistContexts(ctx context.Context, batchPin *blockchain.BatchPin, signingKey *fftypes.VerifierRef, private bool) error {
-	pins := make([]*fftypes.Pin, len(batchPin.Contexts))
+func (em *eventManager) persistContexts(ctx context.Context, batchPin *blockchain.BatchPin, signingKey *core.VerifierRef, private bool) error {
+	pins := make([]*core.Pin, len(batchPin.Contexts))
 	for idx, hash := range batchPin.Contexts {
-		pins[idx] = &fftypes.Pin{
+		pins[idx] = &core.Pin{
+			Namespace: em.namespace.Name,
 			Masked:    private,
 			Hash:      hash,
 			Batch:     batchPin.BatchID,

@@ -24,7 +24,7 @@ import (
 	"testing"
 
 	"github.com/hyperledger/firefly/mocks/apiservermocks"
-	"github.com/hyperledger/firefly/mocks/orchestratormocks"
+	"github.com/hyperledger/firefly/mocks/namespacemocks"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -33,20 +33,20 @@ import (
 const configDir = "../test/data/config"
 
 func TestGetEngine(t *testing.T) {
-	assert.NotNil(t, getOrchestrator())
+	assert.NotNil(t, getRootManager())
 }
 
 func TestExecMissingConfig(t *testing.T) {
-	_utOrchestrator = &orchestratormocks.Orchestrator{}
-	defer func() { _utOrchestrator = nil }()
+	_utManager = &namespacemocks.Manager{}
+	defer func() { _utManager = nil }()
 	viper.Reset()
 	err := Execute()
 	assert.Regexp(t, "Not Found", err)
 }
 
 func TestShowConfig(t *testing.T) {
-	_utOrchestrator = &orchestratormocks.Orchestrator{}
-	defer func() { _utOrchestrator = nil }()
+	_utManager = &namespacemocks.Manager{}
+	defer func() { _utManager = nil }()
 	viper.Reset()
 	rootCmd.SetArgs([]string{"showconf"})
 	defer rootCmd.SetArgs([]string{})
@@ -55,34 +55,33 @@ func TestShowConfig(t *testing.T) {
 }
 
 func TestExecEngineInitFail(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
-	o.On("Init", mock.Anything, mock.Anything).Return(fmt.Errorf("splutter"))
-	_utOrchestrator = o
-	defer func() { _utOrchestrator = nil }()
+	o := &namespacemocks.Manager{}
+	o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("splutter"))
+	_utManager = o
+	defer func() { _utManager = nil }()
 	os.Chdir(configDir)
 	err := Execute()
 	assert.Regexp(t, "splutter", err)
 }
 
 func TestExecEngineStartFail(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
-	o.On("Init", mock.Anything, mock.Anything).Return(nil)
+	o := &namespacemocks.Manager{}
+	o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	o.On("Start").Return(fmt.Errorf("bang"))
-	_utOrchestrator = o
-	defer func() { _utOrchestrator = nil }()
+	_utManager = o
+	defer func() { _utManager = nil }()
 	os.Chdir(configDir)
 	err := Execute()
 	assert.Regexp(t, "bang", err)
 }
 
 func TestExecOkExitSIGINT(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
-	o.On("Init", mock.Anything, mock.Anything).Return(nil)
-	o.On("IsPreInit").Return(false)
+	o := &namespacemocks.Manager{}
+	o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	o.On("Start").Return(nil)
 	o.On("WaitStop").Return()
-	_utOrchestrator = o
-	defer func() { _utOrchestrator = nil }()
+	_utManager = o
+	defer func() { _utManager = nil }()
 
 	os.Chdir(configDir)
 	go func() {
@@ -92,69 +91,81 @@ func TestExecOkExitSIGINT(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestExecOkRestartThenExit(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
-	o.On("IsPreInit").Return(false)
-	var orContext context.Context
-	initCount := 0
-	init := o.On("Init", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+func TestExecOkCancel(t *testing.T) {
+	o := &namespacemocks.Manager{}
+	init := o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	init.RunFn = func(a mock.Arguments) {
-		orContext = a[0].(context.Context)
-		cancelOrContext := a[1].(context.CancelFunc)
+		cancelCtx := a[1].(context.CancelFunc)
+		cancelCtx()
+	}
+	o.On("Start").Return(nil)
+	o.On("WaitStop")
+	_utManager = o
+	defer func() { _utManager = nil }()
+
+	os.Chdir(configDir)
+	err := run()
+	assert.NoError(t, err)
+}
+
+func TestExecOkRestartThenExit(t *testing.T) {
+	o := &namespacemocks.Manager{}
+	initCount := 0
+	init := o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	init.RunFn = func(a mock.Arguments) {
+		resetChan := a[2].(chan bool)
 		initCount++
 		if initCount == 2 {
 			init.ReturnArguments = mock.Arguments{fmt.Errorf("second run")}
+		} else {
+			resetChan <- true
 		}
-		cancelOrContext()
 	}
 	o.On("Start").Return(nil)
-	ws := o.On("WaitStop")
-	ws.RunFn = func(a mock.Arguments) {
-		<-orContext.Done()
-	}
-	_utOrchestrator = o
-	defer func() { _utOrchestrator = nil }()
+	o.On("WaitStop")
+	_utManager = o
+	defer func() { _utManager = nil }()
 
 	os.Chdir(configDir)
-	err := Execute()
+	err := run()
 	assert.EqualError(t, err, "second run")
 }
 
 func TestExecOkRestartConfigProblem(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
+	o := &namespacemocks.Manager{}
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "ut")
 	assert.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
-	o.On("IsPreInit").Return(false)
 	var orContext context.Context
-	init := o.On("Init", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	init := o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	init.RunFn = func(a mock.Arguments) {
 		orContext = a[0].(context.Context)
-		cancelOrContext := a[1].(context.CancelFunc)
-		cancelOrContext()
+		resetChan := a[2].(chan bool)
+		resetChan <- true
 	}
 	o.On("Start").Return(nil)
 	o.On("WaitStop").Run(func(args mock.Arguments) {
 		<-orContext.Done()
 		os.Chdir(tmpDir) // this will mean we fail to read the config
 	})
-	_utOrchestrator = o
-	defer func() { _utOrchestrator = nil }()
+	_utManager = o
+	defer func() { _utManager = nil }()
 
 	os.Chdir(configDir)
-	err = Execute()
+	err = run()
 	assert.Regexp(t, "Config File.*Not Found", err)
 }
 
 func TestAPIServerError(t *testing.T) {
-	o := &orchestratormocks.Orchestrator{}
-	o.On("Init", mock.Anything, mock.Anything).Return(nil)
+	o := &namespacemocks.Manager{}
+	o.On("Init", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	o.On("Start").Return(nil)
 	as := &apiservermocks.Server{}
 	as.On("Serve", mock.Anything, o).Return(fmt.Errorf("pop"))
 
 	errChan := make(chan error)
-	go startFirefly(context.Background(), func() {}, o, as, errChan)
+	resetChan := make(chan bool)
+	go startFirefly(context.Background(), func() {}, o, as, errChan, resetChan, make(chan struct{}))
 	err := <-errChan
 	assert.EqualError(t, err, "pop")
 }

@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,10 +19,11 @@ package events
 import (
 	"context"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/txcommon"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
 	"github.com/hyperledger/firefly/pkg/tokens"
 )
 
@@ -30,31 +31,24 @@ import (
 // This will ensure that the original LocalID provided to the user can later be used in a lookup, and also causes requests that
 // use "confirm=true" to resolve as expected.
 // Must follow these rules to reuse the LocalID:
-// - The transaction ID on the approval must match a transaction+operation initiated by this node.
-// - The connector and pool for this event must match the connector and pool targeted by the initial operation. Connectors are
-//   allowed to trigger side-effects in other pools, but only the event from the targeted pool should use the original LocalID.
-// - The LocalID must not have been used yet. Connectors are allowed to emit multiple events in response to a single operation,
-//   but only the first of them can use the original LocalID.
-func (em *eventManager) loadApprovalID(ctx context.Context, tx *fftypes.UUID, approval *fftypes.TokenApproval) (*fftypes.UUID, error) {
-	// Find a matching operation within the transaction
-	fb := database.OperationQueryFactory.NewFilter(ctx)
-	filter := fb.And(
-		fb.Eq("tx", tx),
-		fb.Eq("type", fftypes.OpTypeTokenApproval),
-	)
-	operations, _, err := em.database.GetOperations(ctx, filter)
+//   - The transaction ID on the approval must match a transaction+operation initiated by this node.
+//   - The connector and pool for this event must match the connector and pool targeted by the initial operation. Connectors are
+//     allowed to trigger side-effects in other pools, but only the event from the targeted pool should use the original LocalID.
+//   - The LocalID must not have been used yet. Connectors are allowed to emit multiple events in response to a single operation,
+//     but only the first of them can use the original LocalID.
+func (em *eventManager) loadApprovalID(ctx context.Context, tx *fftypes.UUID, approval *core.TokenApproval) (*fftypes.UUID, error) {
+	op, err := em.txHelper.FindOperationInTransaction(ctx, tx, core.OpTypeTokenApproval)
 	if err != nil {
 		return nil, err
 	}
-
-	if len(operations) > 0 {
+	if op != nil {
 		// This approval matches an approval transaction+operation submitted by this node.
 		// Check the operation inputs to see if they match the connector and pool on this event.
-		if input, err := txcommon.RetrieveTokenApprovalInputs(ctx, operations[0]); err != nil {
+		if input, err := txcommon.RetrieveTokenApprovalInputs(ctx, op); err != nil {
 			log.L(ctx).Warnf("Failed to read operation inputs for token approval '%s': %s", approval.Subject, err)
 		} else if input != nil && input.Connector == approval.Connector && input.Pool.Equals(approval.Pool) {
 			// Check if the LocalID has already been used
-			if existing, err := em.database.GetTokenApprovalByID(ctx, input.LocalID); err != nil {
+			if existing, err := em.database.GetTokenApprovalByID(ctx, em.namespace.Name, input.LocalID); err != nil {
 				return nil, err
 			} else if existing == nil {
 				// Everything matches - use the LocalID that was assigned up-front when the operation was submitted
@@ -69,7 +63,7 @@ func (em *eventManager) loadApprovalID(ctx context.Context, tx *fftypes.UUID, ap
 func (em *eventManager) persistTokenApproval(ctx context.Context, approval *tokens.TokenApproval) (valid bool, err error) {
 	// Check that this is from a known pool
 	// TODO: should cache this lookup for efficiency
-	pool, err := em.database.GetTokenPoolByLocator(ctx, approval.Connector, approval.PoolLocator)
+	pool, err := em.database.GetTokenPoolByLocator(ctx, em.namespace.Name, approval.Connector, approval.PoolLocator)
 	if err != nil {
 		return false, err
 	}
@@ -81,7 +75,7 @@ func (em *eventManager) persistTokenApproval(ctx context.Context, approval *toke
 	approval.Pool = pool.ID
 
 	// Check that approval has not already been recorded
-	if existing, err := em.database.GetTokenApprovalByProtocolID(ctx, approval.Pool, approval.ProtocolID); err != nil {
+	if existing, err := em.database.GetTokenApprovalByProtocolID(ctx, em.namespace.Name, approval.Connector, approval.ProtocolID); err != nil {
 		return false, err
 	} else if existing != nil {
 		log.L(ctx).Warnf("Token approval '%s' has already been recorded - ignoring", approval.ProtocolID)
@@ -94,20 +88,20 @@ func (em *eventManager) persistTokenApproval(ctx context.Context, approval *toke
 		if approval.LocalID, err = em.loadApprovalID(ctx, approval.TX.ID, &approval.TokenApproval); err != nil {
 			return false, err
 		}
-		if valid, err := em.txHelper.PersistTransaction(ctx, approval.Namespace, approval.TX.ID, approval.TX.Type, approval.Event.BlockchainTXID); err != nil || !valid {
+		if valid, err := em.txHelper.PersistTransaction(ctx, approval.TX.ID, approval.TX.Type, approval.Event.BlockchainTXID); err != nil || !valid {
 			return valid, err
 		}
 	}
 
-	chainEvent := buildBlockchainEvent(approval.Namespace, nil, &approval.Event, &fftypes.BlockchainTransactionRef{
+	chainEvent := buildBlockchainEvent(approval.Namespace, nil, approval.Event, &core.BlockchainTransactionRef{
 		ID:           approval.TX.ID,
 		Type:         approval.TX.Type,
 		BlockchainID: approval.Event.BlockchainTXID,
 	})
-	if err := em.maybePersistBlockchainEvent(ctx, chainEvent); err != nil {
+	if err := em.maybePersistBlockchainEvent(ctx, chainEvent, nil); err != nil {
 		return false, err
 	}
-	em.emitBlockchainEventMetric(&approval.Event)
+	em.emitBlockchainEventMetric(approval.Event)
 	approval.BlockchainEvent = chainEvent.ID
 
 	fb := database.TokenApprovalQueryFactory.NewFilter(ctx)
@@ -132,17 +126,42 @@ func (em *eventManager) persistTokenApproval(ctx context.Context, approval *toke
 }
 
 func (em *eventManager) TokensApproved(ti tokens.Plugin, approval *tokens.TokenApproval) error {
+	var msgIDforRewind *fftypes.UUID
+
 	err := em.retry.Do(em.ctx, "persist token approval", func(attempt int) (bool, error) {
 		err := em.database.RunAsGroup(em.ctx, func(ctx context.Context) error {
 			if valid, err := em.persistTokenApproval(ctx, approval); !valid || err != nil {
 				return err
 			}
 
-			event := fftypes.NewEvent(fftypes.EventTypeApprovalConfirmed, approval.Namespace, approval.LocalID, approval.TX.ID, approval.Pool.String())
+			if approval.Message != nil {
+				msg, err := em.database.GetMessageByID(ctx, em.namespace.Name, approval.Message)
+				switch {
+				case err != nil:
+					return err
+				case msg != nil && msg.State == core.MessageStateStaged:
+					// Message can now be sent
+					msg.State = core.MessageStateReady
+					if err := em.database.ReplaceMessage(ctx, msg); err != nil {
+						return err
+					}
+				default:
+					// Message might already have been received, we need to rewind
+					msgIDforRewind = approval.Message
+				}
+			}
+			em.emitBlockchainEventMetric(approval.Event)
+
+			event := core.NewEvent(core.EventTypeApprovalConfirmed, approval.Namespace, approval.LocalID, approval.TX.ID, approval.Pool.String())
 			return em.database.InsertEvent(ctx, event)
 		})
 		return err != nil, err // retry indefinitely (until context closes)
 	})
+
+	// Initiate a rewind if a batch was potentially completed by the arrival of this transfer
+	if err == nil && msgIDforRewind != nil {
+		em.aggregator.queueMessageRewind(msgIDforRewind)
+	}
 
 	return err
 }

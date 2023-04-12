@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,26 +21,26 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/ffresty"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/events"
-	"github.com/hyperledger/firefly/pkg/ffresty"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 type WebHooks struct {
 	ctx          context.Context
 	capabilities *events.Capabilities
-	callbacks    events.Callbacks
+	callbacks    map[string]events.Callbacks
 	client       *resty.Client
 	connID       string
 }
@@ -62,116 +62,33 @@ type whResponse struct {
 
 func (wh *WebHooks) Name() string { return "webhooks" }
 
-func (wh *WebHooks) Init(ctx context.Context, prefix config.Prefix, callbacks events.Callbacks) (err error) {
+func (wh *WebHooks) Init(ctx context.Context, config config.Section) (err error) {
+	connID := fftypes.ShortID()
 	*wh = WebHooks{
-		ctx:          ctx,
+		ctx:          log.WithLogField(ctx, "webhook", wh.connID),
 		capabilities: &events.Capabilities{},
-		callbacks:    callbacks,
-		client:       ffresty.New(ctx, prefix),
-		connID:       fftypes.ShortID(),
+		callbacks:    make(map[string]events.Callbacks),
+		client:       ffresty.New(ctx, config),
+		connID:       connID,
 	}
+	return nil
+}
+
+func (wh *WebHooks) SetHandler(namespace string, handler events.Callbacks) error {
+	wh.callbacks[namespace] = handler
 	// We have a single logical connection, that matches all subscriptions
-	return callbacks.RegisterConnection(wh.connID, func(sr fftypes.SubscriptionRef) bool { return true })
+	return handler.RegisterConnection(wh.connID, func(sr core.SubscriptionRef) bool { return true })
 }
 
 func (wh *WebHooks) Capabilities() *events.Capabilities {
 	return wh.capabilities
 }
 
-func (wh *WebHooks) GetOptionsSchema(ctx context.Context) string {
-	return fmt.Sprintf(`{
-		"properties": {
-			"fastack": {
-				"type": "boolean",
-				"description": "%s"
-			},
-			"url": {
-				"type": "string",
-				"description": "%s"
-			},
-			"method": {
-				"type": "string",
-				"description": "%s"
-			},
-			"json": {
-				"type": "boolean",
-				"description": "%s"
-			},
-			"reply": {
-				"type": "boolean",
-				"description": "%s"
-			},
-			"replytag": {
-				"type": "string",
-				"description": "%s"
-			},
-			"replytx": {
-				"type": "string",
-				"description": "%s"
-			},
-			"headers": {
-				"type": "object",
-				"description": "%s",
-				"additionalProperties": {
-					"type": "string"
-				}
-			},
-			"query": {
-				"type": "object",
-				"description": "%s",
-				"additionalProperties": {
-					"type": "string"
-				}
-			},
-			"input": {
-				"type": "object",
-				"description": "%s",
-				"properties": {
-					"query": {
-						"type": "string",
-						"description": "%s"
-					},
-					"headers": {
-						"type": "string",
-						"description": "%s"
-					},
-					"body": {
-						"type": "string",
-						"description": "%s"
-					},
-					"path": {
-						"type": "string",
-						"description": "%s"
-					},
-					"replytx": {
-						"type": "string",
-						"description": "%s"
-					}
-				}
-			}
-		}
-	}`,
-		i18n.Expand(ctx, coremsgs.WebhooksOptFastAck),
-		i18n.Expand(ctx, coremsgs.WebhooksOptURL),
-		i18n.Expand(ctx, coremsgs.WebhooksOptMethod),
-		i18n.Expand(ctx, coremsgs.WebhooksOptJSON),
-		i18n.Expand(ctx, coremsgs.WebhooksOptReply),
-		i18n.Expand(ctx, coremsgs.WebhooksOptReplyTag),
-		i18n.Expand(ctx, coremsgs.WebhooksOptReplyTx),
-		i18n.Expand(ctx, coremsgs.WebhooksOptHeaders),
-		i18n.Expand(ctx, coremsgs.WebhooksOptQuery),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInput),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInputQuery),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInputHeaders),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInputBody),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInputPath),
-		i18n.Expand(ctx, coremsgs.WebhooksOptInputReplyTx),
-	)
-}
-
 func (wh *WebHooks) buildRequest(options fftypes.JSONObject, firstData fftypes.JSONObject) (req *whRequest, err error) {
 	req = &whRequest{
-		r:         wh.client.R().SetDoNotParseResponse(true),
+		r: wh.client.R().
+			SetDoNotParseResponse(true).
+			SetContext(wh.ctx),
 		url:       options.GetString("url"),
 		method:    options.GetString("method"),
 		forceJSON: options.GetBool("json"),
@@ -245,7 +162,7 @@ func (wh *WebHooks) buildRequest(options fftypes.JSONObject, firstData fftypes.J
 			if len(txType) > 0 {
 				req.replyTx = txType
 				if strings.EqualFold(txType, "true") {
-					req.replyTx = string(fftypes.TransactionTypeBatchPin)
+					req.replyTx = string(core.TransactionTypeBatchPin)
 				}
 			}
 		}
@@ -253,7 +170,7 @@ func (wh *WebHooks) buildRequest(options fftypes.JSONObject, firstData fftypes.J
 	return req, err
 }
 
-func (wh *WebHooks) ValidateOptions(options *fftypes.SubscriptionOptions) error {
+func (wh *WebHooks) ValidateOptions(options *core.SubscriptionOptions) error {
 	if options.WithData == nil {
 		defaultTrue := true
 		options.WithData = &defaultTrue
@@ -262,7 +179,7 @@ func (wh *WebHooks) ValidateOptions(options *fftypes.SubscriptionOptions) error 
 	return err
 }
 
-func (wh *WebHooks) attemptRequest(sub *fftypes.Subscription, event *fftypes.EventDelivery, data fftypes.DataArray) (req *whRequest, res *whResponse, err error) {
+func (wh *WebHooks) attemptRequest(sub *core.Subscription, event *core.EventDelivery, data core.DataArray) (req *whRequest, res *whResponse, err error) {
 	withData := sub.Options.WithData != nil && *sub.Options.WithData
 	allData := make([]*fftypes.JSONAny, 0, len(data))
 	var firstData fftypes.JSONObject
@@ -294,23 +211,26 @@ func (wh *WebHooks) attemptRequest(sub *fftypes.Subscription, event *fftypes.Eve
 
 	if req.method == http.MethodPost || req.method == http.MethodPatch || req.method == http.MethodPut {
 		switch {
-		case !withData:
-			// We are just sending the event itself
-			req.r.SetBody(event)
 		case req.body != nil:
 			// We might have been told to extract a body from the first data record
 			req.r.SetBody(req.body)
 		case len(allData) > 1:
 			// We've got an array of data to POST
 			req.r.SetBody(allData)
-		default:
-			// Otherwise just send the first object directly
+		case len(allData) == 1:
+			// Just send the first object directly
 			req.r.SetBody(firstData)
+		default:
+			// Just send the event itself
+			req.r.SetBody(event)
+
 		}
 	}
 
+	log.L(wh.ctx).Debugf("Webhook-> %s %s event %s on subscription %s", req.method, req.url, event.ID, sub.ID)
 	resp, err := req.r.Execute(req.method, req.url)
 	if err != nil {
+		log.L(wh.ctx).Errorf("Webhook<- %s %s event %s on subscription %s failed: %s", req.method, req.url, event.ID, sub.ID, err)
 		return nil, nil, err
 	}
 	defer func() { _ = resp.RawBody().Close() }()
@@ -319,6 +239,7 @@ func (wh *WebHooks) attemptRequest(sub *fftypes.Subscription, event *fftypes.Eve
 		Status:  resp.StatusCode(),
 		Headers: fftypes.JSONObject{},
 	}
+	log.L(wh.ctx).Infof("Webhook<- %s %s event %s on subscription %s returned %d", req.method, req.url, event.ID, sub.ID, res.Status)
 	header := resp.Header()
 	for h := range header {
 		res.Headers[h] = header.Get(h)
@@ -351,7 +272,7 @@ func (wh *WebHooks) attemptRequest(sub *fftypes.Subscription, event *fftypes.Eve
 	return req, res, nil
 }
 
-func (wh *WebHooks) doDelivery(connID string, reply bool, sub *fftypes.Subscription, event *fftypes.EventDelivery, data fftypes.DataArray) error {
+func (wh *WebHooks) doDelivery(connID string, reply bool, sub *core.Subscription, event *core.EventDelivery, data core.DataArray, fastAck bool) {
 	req, res, gwErr := wh.attemptRequest(sub, event, data)
 	if gwErr != nil {
 		// Generate a bad-gateway error response - we always want to send something back,
@@ -372,63 +293,77 @@ func (wh *WebHooks) doDelivery(connID string, reply bool, sub *fftypes.Subscript
 	log.L(wh.ctx).Tracef("Webhook response: %s", string(b))
 
 	// Emit the response
-	if reply {
+	if reply && event.Message != nil {
 		txType := fftypes.FFEnum(strings.ToLower(sub.Options.TransportOptions().GetString("replytx")))
 		if req != nil && req.replyTx != "" {
 			txType = fftypes.FFEnum(strings.ToLower(req.replyTx))
 		}
-		wh.callbacks.DeliveryResponse(connID, &fftypes.EventDeliveryResponse{
-			ID:           event.ID,
-			Rejected:     false,
-			Subscription: event.Subscription,
-			Reply: &fftypes.MessageInOut{
-				Message: fftypes.Message{
-					Header: fftypes.MessageHeader{
-						CID:    event.Message.Header.ID,
-						Group:  event.Message.Header.Group,
-						Type:   event.Message.Header.Type,
-						Topics: event.Message.Header.Topics,
-						Tag:    sub.Options.TransportOptions().GetString("replytag"),
-						TxType: txType,
+		if cb, ok := wh.callbacks[sub.Namespace]; ok {
+			log.L(wh.ctx).Debugf("Sending reply message for %s CID=%s", event.ID, event.Message.Header.ID)
+			cb.DeliveryResponse(connID, &core.EventDeliveryResponse{
+				ID:           event.ID,
+				Rejected:     false,
+				Subscription: event.Subscription,
+				Reply: &core.MessageInOut{
+					Message: core.Message{
+						Header: core.MessageHeader{
+							CID:    event.Message.Header.ID,
+							Group:  event.Message.Header.Group,
+							Type:   event.Message.Header.Type,
+							Topics: event.Message.Header.Topics,
+							Tag:    sub.Options.TransportOptions().GetString("replytag"),
+							TxType: txType,
+						},
+					},
+					InlineData: core.InlineData{
+						{Value: fftypes.JSONAnyPtrBytes(b)},
 					},
 				},
-				InlineData: fftypes.InlineData{
-					{Value: fftypes.JSONAnyPtrBytes(b)},
-				},
-			},
-		})
+			})
+		}
+	} else if !fastAck {
+		if cb, ok := wh.callbacks[sub.Namespace]; ok {
+			cb.DeliveryResponse(connID, &core.EventDeliveryResponse{
+				ID:           event.ID,
+				Rejected:     false,
+				Subscription: event.Subscription,
+			})
+		}
 	}
-	return nil
 }
 
-func (wh *WebHooks) DeliveryRequest(connID string, sub *fftypes.Subscription, event *fftypes.EventDelivery, data fftypes.DataArray) error {
-	if event.Message == nil && sub.Options.WithData != nil && *sub.Options.WithData {
-		log.L(wh.ctx).Debugf("Webhook withData=true subscription called with non-message event '%s'", event.ID)
-		return nil
-	}
-
+func (wh *WebHooks) DeliveryRequest(connID string, sub *core.Subscription, event *core.EventDelivery, data core.DataArray) error {
 	reply := sub.Options.TransportOptions().GetBool("reply")
-	if reply && event.Message.Header.CID != nil {
+	if reply && event.Message != nil && event.Message.Header.CID != nil {
 		// We cowardly refuse to dispatch a message that is itself a reply, as it's hard for users to
 		// avoid loops - and there's no way for us to detect here if a user has configured correctly
 		// to avoid a loop.
 		log.L(wh.ctx).Debugf("Webhook subscription with reply enabled called with reply event '%s'", event.ID)
-		wh.callbacks.DeliveryResponse(connID, &fftypes.EventDeliveryResponse{
-			ID:           event.ID,
-			Rejected:     false,
-			Subscription: event.Subscription,
-		})
+		if cb, ok := wh.callbacks[sub.Namespace]; ok {
+			cb.DeliveryResponse(connID, &core.EventDeliveryResponse{
+				ID:           event.ID,
+				Rejected:     false,
+				Subscription: event.Subscription,
+			})
+		}
 		return nil
 	}
 
 	// In fastack mode we drive calls in parallel to the backend, immediately acknowledging the event
-	if sub.Options.TransportOptions().GetBool("fastack") {
-		go func() {
-			err := wh.doDelivery(connID, reply, sub, event, data)
-			log.L(wh.ctx).Warnf("Webhook delivery failed in fastack mode for event '%s': %s", event.ID, err)
-		}()
+	// NOTE: We cannot use this with reply mode, as when we're sending a reply the `DeliveryResponse`
+	//       callback must include the reply in-line.
+	if !reply && sub.Options.TransportOptions().GetBool("fastack") {
+		if cb, ok := wh.callbacks[sub.Namespace]; ok {
+			cb.DeliveryResponse(connID, &core.EventDeliveryResponse{
+				ID:           event.ID,
+				Rejected:     false,
+				Subscription: event.Subscription,
+			})
+		}
+		go wh.doDelivery(connID, reply, sub, event, data, true)
 		return nil
 	}
 
-	return wh.doDelivery(connID, reply, sub, event, data)
+	wh.doDelivery(connID, reply, sub, event, data, false)
+	return nil
 }

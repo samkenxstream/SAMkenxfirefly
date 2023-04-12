@@ -18,33 +18,38 @@ package privatemessaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
 	"github.com/hyperledger/firefly/internal/batch"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/mocks/batchmocks"
-	"github.com/hyperledger/firefly/mocks/batchpinmocks"
 	"github.com/hyperledger/firefly/mocks/blockchainmocks"
+	"github.com/hyperledger/firefly/mocks/cachemocks"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/dataexchangemocks"
 	"github.com/hyperledger/firefly/mocks/datamocks"
 	"github.com/hyperledger/firefly/mocks/identitymanagermocks"
 	"github.com/hyperledger/firefly/mocks/metricsmocks"
+	"github.com/hyperledger/firefly/mocks/multipartymocks"
 	"github.com/hyperledger/firefly/mocks/operationmocks"
 	"github.com/hyperledger/firefly/mocks/syncasyncmocks"
-	"github.com/hyperledger/firefly/pkg/config"
-	"github.com/hyperledger/firefly/pkg/fftypes"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
 
 func newTestPrivateMessagingCommon(t *testing.T, metricsEnabled bool) (*privateMessaging, func()) {
 	coreconfig.Reset()
-	config.Set(coreconfig.NodeName, "node1")
-	config.Set(coreconfig.GroupCacheTTL, "1m")
-	config.Set(coreconfig.GroupCacheSize, "1m")
+	config.Set(coreconfig.CacheGroupLimit, "1m")
+	config.Set(coreconfig.CacheGroupTTL, 10)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	mdi := &databasemocks.Plugin{}
 	mim := &identitymanagermocks.Manager{}
 	mdx := &dataexchangemocks.Plugin{}
@@ -52,38 +57,79 @@ func newTestPrivateMessagingCommon(t *testing.T, metricsEnabled bool) (*privateM
 	mba := &batchmocks.Manager{}
 	mdm := &datamocks.Manager{}
 	msa := &syncasyncmocks.Bridge{}
-	mbp := &batchpinmocks.Submitter{}
+	mmp := &multipartymocks.Manager{}
 	mmi := &metricsmocks.Manager{}
 	mom := &operationmocks.Manager{}
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(cache.NewUmanagedCache(ctx, 100, 5*time.Minute), nil)
 	mockRunAsGroupPassthrough(mdi)
 
 	mba.On("RegisterDispatcher",
 		pinnedPrivateDispatcherName,
-		fftypes.TransactionTypeBatchPin,
-		[]fftypes.MessageType{
-			fftypes.MessageTypeGroupInit,
-			fftypes.MessageTypePrivate,
-			fftypes.MessageTypeTransferPrivate,
+		core.TransactionTypeBatchPin,
+		[]core.MessageType{
+			core.MessageTypeGroupInit,
+			core.MessageTypePrivate,
+			core.MessageTypeDeprecatedTransferPrivate,
+			core.MessageTypeDeprecatedApprovalPrivate,
+		}, mock.Anything, mock.Anything).Return()
+
+	mba.On("RegisterDispatcher",
+		pinnedPrivateDispatcherName,
+		core.TransactionTypeContractInvokePin,
+		[]core.MessageType{
+			core.MessageTypePrivate,
 		}, mock.Anything, mock.Anything).Return()
 
 	mba.On("RegisterDispatcher",
 		unpinnedPrivateDispatcherName,
-		fftypes.TransactionTypeUnpinned,
-		[]fftypes.MessageType{
-			fftypes.MessageTypePrivate,
+		core.TransactionTypeUnpinned,
+		[]core.MessageType{
+			core.MessageTypePrivate,
 		}, mock.Anything, mock.Anything).Return()
+
 	mmi.On("IsMetricsEnabled").Return(metricsEnabled)
 	mom.On("RegisterHandler", mock.Anything, mock.Anything, mock.Anything)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	pm, err := NewPrivateMessaging(ctx, mdi, mim, mdx, mbi, mba, mdm, msa, mbp, mmi, mom)
+	ns := &core.Namespace{Name: "ns1", NetworkName: "ns1"}
+	pm, err := NewPrivateMessaging(ctx, ns, mdi, mdx, mbi, mim, mba, mdm, msa, mmp, mmi, mom, cmi)
 	assert.NoError(t, err)
-
+	cmi.AssertCalled(t, "GetCache", cache.NewCacheConfig(
+		ctx,
+		coreconfig.CacheGroupLimit,
+		coreconfig.CacheGroupTTL,
+		ns.Name,
+	))
 	// Default mocks to save boilerplate in the tests
 	mdx.On("Name").Return("utdx").Maybe()
 	mbi.On("Name").Return("utblk").Maybe()
 
 	return pm.(*privateMessaging), cancel
+}
+
+func TestCacheInitFail(t *testing.T) {
+	coreconfig.Reset()
+	config.Set(coreconfig.CacheGroupLimit, "1m")
+	config.Set(coreconfig.CacheGroupTTL, 10)
+
+	cacheInitError := errors.New("Initialization error.")
+	ctx := context.Background()
+	mdi := &databasemocks.Plugin{}
+	mim := &identitymanagermocks.Manager{}
+	mdx := &dataexchangemocks.Plugin{}
+	mbi := &blockchainmocks.Plugin{}
+	mba := &batchmocks.Manager{}
+	mdm := &datamocks.Manager{}
+	msa := &syncasyncmocks.Bridge{}
+	mmp := &multipartymocks.Manager{}
+	mmi := &metricsmocks.Manager{}
+	mom := &operationmocks.Manager{}
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(nil, cacheInitError)
+
+	ns := &core.Namespace{Name: "ns1", NetworkName: "ns1"}
+	_, err := NewPrivateMessaging(ctx, ns, mdi, mdx, mbi, mim, mba, mdm, msa, mmp, mmi, mom, cmi)
+	assert.Equal(t, cacheInitError, err)
 }
 
 func mockRunAsGroupPassthrough(mdi *databasemocks.Plugin) {
@@ -129,89 +175,89 @@ func TestDispatchBatchWithBlobs(t *testing.T) {
 	blob1 := fftypes.NewRandB32()
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mbp := pm.batchpin.(*batchpinmocks.Submitter)
+	mmp := pm.multiparty.(*multipartymocks.Manager)
 	mdx := pm.exchange.(*dataexchangemocks.Plugin)
 	mim := pm.identity.(*identitymanagermocks.Manager)
 	mom := pm.operations.(*operationmocks.Manager)
 
-	mim.On("GetNodeOwnerOrg", pm.ctx).Return(localOrg, nil)
-	mdi.On("GetGroupByHash", pm.ctx, groupID).Return(&fftypes.Group{
+	mim.On("GetLocalNode", pm.ctx).Return(node1, nil)
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", groupID).Return(&core.Group{
 		Hash: fftypes.NewRandB32(),
-		GroupIdentity: fftypes.GroupIdentity{
+		GroupIdentity: core.GroupIdentity{
 			Name: "group1",
-			Members: fftypes.Members{
+			Members: core.Members{
 				{Identity: "org1", Node: node1.ID},
 				{Identity: "org2", Node: node2.ID},
 			},
 		},
 	}, nil)
-	mdi.On("GetIdentityByID", pm.ctx, node1.ID).Return(node1, nil).Once()
-	mdi.On("GetIdentityByID", pm.ctx, node2.ID).Return(node2, nil).Once()
-	mdi.On("GetBlobMatchingHash", pm.ctx, blob1).Return(&fftypes.Blob{
+	mim.On("CachedIdentityLookupByID", pm.ctx, node1.ID).Return(node1, nil).Once()
+	mim.On("CachedIdentityLookupByID", pm.ctx, node2.ID).Return(node2, nil).Once()
+	mdi.On("GetBlobs", pm.ctx, mock.Anything, mock.Anything).Return([]*core.Blob{{
 		Hash:       blob1,
 		PayloadRef: "/blob/1",
-	}, nil)
-	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Type == fftypes.OpTypeDataExchangeSendBlob
+	}}, nil, nil)
+	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Type == core.OpTypeDataExchangeSendBlob
 	})).Return(nil, nil)
-	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Type == fftypes.OpTypeDataExchangeSendBlob
+	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Type == core.OpTypeDataExchangeSendBlob
 	})).Return(nil, nil)
-	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Type == fftypes.OpTypeDataExchangeSendBatch
+	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Type == core.OpTypeDataExchangeSendBatch
 	})).Return(nil, nil)
-	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Type == fftypes.OpTypeDataExchangeSendBatch
+	mom.On("AddOrReuseOperation", pm.ctx, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Type == core.OpTypeDataExchangeSendBatch
 	})).Return(nil, nil)
-	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		if op.Type != fftypes.OpTypeDataExchangeSendBlob {
+	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		if op.Type != core.OpTypeDataExchangeSendBlob {
 			return false
 		}
 		data := op.Data.(transferBlobData)
 		return *data.Node.ID == *node2.ID
 	})).Return(nil, nil)
-	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		if op.Type != fftypes.OpTypeDataExchangeSendBatch {
+	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		if op.Type != core.OpTypeDataExchangeSendBatch {
 			return false
 		}
 		data := op.Data.(batchSendData)
 		return *data.Node.ID == *node2.ID
 	})).Return(nil, nil)
 
-	mbp.On("SubmitPinnedBatch", pm.ctx, mock.Anything, mock.Anything, "").Return(nil)
+	mmp.On("SubmitBatchPin", pm.ctx, mock.Anything, mock.Anything, "").Return(nil)
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				ID: batchID,
-				SignerRef: fftypes.SignerRef{
+				SignerRef: core.SignerRef{
 					Author: "org1",
 				},
 				Group:     groupID,
 				Namespace: "ns1",
 			},
-			TX: fftypes.TransactionRef{
-				Type: fftypes.TransactionTypeUnpinned,
+			TX: core.TransactionRef{
+				Type: core.TransactionTypeUnpinned,
 				ID:   txID,
 			},
 			Hash: batchHash,
 		},
-		Data: fftypes.DataArray{
-			{ID: dataID1, Blob: &fftypes.BlobRef{Hash: blob1}},
+		Data: core.DataArray{
+			{ID: dataID1, Blob: &core.BlobRef{Hash: blob1}},
 		},
 		Pins: []*fftypes.Bytes32{pin1, pin2},
 	})
 	assert.NoError(t, err)
 
 	mdi.AssertExpectations(t)
-	mbp.AssertExpectations(t)
+	mmp.AssertExpectations(t)
 	mdx.AssertExpectations(t)
 	mim.AssertExpectations(t)
 	mom.AssertExpectations(t)
 }
 
 func TestNewPrivateMessagingMissingDeps(t *testing.T) {
-	_, err := NewPrivateMessaging(context.Background(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	_, err := NewPrivateMessaging(context.Background(), &core.Namespace{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	assert.Regexp(t, "FF10128", err)
 }
 
@@ -220,9 +266,9 @@ func TestDispatchErrorFindingGroup(t *testing.T) {
 	defer cancel()
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetGroupByHash", pm.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{})
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{})
 	assert.Regexp(t, "pop", err)
 }
 
@@ -231,15 +277,12 @@ func TestSendAndSubmitBatchBadID(t *testing.T) {
 	defer cancel()
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetGroupByHash", pm.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	mbp := pm.batchpin.(*batchpinmocks.Submitter)
-	mbp.On("SubmitPinnedBatch", pm.ctx, mock.Anything, mock.Anything, "").Return(fmt.Errorf("pop"))
-
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
-				SignerRef: fftypes.SignerRef{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
+				SignerRef: core.SignerRef{
 					Author: "badauthor",
 				},
 			},
@@ -259,29 +302,30 @@ func TestSendAndSubmitBatchUnregisteredNode(t *testing.T) {
 	node2 := newTestNode("node2", newTestOrg("remoteorg"))
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", pm.ctx, node1.ID).Return(node1, nil).Once()
-	mdi.On("GetIdentityByID", pm.ctx, node2.ID).Return(node2, nil).Once()
-	mdi.On("GetGroupByHash", pm.ctx, groupID).Return(&fftypes.Group{
+	mim := pm.identity.(*identitymanagermocks.Manager)
+	mim.On("CachedIdentityLookupByID", pm.ctx, node1.ID).Return(node1, nil).Once()
+	mim.On("CachedIdentityLookupByID", pm.ctx, node2.ID).Return(node2, nil).Once()
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", groupID).Return(&core.Group{
 		Hash: fftypes.NewRandB32(),
-		GroupIdentity: fftypes.GroupIdentity{
+		GroupIdentity: core.GroupIdentity{
 			Name: "group1",
-			Members: fftypes.Members{
+			Members: core.Members{
 				{Identity: "org1", Node: node1.ID},
 				{Identity: "org2", Node: node2.ID},
 			},
 		},
 	}, nil)
 
-	mim := pm.identity.(*identitymanagermocks.Manager)
-	mim.On("GetNodeOwnerOrg", pm.ctx).Return(nil, fmt.Errorf("pop"))
+	mim.On("GetLocalNode", pm.ctx).Return(nil, fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: groupID,
-				SignerRef: fftypes.SignerRef{
+				SignerRef: core.SignerRef{
 					Author: "badauthor",
 				},
+				Namespace: "ns1",
 			},
 		},
 	})
@@ -296,12 +340,12 @@ func TestSendImmediateFail(t *testing.T) {
 	defer cancel()
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetGroupByHash", pm.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", mock.Anything).Return(nil, fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
-				SignerRef: fftypes.SignerRef{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
+				SignerRef: core.SignerRef{
 					Author: "org1",
 				},
 			},
@@ -322,16 +366,16 @@ func TestSendSubmitInsertOperationFail(t *testing.T) {
 	node2 := newTestNode("node2", newTestOrg("remoteorg"))
 
 	mim := pm.identity.(*identitymanagermocks.Manager)
-	mim.On("GetNodeOwnerOrg", pm.ctx).Return(localOrg, nil)
+	mim.On("GetLocalNode", pm.ctx).Return(node1, nil)
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", pm.ctx, node1.ID).Return(node1, nil).Once()
-	mdi.On("GetIdentityByID", pm.ctx, node2.ID).Return(node2, nil).Once()
-	mdi.On("GetGroupByHash", pm.ctx, groupID).Return(&fftypes.Group{
+	mim.On("CachedIdentityLookupByID", pm.ctx, node1.ID).Return(node1, nil).Once()
+	mim.On("CachedIdentityLookupByID", pm.ctx, node2.ID).Return(node2, nil).Once()
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", groupID).Return(&core.Group{
 		Hash: fftypes.NewRandB32(),
-		GroupIdentity: fftypes.GroupIdentity{
+		GroupIdentity: core.GroupIdentity{
 			Name: "group1",
-			Members: fftypes.Members{
+			Members: core.Members{
 				{Identity: "org1", Node: node1.ID},
 				{Identity: "org2", Node: node2.ID},
 			},
@@ -340,13 +384,14 @@ func TestSendSubmitInsertOperationFail(t *testing.T) {
 	mom := pm.operations.(*operationmocks.Manager)
 	mom.On("AddOrReuseOperation", pm.ctx, mock.Anything).Return(fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: groupID,
-				SignerRef: fftypes.SignerRef{
+				SignerRef: core.SignerRef{
 					Author: "org1",
 				},
+				Namespace: "ns1",
 			},
 		},
 	})
@@ -367,16 +412,16 @@ func TestSendSubmitBlobTransferFail(t *testing.T) {
 	blob1 := fftypes.NewRandB32()
 
 	mim := pm.identity.(*identitymanagermocks.Manager)
-	mim.On("GetNodeOwnerOrg", pm.ctx).Return(localOrg, nil)
+	mim.On("GetLocalNode", pm.ctx).Return(node1, nil)
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", pm.ctx, node1.ID).Return(node1, nil).Once()
-	mdi.On("GetIdentityByID", pm.ctx, node2.ID).Return(node2, nil).Once()
-	mdi.On("GetGroupByHash", pm.ctx, groupID).Return(&fftypes.Group{
+	mim.On("CachedIdentityLookupByID", pm.ctx, node1.ID).Return(node1, nil).Once()
+	mim.On("CachedIdentityLookupByID", pm.ctx, node2.ID).Return(node2, nil).Once()
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", groupID).Return(&core.Group{
 		Hash: fftypes.NewRandB32(),
-		GroupIdentity: fftypes.GroupIdentity{
+		GroupIdentity: core.GroupIdentity{
 			Name: "group1",
-			Members: fftypes.Members{
+			Members: core.Members{
 				{Identity: "org1", Node: node1.ID},
 				{Identity: "org2", Node: node2.ID},
 			},
@@ -385,27 +430,28 @@ func TestSendSubmitBlobTransferFail(t *testing.T) {
 
 	mom := pm.operations.(*operationmocks.Manager)
 	mom.On("AddOrReuseOperation", pm.ctx, mock.Anything).Return(nil)
-	mdi.On("GetBlobMatchingHash", pm.ctx, blob1).Return(&fftypes.Blob{
-		Hash:       blob1,
+	mdi.On("GetBlobs", pm.ctx, mock.Anything, mock.Anything).Return([]*core.Blob{{
 		PayloadRef: "/blob/1",
-	}, nil)
+		Hash:       blob1,
+	}}, nil, nil)
 
-	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
+	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *core.PreparedOperation) bool {
 		data := op.Data.(transferBlobData)
-		return op.Type == fftypes.OpTypeDataExchangeSendBlob && *data.Node.ID == *node2.ID
+		return op.Type == core.OpTypeDataExchangeSendBlob && *data.Node.ID == *node2.ID
 	})).Return(nil, fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: groupID,
-				SignerRef: fftypes.SignerRef{
+				SignerRef: core.SignerRef{
 					Author: "org1",
 				},
+				Namespace: "ns1",
 			},
 		},
-		Data: fftypes.DataArray{
-			{ID: fftypes.NewUUID(), Blob: &fftypes.BlobRef{Hash: blob1}},
+		Data: core.DataArray{
+			{ID: fftypes.NewUUID(), Blob: &core.BlobRef{Hash: blob1}},
 		},
 	})
 	assert.Regexp(t, "pop", err)
@@ -426,16 +472,16 @@ func TestWriteTransactionSubmitBatchPinFail(t *testing.T) {
 	blob1 := fftypes.NewRandB32()
 
 	mim := pm.identity.(*identitymanagermocks.Manager)
-	mim.On("GetNodeOwnerOrg", pm.ctx).Return(localOrg, nil)
+	mim.On("GetLocalNode", pm.ctx).Return(node1, nil)
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetIdentityByID", pm.ctx, node1.ID).Return(node1, nil).Once()
-	mdi.On("GetIdentityByID", pm.ctx, node2.ID).Return(node2, nil).Once()
-	mdi.On("GetGroupByHash", pm.ctx, groupID).Return(&fftypes.Group{
+	mim.On("CachedIdentityLookupByID", pm.ctx, node1.ID).Return(node1, nil).Once()
+	mim.On("CachedIdentityLookupByID", pm.ctx, node2.ID).Return(node2, nil).Once()
+	mdi.On("GetGroupByHash", pm.ctx, "ns1", groupID).Return(&core.Group{
 		Hash: fftypes.NewRandB32(),
-		GroupIdentity: fftypes.GroupIdentity{
+		GroupIdentity: core.GroupIdentity{
 			Name: "group1",
-			Members: fftypes.Members{
+			Members: core.Members{
 				{Identity: "org1", Node: node1.ID},
 				{Identity: "org2", Node: node2.ID},
 			},
@@ -444,47 +490,48 @@ func TestWriteTransactionSubmitBatchPinFail(t *testing.T) {
 
 	mom := pm.operations.(*operationmocks.Manager)
 	mom.On("AddOrReuseOperation", pm.ctx, mock.Anything).Return(nil)
-	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		if op.Type != fftypes.OpTypeDataExchangeSendBlob {
+	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		if op.Type != core.OpTypeDataExchangeSendBlob {
 			return false
 		}
 		data := op.Data.(transferBlobData)
 		return *data.Node.ID == *node2.ID
 	})).Return(nil, nil)
-	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		if op.Type != fftypes.OpTypeDataExchangeSendBatch {
+	mom.On("RunOperation", pm.ctx, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		if op.Type != core.OpTypeDataExchangeSendBatch {
 			return false
 		}
 		data := op.Data.(batchSendData)
 		return *data.Node.ID == *node2.ID
 	})).Return(nil, nil)
 
-	mdi.On("GetBlobMatchingHash", pm.ctx, blob1).Return(&fftypes.Blob{
+	mdi.On("GetBlobs", pm.ctx, "ns1", mock.Anything).Return([]*core.Blob{{
 		Hash:       blob1,
 		PayloadRef: "/blob/1",
-	}, nil)
+	}}, nil, nil)
 
-	mbp := pm.batchpin.(*batchpinmocks.Submitter)
-	mbp.On("SubmitPinnedBatch", pm.ctx, mock.Anything, mock.Anything, "").Return(fmt.Errorf("pop"))
+	mmp := pm.multiparty.(*multipartymocks.Manager)
+	mmp.On("SubmitBatchPin", pm.ctx, mock.Anything, mock.Anything, "").Return(fmt.Errorf("pop"))
 
-	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := pm.dispatchPinnedBatch(pm.ctx, &batch.DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: groupID,
-				SignerRef: fftypes.SignerRef{
+				SignerRef: core.SignerRef{
 					Author: "org1",
 				},
+				Namespace: "ns1",
 			},
 		},
-		Data: fftypes.DataArray{
-			{ID: fftypes.NewUUID(), Blob: &fftypes.BlobRef{Hash: blob1}},
+		Data: core.DataArray{
+			{Namespace: "ns1", ID: fftypes.NewUUID(), Blob: &core.BlobRef{Hash: blob1}},
 		},
 	})
 	assert.Regexp(t, "pop", err)
 
 	mdi.AssertExpectations(t)
 	mim.AssertExpectations(t)
-	mbp.AssertExpectations(t)
+	mmp.AssertExpectations(t)
 	mom.AssertExpectations(t)
 }
 
@@ -492,8 +539,8 @@ func TestTransferBlobsNoHash(t *testing.T) {
 	pm, cancel := newTestPrivateMessaging(t)
 	defer cancel()
 
-	_, err := pm.prepareBlobTransfers(pm.ctx, fftypes.DataArray{
-		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &fftypes.BlobRef{}},
+	_, err := pm.prepareBlobTransfers(pm.ctx, core.DataArray{
+		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &core.BlobRef{}},
 	}, fftypes.NewUUID(), newTestNode("node1", newTestOrg("org1")))
 	assert.Regexp(t, "FF10379", err)
 
@@ -504,10 +551,10 @@ func TestTransferBlobsNotFound(t *testing.T) {
 	defer cancel()
 
 	mdi := pm.database.(*databasemocks.Plugin)
-	mdi.On("GetBlobMatchingHash", pm.ctx, mock.Anything).Return(nil, nil)
+	mdi.On("GetBlobs", pm.ctx, mock.Anything, mock.Anything).Return([]*core.Blob{}, nil, nil)
 
-	_, err := pm.prepareBlobTransfers(pm.ctx, fftypes.DataArray{
-		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &fftypes.BlobRef{Hash: fftypes.NewRandB32()}},
+	_, err := pm.prepareBlobTransfers(pm.ctx, core.DataArray{
+		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &core.BlobRef{Hash: fftypes.NewRandB32()}},
 	}, fftypes.NewUUID(), newTestNode("node1", newTestOrg("org1")))
 	assert.Regexp(t, "FF10239", err)
 
@@ -522,25 +569,14 @@ func TestTransferBlobsOpInsertFail(t *testing.T) {
 	mdx := pm.exchange.(*dataexchangemocks.Plugin)
 	mom := pm.operations.(*operationmocks.Manager)
 
-	mdi.On("GetBlobMatchingHash", pm.ctx, mock.Anything).Return(&fftypes.Blob{PayloadRef: "blob/1"}, nil)
+	mdi.On("GetBlobs", pm.ctx, mock.Anything, mock.Anything).Return([]*core.Blob{{PayloadRef: "blob/1"}}, nil, nil)
 	mdx.On("TransferBlob", pm.ctx, mock.Anything, "peer1", "blob/1").Return(nil)
 	mom.On("AddOrReuseOperation", pm.ctx, mock.Anything).Return(fmt.Errorf("pop"))
 
-	_, err := pm.prepareBlobTransfers(pm.ctx, fftypes.DataArray{
-		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &fftypes.BlobRef{Hash: fftypes.NewRandB32()}},
+	_, err := pm.prepareBlobTransfers(pm.ctx, core.DataArray{
+		{ID: fftypes.NewUUID(), Hash: fftypes.NewRandB32(), Blob: &core.BlobRef{Hash: fftypes.NewRandB32()}},
 	}, fftypes.NewUUID(), newTestNode("node1", newTestOrg("org1")))
 	assert.Regexp(t, "pop", err)
 
 	mdi.AssertExpectations(t)
-}
-
-func TestStart(t *testing.T) {
-	pm, cancel := newTestPrivateMessaging(t)
-	defer cancel()
-
-	mdx := pm.exchange.(*dataexchangemocks.Plugin)
-	mdx.On("Start").Return(nil)
-
-	err := pm.Start()
-	assert.NoError(t, err)
 }

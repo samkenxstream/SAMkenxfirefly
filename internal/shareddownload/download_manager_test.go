@@ -24,17 +24,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
 	"github.com/hyperledger/firefly/internal/coreconfig"
-	"github.com/hyperledger/firefly/internal/operations"
-	"github.com/hyperledger/firefly/internal/txcommon"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/dataexchangemocks"
-	"github.com/hyperledger/firefly/mocks/datamocks"
+	"github.com/hyperledger/firefly/mocks/operationmocks"
 	"github.com/hyperledger/firefly/mocks/shareddownloadmocks"
 	"github.com/hyperledger/firefly/mocks/sharedstoragemocks"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -48,24 +48,28 @@ func newTestDownloadManager(t *testing.T) (*downloadManager, func()) {
 	mss := &sharedstoragemocks.Plugin{}
 	mdx := &dataexchangemocks.Plugin{}
 	mci := &shareddownloadmocks.Callbacks{}
-	mdm := &datamocks.Manager{}
-	txHelper := txcommon.NewTransactionHelper(mdi, mdm)
-	mdi.On("Capabilities").Return(&database.Capabilities{
-		Concurrency: false,
-	})
-	operations, err := operations.NewOperationsManager(context.Background(), mdi, txHelper)
-	assert.NoError(t, err)
+	mom := &operationmocks.Manager{}
+	mom.On("RegisterHandler", mock.Anything, mock.Anything, []core.OpType{
+		core.OpTypeSharedStorageDownloadBatch,
+		core.OpTypeSharedStorageDownloadBlob,
+	}).Return()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	pm, err := NewDownloadManager(ctx, mdi, mss, mdx, operations, mci)
+	ns := &core.Namespace{Name: "ns1", NetworkName: "ns1"}
+	pm, err := NewDownloadManager(ctx, ns, mdi, mss, mdx, mom, mci)
 	assert.NoError(t, err)
 
 	return pm.(*downloadManager), cancel
 }
 
 func TestNewDownloadManagerMissingDeps(t *testing.T) {
-	_, err := NewDownloadManager(context.Background(), nil, nil, nil, nil, nil)
+	_, err := NewDownloadManager(context.Background(), &core.Namespace{}, nil, nil, nil, nil, nil)
 	assert.Regexp(t, "FF10128", err)
+}
+
+func TestName(t *testing.T) {
+	dm, _ := newTestDownloadManager(t)
+	assert.Equal(t, "SharedStorageDownloadManager", dm.Name())
 }
 
 func TestDownloadBatchE2EOk(t *testing.T) {
@@ -85,27 +89,37 @@ func TestDownloadBatchE2EOk(t *testing.T) {
 
 	called := make(chan struct{})
 
-	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("InsertOperation", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+	opID := fftypes.NewUUID()
+
+	mom := dm.operations.(*operationmocks.Manager)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		*opID = *args[1].(*core.Operation).ID
 		args[2].(database.PostCompletionHook)()
 	}).Return(nil)
-	mdi.On("ResolveOperation", mock.Anything, mock.Anything, fftypes.OpStatusSucceeded, "", fftypes.JSONObject{
-		"batch": batchID,
-	}).Run(func(args mock.Arguments) {
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		assert.Equal(t, core.OpTypeSharedStorageDownloadBatch, op.Type)
+		assert.Equal(t, "ns1", op.Namespace)
+		assert.Equal(t, "ref1", op.Data.(downloadBatchData).PayloadRef)
+		return true
+	}), mock.Anything).Return(nil, nil).Run(func(args mock.Arguments) {
+		output, complete, err := dm.RunOperation(args[0].(context.Context), args[1].(*core.PreparedOperation))
+		assert.NoError(t, err)
+		assert.Equal(t, fftypes.JSONObject{"batch": batchID}, output)
+		assert.True(t, complete)
 		close(called)
-	}).Return(nil)
+	})
 
 	mci := dm.callbacks.(*shareddownloadmocks.Callbacks)
-	mci.On("SharedStorageBatchDownloaded", "ns1", "ref1", []byte("some batch data")).Return(batchID, nil)
+	mci.On("SharedStorageBatchDownloaded", "ref1", []byte("some batch data")).Return(batchID, nil)
 
-	err := dm.InitiateDownloadBatch(dm.ctx, "ns1", txID, "ref1")
+	err := dm.InitiateDownloadBatch(dm.ctx, txID, "ref1")
 	assert.NoError(t, err)
 
 	<-called
 
 	mss.AssertExpectations(t)
-	mdi.AssertExpectations(t)
 	mci.AssertExpectations(t)
+	mom.AssertExpectations(t)
 
 }
 
@@ -134,31 +148,50 @@ func TestDownloadBlobWithRetryOk(t *testing.T) {
 
 	called := make(chan struct{})
 
-	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("InsertOperation", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+	mom := dm.operations.(*operationmocks.Manager)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		args[2].(database.PostCompletionHook)()
 	}).Return(nil)
-	mdi.On("ResolveOperation", mock.Anything, mock.Anything, fftypes.OpStatusPending, mock.Anything, mock.Anything).Return(nil)
-	mdi.On("ResolveOperation", mock.Anything, mock.Anything, fftypes.OpStatusSucceeded, "", fftypes.JSONObject{
-		"hash":         blobHash,
-		"size":         int64(12345),
-		"dxPayloadRef": "privateRef1",
-	}).Run(func(args mock.Arguments) {
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		assert.Equal(t, core.OpTypeSharedStorageDownloadBlob, op.Type)
+		assert.Equal(t, "ns1", op.Namespace)
+		assert.Equal(t, dataID, op.Data.(downloadBlobData).DataID)
+		assert.Equal(t, "ref1", op.Data.(downloadBlobData).PayloadRef)
+		return true
+	}), mock.Anything).Return(nil, fmt.Errorf("pop")).Run(func(args mock.Arguments) {
+		_, _, err := dm.RunOperation(args[0].(context.Context), args[1].(*core.PreparedOperation))
+		assert.Regexp(t, "FF10376", err)
+	}).Twice()
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		assert.Equal(t, core.OpTypeSharedStorageDownloadBlob, op.Type)
+		assert.Equal(t, "ns1", op.Namespace)
+		assert.Equal(t, dataID, op.Data.(downloadBlobData).DataID)
+		assert.Equal(t, "ref1", op.Data.(downloadBlobData).PayloadRef)
+		return true
+	}), mock.Anything).Return(nil, nil).Run(func(args mock.Arguments) {
+		output, complete, err := dm.RunOperation(args[0].(context.Context), args[1].(*core.PreparedOperation))
+		assert.NoError(t, err)
+		assert.Equal(t, fftypes.JSONObject{
+			"dxPayloadRef": "privateRef1",
+			"hash":         blobHash,
+			"size":         12345,
+		}.String(), output.String())
+		assert.True(t, complete)
 		close(called)
-	}).Return(nil).Once()
+	}).Once()
 
 	mci := dm.callbacks.(*shareddownloadmocks.Callbacks)
-	mci.On("SharedStorageBlobDownloaded", *blobHash, int64(12345), "privateRef1").Return()
+	mci.On("SharedStorageBlobDownloaded", *blobHash, int64(12345), "privateRef1", dataID).Return()
 
-	err := dm.InitiateDownloadBlob(dm.ctx, "ns1", txID, dataID, "ref1")
+	err := dm.InitiateDownloadBlob(dm.ctx, txID, dataID, "ref1")
 	assert.NoError(t, err)
 
 	<-called
 
 	mss.AssertExpectations(t)
 	mdx.AssertExpectations(t)
-	mdi.AssertExpectations(t)
 	mci.AssertExpectations(t)
+	mom.AssertExpectations(t)
 
 }
 
@@ -173,13 +206,13 @@ func TestDownloadBlobInsertOpFail(t *testing.T) {
 	mss := dm.sharedstorage.(*sharedstoragemocks.Plugin)
 	mss.On("Name").Return("utss")
 
-	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("InsertOperation", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("pop"))
+	mom := dm.operations.(*operationmocks.Manager)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("pop"))
 
-	err := dm.InitiateDownloadBlob(dm.ctx, "ns1", txID, dataID, "ref1")
+	err := dm.InitiateDownloadBlob(dm.ctx, txID, dataID, "ref1")
 	assert.Regexp(t, "pop", err)
 
-	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 
 }
 
@@ -201,24 +234,26 @@ func TestDownloadManagerStartupRecoveryCombinations(t *testing.T) {
 	mss.On("DownloadData", mock.Anything, "ref2").Return(reader, nil)
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetOperations", mock.Anything, mock.Anything).Return([]*fftypes.Operation{}, nil, fmt.Errorf("initial error")).Once()
-	mdi.On("GetOperations", mock.Anything, mock.MatchedBy(func(filter database.Filter) bool {
+	mdi.On("GetOperations", mock.Anything, "ns1", mock.Anything).Return([]*core.Operation{}, nil, fmt.Errorf("initial error")).Once()
+	mdi.On("GetOperations", mock.Anything, "ns1", mock.MatchedBy(func(filter ffapi.Filter) bool {
 		fi, err := filter.Finalize()
 		assert.NoError(t, err)
 		return fi.Skip == 0 && fi.Limit == 25
-	})).Return([]*fftypes.Operation{
+	})).Return([]*core.Operation{
 		{
 			// This one won't submit
-			Type: fftypes.OpTypeSharedStorageDownloadBlob,
-			ID:   fftypes.NewUUID(),
+			Type:      core.OpTypeSharedStorageDownloadBlob,
+			ID:        fftypes.NewUUID(),
+			Namespace: "ns1",
 			Input: fftypes.JSONObject{
 				"bad": "inputs",
 			},
 		},
 		{
 			// This one will be re-submitted and be marked failed
-			Type: fftypes.OpTypeSharedStorageDownloadBlob,
-			ID:   fftypes.NewUUID(),
+			Type:      core.OpTypeSharedStorageDownloadBlob,
+			ID:        fftypes.NewUUID(),
+			Namespace: "ns1",
 			Input: fftypes.JSONObject{
 				"namespace":  "ns1",
 				"dataId":     fftypes.NewUUID().String(),
@@ -227,28 +262,43 @@ func TestDownloadManagerStartupRecoveryCombinations(t *testing.T) {
 		},
 		{
 			// This one will be re-submitted and succeed
-			Type: fftypes.OpTypeSharedStorageDownloadBatch,
-			ID:   fftypes.NewUUID(),
+			Type:      core.OpTypeSharedStorageDownloadBatch,
+			ID:        fftypes.NewUUID(),
+			Namespace: "ns1",
 			Input: fftypes.JSONObject{
 				"namespace":  "ns1",
 				"payloadRef": "ref2",
 			},
 		},
 	}, nil, nil).Once()
-	mdi.On("GetOperations", mock.Anything, mock.MatchedBy(func(filter database.Filter) bool {
+	mdi.On("GetOperations", mock.Anything, "ns1", mock.MatchedBy(func(filter ffapi.Filter) bool {
 		fi, err := filter.Finalize()
 		assert.NoError(t, err)
 		return fi.Skip == 25 && fi.Limit == 25
-	})).Return([]*fftypes.Operation{}, nil, nil).Once()
-	mdi.On("ResolveOperation", mock.Anything, mock.Anything, fftypes.OpStatusFailed, "pop", mock.Anything).Run(func(args mock.Arguments) {
+	})).Return([]*core.Operation{}, nil, nil).Once()
+
+	mom := dm.operations.(*operationmocks.Manager)
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		return op.Type == core.OpTypeSharedStorageDownloadBlob && op.Data.(downloadBlobData).PayloadRef == "ref1"
+	}), mock.Anything).Return(nil, fmt.Errorf("pop")).Run(func(args mock.Arguments) {
+		_, _, err := dm.RunOperation(args[0].(context.Context), args[1].(*core.PreparedOperation))
+		assert.EqualError(t, err, "pop")
 		called <- true
-	}).Return(nil)
-	mdi.On("ResolveOperation", mock.Anything, mock.Anything, fftypes.OpStatusSucceeded, "", mock.Anything).Run(func(args mock.Arguments) {
+	})
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		return op.Type == core.OpTypeSharedStorageDownloadBatch && op.Data.(downloadBatchData).PayloadRef == "ref2"
+	}), mock.Anything).Return(nil, nil).Run(func(args mock.Arguments) {
+		output, complete, err := dm.RunOperation(args[0].(context.Context), args[1].(*core.PreparedOperation))
+		assert.NoError(t, err)
+		assert.Equal(t, fftypes.JSONObject{
+			"batch": batchID,
+		}.String(), output.String())
+		assert.True(t, complete)
 		called <- true
-	}).Return(nil)
+	})
 
 	mci := dm.callbacks.(*shareddownloadmocks.Callbacks)
-	mci.On("SharedStorageBatchDownloaded", "ns1", "ref2", []byte("some batch data")).Return(batchID, nil)
+	mci.On("SharedStorageBatchDownloaded", "ref2", []byte("some batch data")).Return(batchID, nil)
 
 	err := dm.Start()
 	assert.NoError(t, err)
@@ -260,6 +310,7 @@ func TestDownloadManagerStartupRecoveryCombinations(t *testing.T) {
 	mss.AssertExpectations(t)
 	mdi.AssertExpectations(t)
 	mci.AssertExpectations(t)
+	mom.AssertExpectations(t)
 
 }
 
@@ -268,8 +319,8 @@ func TestPrepareOperationUnknown(t *testing.T) {
 	dm, cancel := newTestDownloadManager(t)
 	defer cancel()
 
-	_, err := dm.PrepareOperation(dm.ctx, &fftypes.Operation{
-		Type: fftypes.CallTypeInvoke,
+	_, err := dm.PrepareOperation(dm.ctx, &core.Operation{
+		Type: core.CallTypeInvoke,
 	})
 	assert.Regexp(t, "FF10371", err)
 }
@@ -279,8 +330,8 @@ func TestRunOperationUnknown(t *testing.T) {
 	dm, cancel := newTestDownloadManager(t)
 	defer cancel()
 
-	_, _, err := dm.RunOperation(dm.ctx, &fftypes.PreparedOperation{
-		Type: fftypes.CallTypeInvoke,
+	_, _, err := dm.RunOperation(dm.ctx, &core.PreparedOperation{
+		Type: core.CallTypeInvoke,
 	})
 	assert.Regexp(t, "FF10378", err)
 }

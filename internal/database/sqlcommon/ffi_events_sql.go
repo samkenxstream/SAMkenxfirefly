@@ -21,11 +21,13 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -37,22 +39,25 @@ var (
 		"pathname",
 		"description",
 		"params",
+		"details",
 	}
 	ffiEventFilterFieldMap = map[string]string{
 		"interface": "interface_id",
 	}
 )
 
+const ffieventsTable = "ffievents"
+
 func (s *SQLCommon) UpsertFFIEvent(ctx context.Context, event *fftypes.FFIEvent) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	rows, _, err := s.queryTx(ctx, tx,
+	rows, _, err := s.QueryTx(ctx, ffieventsTable, tx,
 		sq.Select("id").
-			From("ffievents").
+			From(ffieventsTable).
 			Where(sq.And{sq.Eq{"interface_id": event.Interface}, sq.Eq{"namespace": event.Namespace}, sq.Eq{"pathname": event.Pathname}}),
 	)
 	if err != nil {
@@ -62,19 +67,19 @@ func (s *SQLCommon) UpsertFFIEvent(ctx context.Context, event *fftypes.FFIEvent)
 	rows.Close()
 
 	if existing {
-		if _, err = s.updateTx(ctx, tx,
-			sq.Update("ffievents").
+		if _, err = s.UpdateTx(ctx, ffieventsTable, tx,
+			sq.Update(ffieventsTable).
 				Set("params", event.Params).
 				Where(sq.And{sq.Eq{"interface_id": event.Interface}, sq.Eq{"namespace": event.Namespace}, sq.Eq{"pathname": event.Pathname}}),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionFFIEvents, fftypes.ChangeEventTypeUpdated, event.Namespace, event.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionFFIEvents, core.ChangeEventTypeUpdated, event.Namespace, event.ID)
 			},
 		); err != nil {
 			return err
 		}
 	} else {
-		if _, err = s.insertTx(ctx, tx,
-			sq.Insert("ffievents").
+		if _, err = s.InsertTx(ctx, ffieventsTable, tx,
+			sq.Insert(ffieventsTable).
 				Columns(ffiEventsColumns...).
 				Values(
 					event.ID,
@@ -84,16 +89,17 @@ func (s *SQLCommon) UpsertFFIEvent(ctx context.Context, event *fftypes.FFIEvent)
 					event.Pathname,
 					event.Description,
 					event.Params,
+					event.Details,
 				),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionFFIEvents, fftypes.ChangeEventTypeCreated, event.Namespace, event.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionFFIEvents, core.ChangeEventTypeCreated, event.Namespace, event.ID)
 			},
 		); err != nil {
 			return err
 		}
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
 func (s *SQLCommon) ffiEventResult(ctx context.Context, row *sql.Rows) (*fftypes.FFIEvent, error) {
@@ -106,17 +112,18 @@ func (s *SQLCommon) ffiEventResult(ctx context.Context, row *sql.Rows) (*fftypes
 		&event.Pathname,
 		&event.Description,
 		&event.Params,
+		&event.Details,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "ffievents")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, ffieventsTable)
 	}
 	return &event, nil
 }
 
 func (s *SQLCommon) getFFIEventPred(ctx context.Context, desc string, pred interface{}) (*fftypes.FFIEvent, error) {
-	rows, _, err := s.query(ctx,
+	rows, _, err := s.Query(ctx, ffieventsTable,
 		sq.Select(ffiEventsColumns...).
-			From("ffievents").
+			From(ffieventsTable).
 			Where(pred),
 	)
 	if err != nil {
@@ -137,13 +144,14 @@ func (s *SQLCommon) getFFIEventPred(ctx context.Context, desc string, pred inter
 	return ci, nil
 }
 
-func (s *SQLCommon) GetFFIEvents(ctx context.Context, filter database.Filter) (events []*fftypes.FFIEvent, res *database.FilterResult, err error) {
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(ffiEventsColumns...).From("ffievents"), filter, ffiEventFilterFieldMap, []interface{}{"sequence"})
+func (s *SQLCommon) GetFFIEvents(ctx context.Context, namespace string, filter ffapi.Filter) (events []*fftypes.FFIEvent, res *ffapi.FilterResult, err error) {
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(ffiEventsColumns...).From(ffieventsTable),
+		filter, ffiEventFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, ffieventsTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -157,14 +165,10 @@ func (s *SQLCommon) GetFFIEvents(ctx context.Context, filter database.Filter) (e
 		events = append(events, ci)
 	}
 
-	return events, s.queryRes(ctx, tx, "ffievents", fop, fi), err
+	return events, s.QueryRes(ctx, ffieventsTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) GetFFIEvent(ctx context.Context, ns string, interfaceID *fftypes.UUID, pathName string) (*fftypes.FFIEvent, error) {
-	return s.getFFIEventPred(ctx, ns+":"+pathName, sq.And{sq.Eq{"namespace": ns}, sq.Eq{"interface_id": interfaceID}, sq.Eq{"pathname": pathName}})
-}
-
-func (s *SQLCommon) GetFFIEventByID(ctx context.Context, id *fftypes.UUID) (*fftypes.FFIEvent, error) {
-	return s.getFFIEventPred(ctx, id.String(), sq.Eq{"id": id})
+func (s *SQLCommon) GetFFIEvent(ctx context.Context, namespace string, interfaceID *fftypes.UUID, pathName string) (*fftypes.FFIEvent, error) {
+	return s.getFFIEventPred(ctx, namespace+":"+pathName, sq.Eq{"namespace": namespace, "interface_id": interfaceID, "pathname": pathName})
 }

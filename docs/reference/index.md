@@ -1,6 +1,6 @@
 ---
-layout: default
-title: Reference
+layout: i18n_page
+title: pages.reference
 nav_order: 5
 has_children: true
 ---
@@ -9,4 +9,4 @@ has_children: true
 
 ---
 
-This section developer reference information
+This section contains detailed reference information for developers using FireFly.

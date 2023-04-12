@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,37 +19,39 @@ package sqlcommon
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 var (
 	nextpinColumns = []string{
+		"namespace",
 		"context",
 		"identity",
 		"hash",
 		"nonce",
 	}
-	nextpinFilterFieldMap = map[string]string{}
 )
 
-func (s *SQLCommon) InsertNextPin(ctx context.Context, nextpin *fftypes.NextPin) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+const nextpinsTable = "nextpins"
+
+func (s *SQLCommon) InsertNextPin(ctx context.Context, nextpin *core.NextPin) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	sequence, err := s.insertTx(ctx, tx,
-		sq.Insert("nextpins").
+	sequence, err := s.InsertTx(ctx, nextpinsTable, tx,
+		sq.Insert(nextpinsTable).
 			Columns(nextpinColumns...).
 			Values(
+				nextpin.Namespace,
 				nextpin.Context,
 				nextpin.Identity,
 				nextpin.Hash,
@@ -62,12 +64,13 @@ func (s *SQLCommon) InsertNextPin(ctx context.Context, nextpin *fftypes.NextPin)
 	}
 	nextpin.Sequence = sequence
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) nextpinResult(ctx context.Context, row *sql.Rows) (*fftypes.NextPin, error) {
-	nextpin := fftypes.NextPin{}
+func (s *SQLCommon) nextpinResult(ctx context.Context, row *sql.Rows) (*core.NextPin, error) {
+	nextpin := core.NextPin{}
 	err := row.Scan(
+		&nextpin.Namespace,
 		&nextpin.Context,
 		&nextpin.Identity,
 		&nextpin.Hash,
@@ -75,115 +78,89 @@ func (s *SQLCommon) nextpinResult(ctx context.Context, row *sql.Rows) (*fftypes.
 		&nextpin.Sequence,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "nextpins")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, nextpinsTable)
 	}
 	return &nextpin, nil
 }
 
-func (s *SQLCommon) getNextPinPred(ctx context.Context, desc string, pred interface{}) (message *fftypes.NextPin, err error) {
+func (s *SQLCommon) GetNextPinsForContext(ctx context.Context, namespace string, context *fftypes.Bytes32) (message []*core.NextPin, err error) {
+
 	cols := append([]string{}, nextpinColumns...)
-	cols = append(cols, sequenceColumn)
-	rows, _, err := s.query(ctx,
-		sq.Select(cols...).
-			From("nextpins").
-			Where(pred).
-			Limit(1),
-	)
+	cols = append(cols, s.SequenceColumn())
+
+	rows, _, err := s.Query(ctx, nextpinsTable, sq.Select(cols...).From(nextpinsTable).
+		Where(sq.And{
+			sq.Eq{"context": context},
+			sq.Or{sq.Eq{"namespace": namespace}, sq.Eq{"namespace": nil}}, // old entries will have NULL for namespace
+		}))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	if !rows.Next() {
-		log.L(ctx).Debugf("NextPin '%s' not found", desc)
-		return nil, nil
+	nextpin := []*core.NextPin{}
+	for rows.Next() {
+		d, err := s.nextpinResult(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+		nextpin = append(nextpin, d)
 	}
 
-	nextpin, err := s.nextpinResult(ctx, rows)
-	if err != nil {
-		return nil, err
-	}
+	return nextpin, err
 
-	return nextpin, nil
 }
 
-func (s *SQLCommon) GetNextPinByContextAndIdentity(ctx context.Context, context *fftypes.Bytes32, identity string) (message *fftypes.NextPin, err error) {
-	return s.getNextPinPred(ctx, fmt.Sprintf("%s:%s", context, identity), sq.Eq{
-		"context":  context,
-		"identity": identity,
-	})
-}
-
-func (s *SQLCommon) GetNextPinByHash(ctx context.Context, hash *fftypes.Bytes32) (message *fftypes.NextPin, err error) {
-	return s.getNextPinPred(ctx, hash.String(), sq.Eq{
-		"hash": hash,
-	})
-}
-
-func (s *SQLCommon) GetNextPins(ctx context.Context, filter database.Filter) (message []*fftypes.NextPin, fr *database.FilterResult, err error) {
+func (s *SQLCommon) GetNextPins(ctx context.Context, namespace string, filter ffapi.Filter) ([]*core.NextPin, *ffapi.FilterResult, error) {
 
 	cols := append([]string{}, nextpinColumns...)
-	cols = append(cols, sequenceColumn)
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(cols...).From("nextpins"), filter, nextpinFilterFieldMap, []interface{}{"sequence"})
+	cols = append(cols, s.SequenceColumn())
+
+	query, fop, fi, err := s.FilterSelect(
+		ctx, "", sq.Select(cols...).From(nextpinsTable),
+		filter, pinFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, pinsTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	nextpin := []*fftypes.NextPin{}
+	nextpins := []*core.NextPin{}
 	for rows.Next() {
 		d, err := s.nextpinResult(ctx, rows)
 		if err != nil {
 			return nil, nil, err
 		}
-		nextpin = append(nextpin, d)
+		nextpins = append(nextpins, d)
 	}
 
-	return nextpin, s.queryRes(ctx, tx, "nextpins", fop, fi), err
+	return nextpins, s.QueryRes(ctx, pinsTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) UpdateNextPin(ctx context.Context, sequence int64, update database.Update) (err error) {
+func (s *SQLCommon) UpdateNextPin(ctx context.Context, namespace string, sequence int64, update ffapi.Update) (err error) {
 
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	query, err := s.buildUpdate(sq.Update("nextpins"), update, pinFilterFieldMap)
+	query, err := s.BuildUpdate(sq.Update(nextpinsTable), update, pinFilterFieldMap)
 	if err != nil {
 		return err
 	}
-	query = query.Where(sq.Eq{sequenceColumn: sequence})
+	query = query.Set("namespace", namespace) // always populate namespace (to migrate the table over time)
+	query = query.Where(sq.Eq{s.SequenceColumn(): sequence})
 
-	_, err = s.updateTx(ctx, tx, query, nil /* no change events for next pins */)
-	if err != nil {
-		return err
-	}
-
-	return s.commitTx(ctx, tx, autoCommit)
-}
-
-func (s *SQLCommon) DeleteNextPin(ctx context.Context, sequence int64) (err error) {
-
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
-
-	err = s.deleteTx(ctx, tx, sq.Delete("nextpins").Where(sq.Eq{
-		sequenceColumn: sequence,
-	}), nil /* no change events for next pins */)
+	_, err = s.UpdateTx(ctx, nextpinsTable, tx, query, nil /* no change events for next pins */)
 	if err != nil {
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }

@@ -21,11 +21,12 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 var (
@@ -36,16 +37,18 @@ var (
 	nonceFilterFieldMap = map[string]string{}
 )
 
-func (s *SQLCommon) UpdateNonce(ctx context.Context, nonce *fftypes.Nonce) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+const noncesTable = "nonces"
+
+func (s *SQLCommon) UpdateNonce(ctx context.Context, nonce *core.Nonce) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
 	// Update the nonce
-	if _, err = s.updateTx(ctx, tx,
-		sq.Update("nonces").
+	if _, err = s.UpdateTx(ctx, noncesTable, tx,
+		sq.Update(noncesTable).
 			Set("nonce", nonce.Nonce).
 			Where(sq.Eq{"hash": nonce.Hash}),
 		nil, // no change events for nonces
@@ -53,19 +56,19 @@ func (s *SQLCommon) UpdateNonce(ctx context.Context, nonce *fftypes.Nonce) (err 
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) InsertNonce(ctx context.Context, nonce *fftypes.Nonce) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+func (s *SQLCommon) InsertNonce(ctx context.Context, nonce *core.Nonce) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
 	// Insert the nonce
-	if _, err = s.insertTx(ctx, tx,
-		sq.Insert("nonces").
+	if _, err = s.InsertTx(ctx, noncesTable, tx,
+		sq.Insert(noncesTable).
 			Columns(nonceColumns...).
 			Values(
 				nonce.Hash,
@@ -76,26 +79,26 @@ func (s *SQLCommon) InsertNonce(ctx context.Context, nonce *fftypes.Nonce) (err 
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) nonceResult(ctx context.Context, row *sql.Rows) (*fftypes.Nonce, error) {
-	nonce := fftypes.Nonce{}
+func (s *SQLCommon) nonceResult(ctx context.Context, row *sql.Rows) (*core.Nonce, error) {
+	nonce := core.Nonce{}
 	err := row.Scan(
 		&nonce.Hash,
 		&nonce.Nonce,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "nonces")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, noncesTable)
 	}
 	return &nonce, nil
 }
 
-func (s *SQLCommon) GetNonce(ctx context.Context, hash *fftypes.Bytes32) (message *fftypes.Nonce, err error) {
+func (s *SQLCommon) GetNonce(ctx context.Context, hash *fftypes.Bytes32) (message *core.Nonce, err error) {
 
-	rows, _, err := s.query(ctx,
+	rows, _, err := s.Query(ctx, noncesTable,
 		sq.Select(nonceColumns...).
-			From("nonces").
+			From(noncesTable).
 			Where(sq.Eq{"hash": hash}),
 	)
 	if err != nil {
@@ -116,20 +119,20 @@ func (s *SQLCommon) GetNonce(ctx context.Context, hash *fftypes.Bytes32) (messag
 	return nonce, nil
 }
 
-func (s *SQLCommon) GetNonces(ctx context.Context, filter database.Filter) (message []*fftypes.Nonce, fr *database.FilterResult, err error) {
+func (s *SQLCommon) GetNonces(ctx context.Context, filter ffapi.Filter) (message []*core.Nonce, fr *ffapi.FilterResult, err error) {
 
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(nonceColumns...).From("nonces"), filter, nonceFilterFieldMap, []interface{}{"sequence"})
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(nonceColumns...).From(noncesTable), filter, nonceFilterFieldMap, []interface{}{"sequence"})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, noncesTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	nonce := []*fftypes.Nonce{}
+	nonce := []*core.Nonce{}
 	for rows.Next() {
 		d, err := s.nonceResult(ctx, rows)
 		if err != nil {
@@ -138,24 +141,24 @@ func (s *SQLCommon) GetNonces(ctx context.Context, filter database.Filter) (mess
 		nonce = append(nonce, d)
 	}
 
-	return nonce, s.queryRes(ctx, tx, "nonces", fop, fi), err
+	return nonce, s.QueryRes(ctx, noncesTable, tx, fop, fi), err
 
 }
 
 func (s *SQLCommon) DeleteNonce(ctx context.Context, hash *fftypes.Bytes32) (err error) {
 
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	err = s.deleteTx(ctx, tx, sq.Delete("nonces").Where(sq.Eq{
+	err = s.DeleteTx(ctx, noncesTable, tx, sq.Delete(noncesTable).Where(sq.Eq{
 		"hash": hash,
 	}), nil /* no change events for nonces */)
 	if err != nil {
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }

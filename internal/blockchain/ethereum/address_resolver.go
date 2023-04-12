@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,22 +20,23 @@ import (
 	"context"
 	"strings"
 	"text/template"
-	"time"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/ffresty"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly/internal/cache"
+	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/config"
-	"github.com/hyperledger/firefly/pkg/ffresty"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/karlseguin/ccache"
+	"github.com/hyperledger/firefly/pkg/blockchain"
 )
 
 // addressResolver is a REST-pluggable interface to allow arbitrary strings that reference
 // keys, to be resolved down to an Ethereum address - which will be kept in a LRU cache.
-// This supports cases where the signing device behind Ethconnect is able to support keys
+// This supports cases where the signing device behind Ethconnect/evmconnect is able to support keys
 // addressed using somthing like a HD Wallet hierarchical syntax.
-// Once the resolver has returned the String->Address mapping, the ethconnect downstream
+// Once the resolver has returned the String->Address mapping, the ethconnect/evmconnect downstream
 // signing process must be able to process using the resolved ethereum address (meaning
 // it might have to reliably store the reverse mapping, it the case of a HD wallet).
 type addressResolver struct {
@@ -45,32 +46,42 @@ type addressResolver struct {
 	bodyTemplate   *template.Template
 	responseField  string
 	client         *resty.Client
-	cache          *ccache.Cache
-	cacheTTL       time.Duration
+	cache          cache.CInterface
 }
 
 type addressResolverInserts struct {
-	Key string
+	Key    string
+	Intent blockchain.ResolveKeyIntent
 }
 
-func newAddressResolver(ctx context.Context, prefix config.Prefix) (ar *addressResolver, err error) {
-
+func newAddressResolver(ctx context.Context, localConfig config.Section, cacheManager cache.Manager, enableCache bool) (ar *addressResolver, err error) {
 	ar = &addressResolver{
-		retainOriginal: prefix.GetBool(AddressResolverRetainOriginal),
-		method:         prefix.GetString(AddressResolverMethod),
-		responseField:  prefix.GetString(AddressResolverResponseField),
-		client:         ffresty.New(ctx, prefix),
-		cache:          ccache.New(ccache.Configure().MaxSize(prefix.GetInt64(AddressResolverCacheSize))),
-		cacheTTL:       prefix.GetDuration(AddressResolverCacheTTL),
+		retainOriginal: localConfig.GetBool(AddressResolverRetainOriginal),
+		method:         localConfig.GetString(AddressResolverMethod),
+		responseField:  localConfig.GetString(AddressResolverResponseField),
+		client:         ffresty.New(ctx, localConfig),
+	}
+	if enableCache {
+		ar.cache, err = cacheManager.GetCache(
+			cache.NewCacheConfig(
+				ctx,
+				coreconfig.CacheAddressResolverLimit,
+				coreconfig.CacheAddressResolverTTL,
+				"",
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	urlTemplateString := prefix.GetString(AddressResolverURLTemplate)
+	urlTemplateString := localConfig.GetString(AddressResolverURLTemplate)
 	ar.urlTemplate, err = template.New(AddressResolverURLTemplate).Option("missingkey=error").Parse(urlTemplateString)
 	if err != nil {
 		return nil, i18n.NewError(ctx, coremsgs.MsgGoTemplateCompileFailed, AddressResolverURLTemplate, err)
 	}
 
-	bodyTemplateString := prefix.GetString(AddressResolverBodyTemplate)
+	bodyTemplateString := localConfig.GetString(AddressResolverBodyTemplate)
 	if bodyTemplateString != "" {
 		ar.bodyTemplate, err = template.New(AddressResolverBodyTemplate).Option("missingkey=error").Parse(bodyTemplateString)
 		if err != nil {
@@ -81,15 +92,17 @@ func newAddressResolver(ctx context.Context, prefix config.Prefix) (ar *addressR
 	return ar, nil
 }
 
-func (ar *addressResolver) NormalizeSigningKey(ctx context.Context, keyDescriptor string) (string, error) {
+func (ar *addressResolver) ResolveSigningKey(ctx context.Context, keyDescriptor string, intent blockchain.ResolveKeyIntent) (string, error) {
 
-	if cached := ar.cache.Get(keyDescriptor); cached != nil {
-		cached.Extend(ar.cacheTTL)
-		return cached.Value().(string), nil
+	if ar.cache != nil {
+		if cached := ar.cache.GetString(keyDescriptor); cached != "" {
+			return cached, nil
+		}
 	}
 
 	inserts := &addressResolverInserts{
-		Key: keyDescriptor,
+		Key:    keyDescriptor,
+		Intent: intent,
 	}
 
 	urlStr := &strings.Builder{}
@@ -119,11 +132,13 @@ func (ar *addressResolver) NormalizeSigningKey(ctx context.Context, keyDescripto
 		return "", i18n.NewError(ctx, coremsgs.MsgAddressResolveBadStatus, keyDescriptor, res.StatusCode(), jsonRes.String())
 	}
 
-	address, err := validateEthAddress(ctx, jsonRes.GetString(ar.responseField))
+	address, err := formatEthAddress(ctx, jsonRes.GetString(ar.responseField))
 	if err != nil {
 		return "", i18n.NewError(ctx, coremsgs.MsgAddressResolveBadResData, keyDescriptor, jsonRes.String(), err)
 	}
 
-	ar.cache.Set(keyDescriptor, address, ar.cacheTTL)
+	if ar.cache != nil {
+		ar.cache.SetString(keyDescriptor, address)
+	}
 	return address, nil
 }

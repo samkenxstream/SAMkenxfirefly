@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -18,23 +18,36 @@ package contracts
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/hyperledger/firefly/internal/blockchain/ethereum"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-signer/pkg/ffi2abi"
+	"github.com/hyperledger/firefly/internal/cache"
+	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/internal/database/sqlcommon"
 	"github.com/hyperledger/firefly/internal/identity"
 	"github.com/hyperledger/firefly/internal/syncasync"
 	"github.com/hyperledger/firefly/internal/txcommon"
+	"github.com/hyperledger/firefly/mocks/batchmocks"
 	"github.com/hyperledger/firefly/mocks/blockchainmocks"
 	"github.com/hyperledger/firefly/mocks/broadcastmocks"
+	"github.com/hyperledger/firefly/mocks/cachemocks"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/datamocks"
 	"github.com/hyperledger/firefly/mocks/identitymanagermocks"
 	"github.com/hyperledger/firefly/mocks/operationmocks"
+	"github.com/hyperledger/firefly/mocks/privatemessagingmocks"
 	"github.com/hyperledger/firefly/mocks/syncasyncmocks"
 	"github.com/hyperledger/firefly/mocks/txcommonmocks"
+	"github.com/hyperledger/firefly/pkg/blockchain"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/santhosh-tekuri/jsonschema/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -44,29 +57,35 @@ func newTestContractManager() *contractManager {
 	mdi := &databasemocks.Plugin{}
 	mdm := &datamocks.Manager{}
 	mbm := &broadcastmocks.Manager{}
+	mpm := &privatemessagingmocks.Manager{}
+	mbp := &batchmocks.Manager{}
 	mim := &identitymanagermocks.Manager{}
 	mbi := &blockchainmocks.Plugin{}
 	mom := &operationmocks.Manager{}
-	txHelper := txcommon.NewTransactionHelper(mdi, mdm)
+	ctx := context.Background()
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(cache.NewUmanagedCache(ctx, 100, 5*time.Minute), nil)
+	txHelper, _ := txcommon.NewTransactionHelper(ctx, "ns1", mdi, mdm, cmi)
 	msa := &syncasyncmocks.Bridge{}
 	mbi.On("GetFFIParamValidator", mock.Anything).Return(nil, nil)
 	mom.On("RegisterHandler", mock.Anything, mock.Anything, mock.Anything)
 
 	mbi.On("Name").Return("mockblockchain").Maybe()
 
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.Anything).Return(nil, nil, nil).Once()
 	rag := mdi.On("RunAsGroup", mock.Anything, mock.Anything).Maybe()
 	rag.RunFn = func(a mock.Arguments) {
 		rag.ReturnArguments = mock.Arguments{
 			a[1].(func(context.Context) error)(a[0].(context.Context)),
 		}
 	}
-	cm, _ := NewContractManager(context.Background(), mdi, mbm, mim, mbi, mom, txHelper, msa)
+	cm, _ := NewContractManager(context.Background(), "ns1", mdi, mbi, mdm, mbm, mpm, mbp, mim, mom, txHelper, msa)
 	cm.(*contractManager).txHelper = &txcommonmocks.Helper{}
 	return cm.(*contractManager)
 }
 
 func TestNewContractManagerFail(t *testing.T) {
-	_, err := NewContractManager(context.Background(), nil, nil, nil, nil, nil, nil, nil)
+	_, err := NewContractManager(context.Background(), "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	assert.Regexp(t, "FF10128", err)
 }
 
@@ -79,13 +98,18 @@ func TestNewContractManagerFFISchemaLoaderFail(t *testing.T) {
 	mdi := &databasemocks.Plugin{}
 	mdm := &datamocks.Manager{}
 	mbm := &broadcastmocks.Manager{}
+	mpm := &privatemessagingmocks.Manager{}
+	mbp := &batchmocks.Manager{}
 	mim := &identitymanagermocks.Manager{}
 	mbi := &blockchainmocks.Plugin{}
 	mom := &operationmocks.Manager{}
-	txHelper := txcommon.NewTransactionHelper(mdi, mdm)
+	ctx := context.Background()
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(cache.NewUmanagedCache(ctx, 100, 5*time.Minute), nil)
+	txHelper, _ := txcommon.NewTransactionHelper(ctx, "ns1", mdi, mdm, cmi)
 	msa := &syncasyncmocks.Bridge{}
 	mbi.On("GetFFIParamValidator", mock.Anything).Return(nil, fmt.Errorf("pop"))
-	_, err := NewContractManager(context.Background(), mdi, mbm, mim, mbi, mom, txHelper, msa)
+	_, err := NewContractManager(context.Background(), "ns1", mdi, mbi, mdm, mbm, mpm, mbp, mim, mom, txHelper, msa)
 	assert.Regexp(t, "pop", err)
 }
 
@@ -93,36 +117,100 @@ func TestNewContractManagerFFISchemaLoader(t *testing.T) {
 	mdi := &databasemocks.Plugin{}
 	mdm := &datamocks.Manager{}
 	mbm := &broadcastmocks.Manager{}
+	mpm := &privatemessagingmocks.Manager{}
+	mbp := &batchmocks.Manager{}
 	mim := &identitymanagermocks.Manager{}
 	mbi := &blockchainmocks.Plugin{}
 	mom := &operationmocks.Manager{}
-	txHelper := txcommon.NewTransactionHelper(mdi, mdm)
+	ctx := context.Background()
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(cache.NewUmanagedCache(ctx, 100, 5*time.Minute), nil)
+	txHelper, _ := txcommon.NewTransactionHelper(ctx, "ns1", mdi, mdm, cmi)
 	msa := &syncasyncmocks.Bridge{}
-	mbi.On("GetFFIParamValidator", mock.Anything).Return(&ethereum.FFIParamValidator{}, nil)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("GetFFIParamValidator", mock.Anything).Return(&ffi2abi.ParamValidator{}, nil)
 	mom.On("RegisterHandler", mock.Anything, mock.Anything, mock.Anything)
-	_, err := NewContractManager(context.Background(), mdi, mbm, mim, mbi, mom, txHelper, msa)
+	_, err := NewContractManager(context.Background(), "ns1", mdi, mbi, mdm, mbm, mpm, mbp, mim, mom, txHelper, msa)
 	assert.NoError(t, err)
 }
 
-func TestBroadcastFFI(t *testing.T) {
+func TestResolveFFI(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
-	mim := cm.identity.(*identitymanagermocks.Manager)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
 
 	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(nil, nil)
-	mim.On("GetOrgKey", mock.Anything).Return("key", nil)
 
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
+	ffi := &fftypes.FFI{
+		Namespace: "ns1",
+		Name:      "test",
+		Version:   "1.0.0",
+		ID:        fftypes.NewUUID(),
+		Methods: []*fftypes.FFIMethod{
+			{
+				Name: "sum",
+			},
+		},
+		Events: []*fftypes.FFIEvent{
+			{
+				FFIEventDefinition: fftypes.FFIEventDefinition{
+					Name: "changed",
+				},
+			},
+		},
+		Errors: []*fftypes.FFIError{
+			{
+				FFIErrorDefinition: fftypes.FFIErrorDefinition{
+					Name: "changed",
+				},
+			},
 		},
 	}
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.FFI"), fftypes.SystemTagDefineFFI, false).Return(msg, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
+	assert.NoError(t, err)
+}
+
+func TestBroadcastFFIInvalid(t *testing.T) {
+	cm := newTestContractManager()
+	mdb := cm.database.(*databasemocks.Plugin)
+
+	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(nil, nil)
+
 	ffi := &fftypes.FFI{
-		Name:    "test",
-		Version: "1.0.0",
-		ID:      fftypes.NewUUID(),
+		Namespace: "ns1",
+		Name:      "test",
+		Version:   "1.0.0",
+		ID:        fftypes.NewUUID(),
+		Methods: []*fftypes.FFIMethod{
+			{
+				Name: "sum",
+				Params: []*fftypes.FFIParam{
+					{
+						Name:   "x",
+						Schema: fftypes.JSONAnyPtr(`{"type": "null"}`),
+					},
+				},
+			},
+		},
+	}
+
+	err := cm.ResolveFFI(context.Background(), ffi)
+	assert.Regexp(t, "does not validate", err)
+
+	mdb.AssertExpectations(t)
+}
+
+func TestResolveFFIExists(t *testing.T) {
+	cm := newTestContractManager()
+	mdb := cm.database.(*databasemocks.Plugin)
+
+	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(&fftypes.FFI{}, nil)
+
+	ffi := &fftypes.FFI{
+		Namespace: "ns1",
+		Name:      "test",
+		Version:   "1.0.0",
+		ID:        fftypes.NewUUID(),
 		Methods: []*fftypes.FFIMethod{
 			{
 				Name: "sum",
@@ -136,93 +224,15 @@ func TestBroadcastFFI(t *testing.T) {
 			},
 		},
 	}
-	_, err := cm.BroadcastFFI(context.Background(), "ns1", ffi, false)
-	assert.NoError(t, err)
-}
 
-func TestBroadcastFFIInvalid(t *testing.T) {
-	cm := newTestContractManager()
-	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
-
-	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(nil, nil)
-
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.FFI"), fftypes.SystemTagDefineFFI, false).Return(msg, nil)
-	ffi := &fftypes.FFI{
-		Name:    "test",
-		Version: "1.0.0",
-		ID:      fftypes.NewUUID(),
-		Methods: []*fftypes.FFIMethod{
-			{
-				Name: "sum",
-				Params: []*fftypes.FFIParam{
-					{
-						Name:   "x",
-						Schema: fftypes.JSONAnyPtr(`{"type": "number"}`),
-					},
-				},
-			},
-		},
-	}
-	_, err := cm.BroadcastFFI(context.Background(), "ns1", ffi, false)
-	assert.Regexp(t, "does not validate", err)
-}
-
-func TestBroadcastFFIExists(t *testing.T) {
-	cm := newTestContractManager()
-	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
-
-	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(&fftypes.FFI{}, nil)
-
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.FFI"), fftypes.SystemTagDefineFFI, false).Return(msg, nil)
-	ffi := &fftypes.FFI{
-		Name:    "test",
-		Version: "1.0.0",
-		ID:      fftypes.NewUUID(),
-	}
-	_, err := cm.BroadcastFFI(context.Background(), "ns1", ffi, false)
+	err := cm.ResolveFFI(context.Background(), ffi)
 	assert.Regexp(t, "FF10302", err)
-}
-
-func TestBroadcastFFIFail(t *testing.T) {
-	cm := newTestContractManager()
-	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
-	mim := cm.identity.(*identitymanagermocks.Manager)
-
-	mdb.On("GetFFI", mock.Anything, "ns1", "test", "1.0.0").Return(nil, nil)
-	mim.On("GetOrgKey", mock.Anything).Return("key", nil)
-
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.FFI"), fftypes.SystemTagDefineFFI, false).Return(nil, fmt.Errorf("pop"))
-	ffi := &fftypes.FFI{
-		Name:    "test",
-		Version: "1.0.0",
-		ID:      fftypes.NewUUID(),
-		Methods: []*fftypes.FFIMethod{
-			{
-				Name: "sum",
-			},
-		},
-	}
-	_, err := cm.BroadcastFFI(context.Background(), "ns1", ffi, false)
-	assert.Regexp(t, "pop", err)
 }
 
 func TestValidateInvokeContractRequest(t *testing.T) {
 	cm := newTestContractManager()
-	req := &fftypes.ContractCallRequest{
-		Type: fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type: core.CallTypeInvoke,
 		Method: &fftypes.FFIMethod{
 			Name: "sum",
 			Params: []*fftypes.FFIParam{
@@ -247,14 +257,20 @@ func TestValidateInvokeContractRequest(t *testing.T) {
 			"y": float64(2),
 		},
 	}
+
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbi.On("ValidateInvokeRequest", context.Background(), req.Method, req.Input, req.Errors, false).Return(nil)
+
 	err := cm.validateInvokeContractRequest(context.Background(), req)
 	assert.NoError(t, err)
+
+	mbi.AssertExpectations(t)
 }
 
 func TestValidateInvokeContractRequestMissingInput(t *testing.T) {
 	cm := newTestContractManager()
-	req := &fftypes.ContractCallRequest{
-		Type: fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type: core.CallTypeInvoke,
 		Method: &fftypes.FFIMethod{
 			Name: "sum",
 			Params: []*fftypes.FFIParam{
@@ -284,8 +300,8 @@ func TestValidateInvokeContractRequestMissingInput(t *testing.T) {
 
 func TestValidateInvokeContractRequestInputWrongType(t *testing.T) {
 	cm := newTestContractManager()
-	req := &fftypes.ContractCallRequest{
-		Type: fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type: core.CallTypeInvoke,
 		Method: &fftypes.FFIMethod{
 			Name: "sum",
 			Params: []*fftypes.FFIParam{
@@ -316,8 +332,41 @@ func TestValidateInvokeContractRequestInputWrongType(t *testing.T) {
 
 func TestValidateInvokeContractRequestInvalidParam(t *testing.T) {
 	cm := newTestContractManager()
-	req := &fftypes.ContractCallRequest{
-		Type: fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type: core.CallTypeInvoke,
+		Method: &fftypes.FFIMethod{
+			Name: "sum",
+			Params: []*fftypes.FFIParam{
+				{
+					Name:   "x",
+					Schema: fftypes.JSONAnyPtr(`{"type": "null", "details": {"type": "uint256"}}`),
+				},
+				{
+					Name:   "y",
+					Schema: fftypes.JSONAnyPtr(`{"type": "integer", "details": {"type": "uint256"}}`),
+				},
+			},
+			Returns: []*fftypes.FFIParam{
+				{
+					Name:   "z",
+					Schema: fftypes.JSONAnyPtr(`{"type": "integer"}`),
+				},
+			},
+		},
+		Input: map[string]interface{}{
+			"x": float64(1),
+			"y": float64(2),
+		},
+	}
+
+	err := cm.validateInvokeContractRequest(context.Background(), req)
+	assert.Regexp(t, "does not validate", err)
+}
+
+func TestValidateInvokeContractRequestInvalidReturn(t *testing.T) {
+	cm := newTestContractManager()
+	req := &core.ContractCallRequest{
+		Type: core.CallTypeInvoke,
 		Method: &fftypes.FFIMethod{
 			Name: "sum",
 			Params: []*fftypes.FFIParam{
@@ -333,7 +382,7 @@ func TestValidateInvokeContractRequestInvalidParam(t *testing.T) {
 			Returns: []*fftypes.FFIParam{
 				{
 					Name:   "z",
-					Schema: fftypes.JSONAnyPtr(`{"type": "number"}`),
+					Schema: fftypes.JSONAnyPtr(`{"type": "null"}`),
 				},
 			},
 		},
@@ -349,6 +398,8 @@ func TestValidateInvokeContractRequestInvalidParam(t *testing.T) {
 
 func TestValidateFFI(t *testing.T) {
 	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
 	ffi := &fftypes.FFI{
 		Name:      "math",
 		Version:   "1.0.0",
@@ -400,9 +451,24 @@ func TestValidateFFI(t *testing.T) {
 				},
 			},
 		},
+		Errors: []*fftypes.FFIError{
+			{
+				FFIErrorDefinition: fftypes.FFIErrorDefinition{
+					Name: "sum",
+					Params: []*fftypes.FFIParam{
+						{
+							Name:   "z",
+							Schema: fftypes.JSONAnyPtr(`{"type": "integer", "details": {"type": "uint256"}}`),
+						},
+					},
+				},
+			},
+		},
 	}
 
-	err := cm.ValidateFFIAndSetPathnames(context.Background(), ffi)
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
 	assert.NoError(t, err)
 
 	assert.Equal(t, "sum", ffi.Methods[0].Pathname)
@@ -413,6 +479,8 @@ func TestValidateFFI(t *testing.T) {
 
 func TestValidateFFIFail(t *testing.T) {
 	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
 	ffi := &fftypes.FFI{
 		Namespace: "default",
 		Methods: []*fftypes.FFIMethod{
@@ -464,12 +532,16 @@ func TestValidateFFIFail(t *testing.T) {
 		},
 	}
 
-	err := cm.ValidateFFIAndSetPathnames(context.Background(), ffi)
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
 	assert.Regexp(t, "FF00140", err)
 }
 
 func TestValidateFFIBadMethod(t *testing.T) {
 	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
 	ffi := &fftypes.FFI{
 		Name:      "math",
 		Version:   "1.0.0",
@@ -510,12 +582,16 @@ func TestValidateFFIBadMethod(t *testing.T) {
 		},
 	}
 
-	err := cm.ValidateFFIAndSetPathnames(context.Background(), ffi)
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
 	assert.Regexp(t, "FF10320", err)
 }
 
 func TestValidateFFIBadEventParam(t *testing.T) {
 	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
 	ffi := &fftypes.FFI{
 		Name:      "math",
 		Version:   "1.0.0",
@@ -556,8 +632,68 @@ func TestValidateFFIBadEventParam(t *testing.T) {
 		},
 	}
 
-	err := cm.ValidateFFIAndSetPathnames(context.Background(), ffi)
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
 	assert.Regexp(t, "FF10319", err)
+}
+
+func TestValidateFFIBadError(t *testing.T) {
+	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
+	ffi := &fftypes.FFI{
+		Name:      "math",
+		Version:   "1.0.0",
+		Namespace: "default",
+		Errors: []*fftypes.FFIError{
+			{
+				FFIErrorDefinition: fftypes.FFIErrorDefinition{
+					Name: "",
+					Params: []*fftypes.FFIParam{
+						{
+							Name:   "z",
+							Schema: fftypes.JSONAnyPtr(`{"type": "integer", "details": {"type": "uint256"}}`),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
+	assert.Regexp(t, "FF10433", err)
+}
+
+func TestValidateFFIBadErrorParam(t *testing.T) {
+	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
+	ffi := &fftypes.FFI{
+		Name:      "math",
+		Version:   "1.0.0",
+		Namespace: "default",
+		Errors: []*fftypes.FFIError{
+			{
+				FFIErrorDefinition: fftypes.FFIErrorDefinition{
+					Name: "pop",
+					Params: []*fftypes.FFIParam{
+						{
+							Name:   "z",
+							Schema: fftypes.JSONAnyPtr(`{"type": "wrongness"`),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mdi.On("GetFFI", context.Background(), "ns1", "math", "1.0.0").Return(nil, nil)
+
+	err := cm.ResolveFFI(context.Background(), ffi)
+	assert.Regexp(t, "FF10332", err)
 }
 
 func TestAddContractListenerInline(t *testing.T) {
@@ -565,12 +701,12 @@ func TestAddContractListenerInline(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{
+			Event: &core.FFISerializedEvent{
 				FFIEventDefinition: fftypes.FFIEventDefinition{
 					Name: "changed",
 					Params: fftypes.FFIParams{
@@ -581,18 +717,55 @@ func TestAddContractListenerInline(t *testing.T) {
 					},
 				},
 			},
-			Options: &fftypes.ContractListenerOptions{},
+			Options: &core.ContractListenerOptions{},
 			Topic:   "test-topic",
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
-	mbi.On("AddContractListener", context.Background(), sub).Return(nil)
-	mdi.On("UpsertContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("InsertContractListener", context.Background(), &sub.ContractListener).Return(nil)
 
-	result, err := cm.AddContractListener(context.Background(), "ns", sub)
+	result, err := cm.AddContractListener(context.Background(), sub)
+	assert.NoError(t, err)
+	assert.NotNil(t, result.ID)
+	assert.NotNil(t, result.Event)
+
+	mbi.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+}
+
+func TestAddContractListenerNoLocationOK(t *testing.T) {
+	cm := newTestContractManager()
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mdi := cm.database.(*databasemocks.Plugin)
+
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
+			Event: &core.FFISerializedEvent{
+				FFIEventDefinition: fftypes.FFIEventDefinition{
+					Name: "changed",
+					Params: fftypes.FFIParams{
+						{
+							Name:   "value",
+							Schema: fftypes.JSONAnyPtr(`{"type": "integer"}`),
+						},
+					},
+				},
+			},
+			Options: &core.ContractListenerOptions{},
+			Topic:   "test-topic",
+		},
+	}
+
+	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("InsertContractListener", context.Background(), &sub.ContractListener).Return(nil)
+
+	result, err := cm.AddContractListener(context.Background(), sub)
 	assert.NoError(t, err)
 	assert.NotNil(t, result.ID)
 	assert.NotNil(t, result.Event)
@@ -622,8 +795,8 @@ func TestAddContractListenerByEventPath(t *testing.T) {
 		},
 	}
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Interface: &fftypes.FFIReference{
 				ID: interfaceID,
 			},
@@ -635,15 +808,15 @@ func TestAddContractListenerByEventPath(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
-	mbi.On("AddContractListener", context.Background(), sub).Return(nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
 	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, sub.EventPath).Return(event, nil)
-	mdi.On("UpsertContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("InsertContractListener", context.Background(), &sub.ContractListener).Return(nil)
 
-	result, err := cm.AddContractListener(context.Background(), "ns1", sub)
+	result, err := cm.AddContractListener(context.Background(), sub)
 	assert.NoError(t, err)
 	assert.NotNil(t, result.ID)
 	assert.NotNil(t, result.Event)
@@ -656,8 +829,8 @@ func TestAddContractListenerBadLocation(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Interface: &fftypes.FFIReference{
 				ID: fftypes.NewUUID(),
 			},
@@ -669,9 +842,9 @@ func TestAddContractListenerBadLocation(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(nil, fmt.Errorf("pop"))
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns1", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -684,8 +857,8 @@ func TestAddContractListenerFFILookupFail(t *testing.T) {
 
 	interfaceID := fftypes.NewUUID()
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Interface: &fftypes.FFIReference{
 				ID: interfaceID,
 			},
@@ -697,10 +870,10 @@ func TestAddContractListenerFFILookupFail(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(nil, fmt.Errorf("pop"))
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns1", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -714,8 +887,8 @@ func TestAddContractListenerEventLookupFail(t *testing.T) {
 
 	interfaceID := fftypes.NewUUID()
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Interface: &fftypes.FFIReference{
 				ID: interfaceID,
 			},
@@ -727,11 +900,11 @@ func TestAddContractListenerEventLookupFail(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
 	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, sub.EventPath).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns1", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -745,8 +918,8 @@ func TestAddContractListenerEventLookupNotFound(t *testing.T) {
 
 	interfaceID := fftypes.NewUUID()
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Interface: &fftypes.FFIReference{
 				ID: interfaceID,
 			},
@@ -758,11 +931,11 @@ func TestAddContractListenerEventLookupNotFound(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
 	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, sub.EventPath).Return(nil, nil)
 
-	_, err := cm.AddContractListener(context.Background(), "ns1", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF10370", err)
 
 	mbi.AssertExpectations(t)
@@ -773,8 +946,8 @@ func TestAddContractListenerMissingEventOrID(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
@@ -782,41 +955,175 @@ func TestAddContractListenerMissingEventOrID(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 
-	_, err := cm.AddContractListener(context.Background(), "ns2", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF10317", err)
 
 	mbi.AssertExpectations(t)
 }
 
-func TestAddContractListenerBadNamespace(t *testing.T) {
+func TestAddContractListenerVerifyOk(t *testing.T) {
 	cm := newTestContractManager()
-	sub := &fftypes.ContractListenerInput{}
 
-	_, err := cm.AddContractListener(context.Background(), "!bad", sub)
-	assert.Regexp(t, "FF00140.*'namespace'", err)
+	ctx := context.Background()
+
+	mdi := cm.database.(*databasemocks.Plugin)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.MatchedBy(func(f ffapi.Filter) bool {
+		fi, _ := f.Finalize()
+		return fi.Skip == 0 && fi.Limit == 50
+	})).Return([]*core.ContractListener{
+		{ID: fftypes.NewUUID(), BackendID: "12345"},
+		{ID: fftypes.NewUUID(), BackendID: "23456"},
+	}, nil, nil).Once()
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.MatchedBy(func(f ffapi.Filter) bool {
+		fi, _ := f.Finalize()
+		return fi.Skip == 50 && fi.Limit == 50
+	})).Return([]*core.ContractListener{}, nil, nil).Once()
+
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbi.On("GetContractListenerStatus", ctx, "12345", true).Return(true, struct{}{}, nil)
+	mbi.On("GetContractListenerStatus", ctx, "23456", true).Return(false, nil, nil)
+	mbi.On("AddContractListener", ctx, mock.MatchedBy(func(l *core.ContractListener) bool {
+		prevBackendID := l.BackendID
+		l.BackendID = "34567"
+		return prevBackendID == "23456"
+	})).Return(nil)
+
+	mdi.On("UpdateContractListener", ctx, "ns1", mock.Anything, mock.MatchedBy(func(u ffapi.Update) bool {
+		uu, _ := u.Finalize()
+		return strings.Contains(uu.String(), "34567")
+	})).Return(nil).Once()
+
+	err := cm.verifyListeners(ctx)
+	assert.NoError(t, err)
+
+	mdi.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+}
+
+func TestAddContractListenerVerifyUpdateFail(t *testing.T) {
+	cm := newTestContractManager()
+
+	ctx := context.Background()
+
+	mdi := cm.database.(*databasemocks.Plugin)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.MatchedBy(func(f ffapi.Filter) bool {
+		fi, _ := f.Finalize()
+		return fi.Skip == 0 && fi.Limit == 50
+	})).Return([]*core.ContractListener{
+		{ID: fftypes.NewUUID(), BackendID: "12345"},
+		{ID: fftypes.NewUUID(), BackendID: "23456"},
+	}, nil, nil).Once()
+
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbi.On("GetContractListenerStatus", ctx, "12345", true).Return(true, struct{}{}, nil)
+	mbi.On("GetContractListenerStatus", ctx, "23456", true).Return(false, nil, nil)
+	mbi.On("AddContractListener", ctx, mock.MatchedBy(func(l *core.ContractListener) bool {
+		prevBackendID := l.BackendID
+		l.BackendID = "34567"
+		return prevBackendID == "23456"
+	})).Return(nil)
+
+	mdi.On("UpdateContractListener", ctx, "ns1", mock.Anything, mock.MatchedBy(func(u ffapi.Update) bool {
+		uu, _ := u.Finalize()
+		return strings.Contains(uu.String(), "34567")
+	})).Return(fmt.Errorf("pop")).Once()
+
+	err := cm.verifyListeners(ctx)
+	assert.Regexp(t, "pop", err)
+
+	mdi.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+}
+
+func TestAddContractListenerVerifyAddFail(t *testing.T) {
+	cm := newTestContractManager()
+
+	ctx := context.Background()
+
+	mdi := cm.database.(*databasemocks.Plugin)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.MatchedBy(func(f ffapi.Filter) bool {
+		fi, _ := f.Finalize()
+		return fi.Skip == 0 && fi.Limit == 50
+	})).Return([]*core.ContractListener{
+		{ID: fftypes.NewUUID(), BackendID: "12345"},
+		{ID: fftypes.NewUUID(), BackendID: "23456"},
+	}, nil, nil).Once()
+
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbi.On("GetContractListenerStatus", ctx, "12345", true).Return(true, struct{}{}, nil)
+	mbi.On("GetContractListenerStatus", ctx, "23456", true).Return(false, nil, nil)
+	mbi.On("AddContractListener", ctx, mock.MatchedBy(func(l *core.ContractListener) bool {
+		prevBackendID := l.BackendID
+		l.BackendID = "34567"
+		return prevBackendID == "23456"
+	})).Return(fmt.Errorf("pop"))
+
+	err := cm.verifyListeners(ctx)
+	assert.Regexp(t, "pop", err)
+
+	mdi.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+}
+
+func TestAddContractListenerVerifyGetFail(t *testing.T) {
+	cm := newTestContractManager()
+
+	ctx := context.Background()
+
+	mdi := cm.database.(*databasemocks.Plugin)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.MatchedBy(func(f ffapi.Filter) bool {
+		fi, _ := f.Finalize()
+		return fi.Skip == 0 && fi.Limit == 50
+	})).Return([]*core.ContractListener{
+		{ID: fftypes.NewUUID(), BackendID: "12345"},
+		{ID: fftypes.NewUUID(), BackendID: "23456"},
+	}, nil, nil).Once()
+
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbi.On("GetContractListenerStatus", ctx, "12345", true).Return(false, nil, fmt.Errorf("pop"))
+
+	err := cm.verifyListeners(ctx)
+	assert.Regexp(t, "pop", err)
+
+	mdi.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+}
+
+func TestAddContractListenerVerifyGetListFail(t *testing.T) {
+	cm := newTestContractManager()
+
+	ctx := context.Background()
+
+	mdi := cm.database.(*databasemocks.Plugin)
+	mdi.On("GetContractListeners", mock.Anything, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop")).Once()
+
+	err := cm.verifyListeners(ctx)
+	assert.Regexp(t, "pop", err)
+
+	mdi.AssertExpectations(t)
 }
 
 func TestAddContractListenerBadName(t *testing.T) {
 	cm := newTestContractManager()
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Name: "!bad",
 		},
 	}
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF00140.*'name'", err)
 }
 
 func TestAddContractListenerMissingTopic(t *testing.T) {
 	cm := newTestContractManager()
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{},
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{},
 	}
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF00140.*'topic'", err)
 }
 
@@ -825,8 +1132,8 @@ func TestAddContractListenerNameConflict(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Name: "sub1",
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
@@ -836,10 +1143,10 @@ func TestAddContractListenerNameConflict(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(&fftypes.ContractListener{}, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(&core.ContractListener{}, nil)
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF10312", err)
 
 	mbi.AssertExpectations(t)
@@ -851,8 +1158,8 @@ func TestAddContractListenerNameError(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Name: "sub1",
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
@@ -862,10 +1169,10 @@ func TestAddContractListenerNameError(t *testing.T) {
 		EventPath: "changed",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(nil, fmt.Errorf("pop"))
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -877,21 +1184,21 @@ func TestAddContractListenerTopicConflict(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{},
+			Event: &core.FFISerializedEvent{},
 			Topic: "test-topic",
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return([]*fftypes.ContractListener{{}}, nil, nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return([]*core.ContractListener{{}}, nil, nil)
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "FF10383", err)
 
 	mbi.AssertExpectations(t)
@@ -903,21 +1210,21 @@ func TestAddContractListenerTopicError(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{},
+			Event: &core.FFISerializedEvent{},
 			Topic: "test-topic",
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -929,18 +1236,18 @@ func TestAddContractListenerValidateFail(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{
+			Event: &core.FFISerializedEvent{
 				FFIEventDefinition: fftypes.FFIEventDefinition{
 					Name: "changed",
 					Params: fftypes.FFIParams{
 						{
 							Name:   "value",
-							Schema: fftypes.JSONAnyPtr(`{"type": "number"}`),
+							Schema: fftypes.JSONAnyPtr(`{"type": "null"}`),
 						},
 					},
 				},
@@ -949,11 +1256,11 @@ func TestAddContractListenerValidateFail(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.Regexp(t, "does not validate", err)
 
 	mbi.AssertExpectations(t)
@@ -965,12 +1272,12 @@ func TestAddContractListenerBlockchainFail(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{
+			Event: &core.FFISerializedEvent{
 				FFIEventDefinition: fftypes.FFIEventDefinition{
 					Name: "changed",
 					Params: fftypes.FFIParams{
@@ -985,12 +1292,12 @@ func TestAddContractListenerBlockchainFail(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
-	mbi.On("AddContractListener", context.Background(), sub).Return(fmt.Errorf("pop"))
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), &sub.ContractListener).Return(fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -1002,12 +1309,12 @@ func TestAddContractListenerUpsertSubFail(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListenerInput{
-		ContractListener: fftypes.ContractListener{
+	sub := &core.ContractListenerInput{
+		ContractListener: core.ContractListener{
 			Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 				"address": "0x123",
 			}.String()),
-			Event: &fftypes.FFISerializedEvent{
+			Event: &core.FFISerializedEvent{
 				FFIEventDefinition: fftypes.FFIEventDefinition{
 					Name: "changed",
 					Params: fftypes.FFIParams{
@@ -1022,13 +1329,13 @@ func TestAddContractListenerUpsertSubFail(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), sub.Location).Return(sub.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, sub.Location).Return(sub.Location, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
-	mbi.On("AddContractListener", context.Background(), sub).Return(nil)
-	mdi.On("UpsertContractListener", context.Background(), &sub.ContractListener).Return(fmt.Errorf("pop"))
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), &sub.ContractListener).Return(nil)
+	mdi.On("InsertContractListener", context.Background(), &sub.ContractListener).Return(fmt.Errorf("pop"))
 
-	_, err := cm.AddContractListener(context.Background(), "ns", sub)
+	_, err := cm.AddContractListener(context.Background(), sub)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
@@ -1041,7 +1348,7 @@ func TestAddContractAPIListener(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 
 	interfaceID := fftypes.NewUUID()
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Interface: &fftypes.FFIReference{
 			ID: interfaceID,
 		},
@@ -1049,7 +1356,7 @@ func TestAddContractAPIListener(t *testing.T) {
 			"address": "0x123",
 		}.String()),
 	}
-	listener := &fftypes.ContractListener{
+	listener := &core.ContractListener{
 		Topic: "test-topic",
 	}
 	event := &fftypes.FFIEvent{
@@ -1058,20 +1365,20 @@ func TestAddContractAPIListener(t *testing.T) {
 		},
 	}
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(api, nil)
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(listener.Location, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
-	mdi.On("GetFFIEvent", context.Background(), "ns", interfaceID, "changed").Return(event, nil)
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(api, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeListener, api.Location).Return(listener.Location, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
+	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, "changed").Return(event, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
-	mbi.On("AddContractListener", context.Background(), mock.MatchedBy(func(l *fftypes.ContractListenerInput) bool {
-		return *l.Interface.ID == *interfaceID && l.EventPath == "changed" && l.Topic == "test-topic"
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
+	mbi.On("AddContractListener", context.Background(), mock.MatchedBy(func(l *core.ContractListener) bool {
+		return *l.Interface.ID == *interfaceID && l.Topic == "test-topic"
 	})).Return(nil)
-	mdi.On("UpsertContractListener", context.Background(), mock.MatchedBy(func(l *fftypes.ContractListener) bool {
+	mdi.On("InsertContractListener", context.Background(), mock.MatchedBy(func(l *core.ContractListener) bool {
 		return *l.Interface.ID == *interfaceID && l.Event.Name == "changed" && l.Topic == "test-topic"
 	})).Return(nil)
 
-	_, err := cm.AddContractAPIListener(context.Background(), "ns", "simple", "changed", listener)
+	_, err := cm.AddContractAPIListener(context.Background(), "simple", "changed", listener)
 	assert.NoError(t, err)
 
 	mbi.AssertExpectations(t)
@@ -1082,16 +1389,16 @@ func TestAddContractAPIListenerNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	listener := &fftypes.ContractListener{
+	listener := &core.ContractListener{
 		Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 			"address": "0x123",
 		}.String()),
 		Topic: "test-topic",
 	}
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(nil, nil)
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(nil, nil)
 
-	_, err := cm.AddContractAPIListener(context.Background(), "ns", "simple", "changed", listener)
+	_, err := cm.AddContractAPIListener(context.Background(), "simple", "changed", listener)
 	assert.Regexp(t, "FF10109", err)
 
 	mdi.AssertExpectations(t)
@@ -1101,16 +1408,16 @@ func TestAddContractAPIListenerFail(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	listener := &fftypes.ContractListener{
+	listener := &core.ContractListener{
 		Location: fftypes.JSONAnyPtr(fftypes.JSONObject{
 			"address": "0x123",
 		}.String()),
 		Topic: "test-topic",
 	}
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.AddContractAPIListener(context.Background(), "ns", "simple", "changed", listener)
+	_, err := cm.AddContractAPIListener(context.Background(), "simple", "changed", listener)
 	assert.EqualError(t, err, "pop")
 
 	mdi.AssertExpectations(t)
@@ -1120,7 +1427,7 @@ func TestGetFFI(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 	mdb.On("GetFFI", mock.Anything, "ns1", "ffi", "v1.0.0").Return(&fftypes.FFI{}, nil)
-	_, err := cm.GetFFI(context.Background(), "ns1", "ffi", "v1.0.0")
+	_, err := cm.GetFFI(context.Background(), "ffi", "v1.0.0")
 	assert.NoError(t, err)
 }
 
@@ -1131,17 +1438,23 @@ func TestGetFFIWithChildren(t *testing.T) {
 
 	cid := fftypes.NewUUID()
 	mdb.On("GetFFI", mock.Anything, "ns1", "ffi", "v1.0.0").Return(&fftypes.FFI{ID: cid}, nil)
-	mdb.On("GetFFIMethods", mock.Anything, mock.Anything).Return([]*fftypes.FFIMethod{
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIMethod{
 		{ID: fftypes.NewUUID(), Name: "method1"},
 	}, nil, nil)
-	mdb.On("GetFFIEvents", mock.Anything, mock.Anything).Return([]*fftypes.FFIEvent{
+	mdb.On("GetFFIEvents", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIEvent{
 		{ID: fftypes.NewUUID(), FFIEventDefinition: fftypes.FFIEventDefinition{Name: "event1"}},
 	}, nil, nil)
 	mbi.On("GenerateEventSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIEventDefinition) bool {
 		return ev.Name == "event1"
 	})).Return("event1Sig")
+	mdb.On("GetFFIErrors", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIError{
+		{ID: fftypes.NewUUID(), FFIErrorDefinition: fftypes.FFIErrorDefinition{Name: "customError1"}},
+	}, nil, nil)
+	mbi.On("GenerateErrorSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIErrorDefinition) bool {
+		return ev.Name == "customError1"
+	})).Return("error1Sig")
 
-	_, err := cm.GetFFIWithChildren(context.Background(), "ns1", "ffi", "v1.0.0")
+	_, err := cm.GetFFIWithChildren(context.Background(), "ffi", "v1.0.0")
 	assert.NoError(t, err)
 
 	mdb.AssertExpectations(t)
@@ -1152,7 +1465,7 @@ func TestGetFFIByID(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(&fftypes.FFI{}, nil)
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(&fftypes.FFI{}, nil)
 	_, err := cm.GetFFIByID(context.Background(), cid)
 	assert.NoError(t, err)
 }
@@ -1163,18 +1476,24 @@ func TestGetFFIByIDWithChildren(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(&fftypes.FFI{
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(&fftypes.FFI{
 		ID: cid,
 	}, nil)
-	mdb.On("GetFFIMethods", mock.Anything, mock.Anything).Return([]*fftypes.FFIMethod{
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIMethod{
 		{ID: fftypes.NewUUID(), Name: "method1"},
 	}, nil, nil)
-	mdb.On("GetFFIEvents", mock.Anything, mock.Anything).Return([]*fftypes.FFIEvent{
+	mdb.On("GetFFIEvents", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIEvent{
 		{ID: fftypes.NewUUID(), FFIEventDefinition: fftypes.FFIEventDefinition{Name: "event1"}},
 	}, nil, nil)
 	mbi.On("GenerateEventSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIEventDefinition) bool {
 		return ev.Name == "event1"
 	})).Return("event1Sig")
+	mdb.On("GetFFIErrors", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIError{
+		{ID: fftypes.NewUUID(), FFIErrorDefinition: fftypes.FFIErrorDefinition{Name: "customError1"}},
+	}, nil, nil)
+	mbi.On("GenerateErrorSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIErrorDefinition) bool {
+		return ev.Name == "customError1"
+	})).Return("error1Sig")
 
 	ffi, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
 
@@ -1186,18 +1505,38 @@ func TestGetFFIByIDWithChildren(t *testing.T) {
 	assert.Equal(t, "event1", ffi.Events[0].Name)
 }
 
+func TestGetFFIByIDWithChildrenErrorsFail(t *testing.T) {
+	cm := newTestContractManager()
+	mdb := cm.database.(*databasemocks.Plugin)
+
+	cid := fftypes.NewUUID()
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(&fftypes.FFI{
+		ID: cid,
+	}, nil)
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIMethod{
+		{ID: fftypes.NewUUID(), Name: "method1"},
+	}, nil, nil)
+	mdb.On("GetFFIEvents", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIEvent{}, nil, nil)
+	mdb.On("GetFFIErrors", mock.Anything, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+
+	_, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
+
+	assert.EqualError(t, err, "pop")
+	mdb.AssertExpectations(t)
+}
+
 func TestGetFFIByIDWithChildrenEventsFail(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(&fftypes.FFI{
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(&fftypes.FFI{
 		ID: cid,
 	}, nil)
-	mdb.On("GetFFIMethods", mock.Anything, mock.Anything).Return([]*fftypes.FFIMethod{
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIMethod{
 		{ID: fftypes.NewUUID(), Name: "method1"},
 	}, nil, nil)
-	mdb.On("GetFFIEvents", mock.Anything, mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+	mdb.On("GetFFIEvents", mock.Anything, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
 
 	_, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
 
@@ -1210,10 +1549,10 @@ func TestGetFFIByIDWithChildrenMethodsFail(t *testing.T) {
 	mdb := cm.database.(*databasemocks.Plugin)
 
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(&fftypes.FFI{
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(&fftypes.FFI{
 		ID: cid,
 	}, nil)
-	mdb.On("GetFFIMethods", mock.Anything, mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
 
 	_, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
 
@@ -1226,7 +1565,7 @@ func TestGetFFIByIDWithChildrenFFILookupFail(t *testing.T) {
 	mdb := cm.database.(*databasemocks.Plugin)
 
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(nil, fmt.Errorf("pop"))
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(nil, fmt.Errorf("pop"))
 
 	_, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
 
@@ -1239,7 +1578,7 @@ func TestGetFFIByIDWithChildrenFFINotFound(t *testing.T) {
 	mdb := cm.database.(*databasemocks.Plugin)
 
 	cid := fftypes.NewUUID()
-	mdb.On("GetFFIByID", mock.Anything, cid).Return(nil, nil)
+	mdb.On("GetFFIByID", mock.Anything, "ns1", cid).Return(nil, nil)
 
 	ffi, err := cm.GetFFIByIDWithChildren(context.Background(), cid)
 
@@ -1252,9 +1591,222 @@ func TestGetFFIs(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 	filter := database.FFIQueryFactory.NewFilter(context.Background()).And()
-	mdb.On("GetFFIs", mock.Anything, "ns1", filter).Return([]*fftypes.FFI{}, &database.FilterResult{}, nil)
-	_, _, err := cm.GetFFIs(context.Background(), "ns1", filter)
+	mdb.On("GetFFIs", mock.Anything, "ns1", filter).Return([]*fftypes.FFI{}, &ffapi.FilterResult{}, nil)
+	_, _, err := cm.GetFFIs(context.Background(), filter)
 	assert.NoError(t, err)
+}
+
+func TestDeployContract(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainContractDeploy && op.Plugin == "mockblockchain"
+	})).Return(nil)
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		data := op.Data.(blockchainContractDeployData)
+		return op.Type == core.OpTypeBlockchainContractDeploy && data.Request == req
+	})).Return(nil, nil)
+
+	_, err := cm.DeployContract(context.Background(), req, false)
+
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractIdempotentResubmitOperation(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(&core.Operation{}, nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	// If ResubmitOperations returns an operation it's because it found one to resubmit, so we return 2xx not 409, and don't expect an error
+	_, err := cm.DeployContract(context.Background(), req, false)
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractIdempotentNoOperationToResubmit(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(nil, nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	// If ResubmitOperations returns nil it's because there was no operation in initialized state, so we expect the regular 409 error back
+	_, err := cm.DeployContract(context.Background(), req, false)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "FF10431")
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractIdempotentErrorOnOperationResubmit(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(nil, fmt.Errorf("pop"))
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	_, err := cm.DeployContract(context.Background(), req, false)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "pop")
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractSync(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	sam := cm.syncasync.(*syncasyncmocks.Bridge)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainContractDeploy && op.Plugin == "mockblockchain"
+	})).Return(nil)
+
+	sam.On("WaitForDeployOperation", mock.Anything, mock.Anything, mock.Anything).Return(&core.Operation{Status: core.OpStatusSucceeded}, nil)
+
+	_, err := cm.DeployContract(context.Background(), req, true)
+
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractResolveInputSigningKeyFail(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:        signingKey,
+		Definition: fftypes.JSONAnyPtr("[]"),
+		Contract:   fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:      []interface{}{"one", "two", "three"},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("", errors.New("pop"))
+	_, err := cm.DeployContract(context.Background(), req, false)
+
+	assert.Regexp(t, "pop", err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
+}
+
+func TestDeployContractSubmitNewTransactionFail(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	signingKey := "0x2468"
+	req := &core.ContractDeployRequest{
+		Key:            signingKey,
+		Definition:     fftypes.JSONAnyPtr("[]"),
+		Contract:       fftypes.JSONAnyPtr("\"0x123456\""),
+		Input:          []interface{}{"one", "two", "three"},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractDeploy, core.IdempotencyKey("idem1")).Return(nil, errors.New("pop"))
+	mim.On("ResolveInputSigningKey", mock.Anything, signingKey, identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	_, err := cm.DeployContract(context.Background(), req, false)
+
+	assert.Regexp(t, "pop", err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
 }
 
 func TestInvokeContract(t *testing.T) {
@@ -1263,9 +1815,10 @@ func TestInvokeContract(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 	mth := cm.txHelper.(*txcommonmocks.Helper)
 	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1274,19 +1827,21 @@ func TestInvokeContract(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
 	})).Return(nil)
-	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		data := op.Data.(blockchainInvokeData)
-		return op.Type == fftypes.OpTypeBlockchainInvoke && data.Request == req
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		data := op.Data.(txcommon.BlockchainInvokeData)
+		return op.Type == core.OpTypeBlockchainInvoke && data.Request == req
 	})).Return(nil, nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.NoError(t, err)
 
@@ -1294,6 +1849,468 @@ func TestInvokeContract(t *testing.T) {
 	mim.AssertExpectations(t)
 	mdi.AssertExpectations(t)
 	mom.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcast(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbm := cm.broadcast.(*broadcastmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name: "doStuff",
+			ID:   fftypes.NewUUID(),
+			Params: fftypes.FFIParams{
+				{
+					Name:   "data",
+					Schema: fftypes.JSONAnyPtr(`{"type":"string"}`),
+				},
+			},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvokePin, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	})).Return(nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, true).Return(nil)
+	mbm.On("NewBroadcast", req.Message).Return(sender, nil)
+	sender.On("Prepare", mock.Anything).Return(nil)
+	sender.On("Send", mock.Anything).Return(nil)
+
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+	sender.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcastConfirm(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbm := cm.broadcast.(*broadcastmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name: "doStuff",
+			ID:   fftypes.NewUUID(),
+			Params: fftypes.FFIParams{
+				{
+					Name:   "data",
+					Schema: fftypes.JSONAnyPtr(`{"type":"string"}`),
+				},
+			},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvokePin, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	})).Return(nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, true).Return(nil)
+	mbm.On("NewBroadcast", req.Message).Return(sender, nil)
+	sender.On("Prepare", mock.Anything).Return(nil)
+	sender.On("SendAndWait", mock.Anything).Return(nil)
+
+	_, err := cm.InvokeContract(context.Background(), req, true)
+
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mom.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+	sender.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcastPrepareFail(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mdi := cm.database.(*databasemocks.Plugin)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+	mbm := cm.broadcast.(*broadcastmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name: "doStuff",
+			ID:   fftypes.NewUUID(),
+			Params: fftypes.FFIParams{
+				{
+					Name:   "data",
+					Schema: fftypes.JSONAnyPtr(`{"type":"string"}`),
+				},
+			},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, true).Return(nil)
+	mbm.On("NewBroadcast", req.Message).Return(sender, nil)
+	sender.On("Prepare", mock.Anything).Return(fmt.Errorf("pop"))
+
+	_, err := cm.InvokeContract(context.Background(), req, true)
+
+	assert.EqualError(t, err, "pop")
+
+	mim.AssertExpectations(t)
+	mdi.AssertExpectations(t)
+	mbi.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+	sender.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcastBadRequest(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mbm := cm.broadcast.(*broadcastmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name: "doStuff",
+			ID:   fftypes.NewUUID(),
+			Params: fftypes.FFIParams{
+				{
+					Name:   "data",
+					Schema: fftypes.JSONAnyPtr(`{"type":"string"}`),
+				}},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+		Input: map[string]interface{}{
+			"data": "should not be here",
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbm.On("NewBroadcast", req.Message).Return(sender, nil)
+
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10445", err)
+
+	mim.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcastBadMethod(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mbm := cm.broadcast.(*broadcastmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbm.On("NewBroadcast", req.Message).Return(sender, nil)
+
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10443", err)
+
+	mim.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+}
+
+func TestInvokeContractWithPrivateMessageBadMethod(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mpm := cm.messaging.(*privatemessagingmocks.Manager)
+	sender := &syncasyncmocks.Sender{}
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			Message: core.Message{
+				Header: core.MessageHeader{
+					Type: core.MessageTypePrivate,
+				},
+			},
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mpm.On("NewMessage", req.Message).Return(sender, nil)
+
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10443", err)
+
+	mim.AssertExpectations(t)
+	mpm.AssertExpectations(t)
+}
+
+func TestInvokeContractWithBroadcastUnsupported(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	cm.broadcast = nil
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10415", err)
+
+	mim.AssertExpectations(t)
+}
+
+func TestInvokeContractWithPrivateMessageUnsupported(t *testing.T) {
+	cm := newTestContractManager()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+		Message: &core.MessageInOut{
+			Message: core.Message{
+				Header: core.MessageHeader{
+					Type: core.MessageTypePrivate,
+				},
+			},
+			InlineData: core.InlineData{
+				&core.DataRefOrValue{Value: fftypes.JSONAnyPtr("\"test-message\"")},
+			},
+		},
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+
+	cm.messaging = nil
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10415", err)
+
+	mim.AssertExpectations(t)
+}
+
+func TestInvokeContractIdempotentResubmitOperation(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbm := cm.blockchain.(*blockchainmocks.Plugin)
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(&core.Operation{}, nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbm.On("ValidateInvokeRequest", context.Background(), req.Method, req.Input, req.Errors, false).Return(nil)
+
+	// If ResubmitOperations returns an operation it's because it found one to resubmit, so we return 2xx not 409, and don't expect an error
+	_, err := cm.InvokeContract(context.Background(), req, false)
+	assert.NoError(t, err)
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+}
+
+func TestInvokeContractIdempotentNoOperationToResubmit(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbm := cm.blockchain.(*blockchainmocks.Plugin)
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(nil, nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbm.On("ValidateInvokeRequest", context.Background(), req.Method, req.Input, req.Errors, false).Return(nil)
+
+	// If ResubmitOperations returns nil it's because there was no operation in initialized state, so we expect the regular 409 error back
+	_, err := cm.InvokeContract(context.Background(), req, false)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "FF10431")
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+	mbm.AssertExpectations(t)
+}
+
+func TestInvokeContractIdempotentErrorOnOperationResubmit(t *testing.T) {
+	cm := newTestContractManager()
+	var id = fftypes.NewUUID()
+	mim := cm.identity.(*identitymanagermocks.Manager)
+	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbm := cm.blockchain.(*blockchainmocks.Plugin)
+
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
+		Interface: fftypes.NewUUID(),
+		Location:  fftypes.JSONAnyPtr(""),
+		Method: &fftypes.FFIMethod{
+			Name:    "doStuff",
+			ID:      fftypes.NewUUID(),
+			Params:  fftypes.FFIParams{},
+			Returns: fftypes.FFIParams{},
+		},
+		IdempotencyKey: "idem1",
+	}
+
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), &sqlcommon.IdempotencyError{
+		ExistingTXID:  id,
+		OriginalError: i18n.NewError(context.Background(), coremsgs.MsgIdempotencyKeyDuplicateTransaction, "idem1", id)})
+	mom.On("ResubmitOperations", context.Background(), id).Return(nil, fmt.Errorf("pop"))
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbm.On("ValidateInvokeRequest", context.Background(), req.Method, req.Input, req.Errors, false).Return(nil)
+
+	// If ResubmitOperations returns an error trying to resubmit an operation we expect that back, not a 409 conflict
+	_, err := cm.InvokeContract(context.Background(), req, false)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "pop")
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mom.AssertExpectations(t)
+	mbm.AssertExpectations(t)
 }
 
 func TestInvokeContractConfirm(t *testing.T) {
@@ -1303,9 +2320,10 @@ func TestInvokeContractConfirm(t *testing.T) {
 	mth := cm.txHelper.(*txcommonmocks.Helper)
 	mom := cm.operations.(*operationmocks.Manager)
 	msa := cm.syncasync.(*syncasyncmocks.Bridge)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1314,25 +2332,27 @@ func TestInvokeContractConfirm(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
 	})).Return(nil)
-	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		data := op.Data.(blockchainInvokeData)
-		return op.Type == fftypes.OpTypeBlockchainInvoke && data.Request == req
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		data := op.Data.(txcommon.BlockchainInvokeData)
+		return op.Type == core.OpTypeBlockchainInvoke && data.Request == req
 	})).Return(nil, nil)
-	msa.On("WaitForInvokeOperation", mock.Anything, "ns1", mock.Anything, mock.Anything).
+	msa.On("WaitForInvokeOperation", mock.Anything, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
-			send := args[3].(syncasync.RequestSender)
+			send := args[2].(syncasync.SendFunction)
 			send(context.Background())
 		}).
-		Return(&fftypes.Operation{}, nil)
+		Return(&core.Operation{}, nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, true)
+	_, err := cm.InvokeContract(context.Background(), req, true)
 
 	assert.NoError(t, err)
 
@@ -1341,6 +2361,7 @@ func TestInvokeContractConfirm(t *testing.T) {
 	mdi.AssertExpectations(t)
 	mom.AssertExpectations(t)
 	msa.AssertExpectations(t)
+	mbi.AssertExpectations(t)
 }
 
 func TestInvokeContractFail(t *testing.T) {
@@ -1349,9 +2370,10 @@ func TestInvokeContractFail(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 	mth := cm.txHelper.(*txcommonmocks.Helper)
 	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1360,19 +2382,21 @@ func TestInvokeContractFail(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
 	})).Return(nil)
-	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		data := op.Data.(blockchainInvokeData)
-		return op.Type == fftypes.OpTypeBlockchainInvoke && data.Request == req
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		data := op.Data.(txcommon.BlockchainInvokeData)
+		return op.Type == core.OpTypeBlockchainInvoke && data.Request == req
 	})).Return(nil, fmt.Errorf("pop"))
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.EqualError(t, err, "pop")
 
@@ -1380,21 +2404,22 @@ func TestInvokeContractFail(t *testing.T) {
 	mdi.AssertExpectations(t)
 	mth.AssertExpectations(t)
 	mom.AssertExpectations(t)
+	mbi.AssertExpectations(t)
 }
 
-func TestInvokeContractFailNormalizeSigningKey(t *testing.T) {
+func TestInvokeContractFailResolveInputSigningKey(t *testing.T) {
 	cm := newTestContractManager()
 	mim := cm.identity.(*identitymanagermocks.Manager)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("", fmt.Errorf("pop"))
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("", fmt.Errorf("pop"))
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.Regexp(t, "pop", err)
 }
@@ -1404,16 +2429,16 @@ func TestInvokeContractFailResolve(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mim := cm.identity.(*identitymanagermocks.Manager)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mbi.On("InvokeContract", mock.Anything, mock.AnythingOfType("*fftypes.UUID"), "key-resolved", req.Location, req.Method, req.Input).Return(nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbi.On("InvokeContract", mock.Anything, mock.AnythingOfType("*fftypes.UUID"), "key-resolved", req.Location, req.Method, req.Input, req.Errors).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.Regexp(t, "FF10313", err)
 }
@@ -1422,9 +2447,10 @@ func TestInvokeContractTXFail(t *testing.T) {
 	cm := newTestContractManager()
 	mim := cm.identity.(*identitymanagermocks.Manager)
 	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1433,14 +2459,20 @@ func TestInvokeContractTXFail(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(nil, fmt.Errorf("pop"))
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(nil, fmt.Errorf("pop"))
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.EqualError(t, err, "pop")
+
+	mim.AssertExpectations(t)
+	mth.AssertExpectations(t)
+	mbi.AssertExpectations(t)
 }
 
 func TestInvokeContractMethodNotFound(t *testing.T) {
@@ -1448,27 +2480,48 @@ func TestInvokeContractMethodNotFound(t *testing.T) {
 	mdb := cm.database.(*databasemocks.Plugin)
 	mim := cm.identity.(*identitymanagermocks.Manager)
 
-	req := &fftypes.ContractCallRequest{
-		Type:       fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:       core.CallTypeInvoke,
 		Interface:  fftypes.NewUUID(),
 		Location:   fftypes.JSONAnyPtr(""),
 		MethodPath: "set",
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
 	mdb.On("GetFFIMethod", mock.Anything, "ns1", req.Interface, req.MethodPath).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.Regexp(t, "FF10315", err)
+}
+
+func TestInvokeContractErrorsFail(t *testing.T) {
+	cm := newTestContractManager()
+	mdb := cm.database.(*databasemocks.Plugin)
+	mim := cm.identity.(*identitymanagermocks.Manager)
+
+	req := &core.ContractCallRequest{
+		Type:       core.CallTypeInvoke,
+		Interface:  fftypes.NewUUID(),
+		Location:   fftypes.JSONAnyPtr(""),
+		MethodPath: "set",
+	}
+
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mdb.On("GetFFIMethod", mock.Anything, "ns1", req.Interface, req.MethodPath).Return(&fftypes.FFIMethod{Name: "set"}, nil)
+	mdb.On("GetFFIErrors", mock.Anything, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+
+	_, err := cm.InvokeContract(context.Background(), req, false)
+
+	assert.Regexp(t, "FF10434", err)
 }
 
 func TestInvokeContractMethodBadInput(t *testing.T) {
 	cm := newTestContractManager()
 	mim := cm.identity.(*identitymanagermocks.Manager)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1492,9 +2545,9 @@ func TestInvokeContractMethodBadInput(t *testing.T) {
 			},
 		},
 	}
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 	assert.Regexp(t, "FF10304", err)
 }
 
@@ -1502,11 +2555,9 @@ func TestQueryContract(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mim := cm.identity.(*identitymanagermocks.Manager)
-	mdi := cm.database.(*databasemocks.Plugin)
-	mth := cm.txHelper.(*txcommonmocks.Helper)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeQuery,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeQuery,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1515,27 +2566,28 @@ func TestQueryContract(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
-	})).Return(nil)
-	mbi.On("QueryContract", mock.Anything, req.Location, req.Method, req.Input).Return(struct{}{}, nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mbi.On("QueryContract", mock.Anything, req.Location, req.Method, req.Input, req.Errors, req.Options).Return(struct{}{}, nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContract(context.Background(), "ns1", req, false)
+	_, err := cm.InvokeContract(context.Background(), req, false)
 
 	assert.NoError(t, err)
+
+	mbi.AssertExpectations(t)
+	mim.AssertExpectations(t)
 }
 
 func TestCallContractInvalidType(t *testing.T) {
 	cm := newTestContractManager()
 	mim := cm.identity.(*identitymanagermocks.Manager)
-	mdi := cm.database.(*databasemocks.Plugin)
-	mth := cm.txHelper.(*txcommonmocks.Helper)
+	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
+	req := &core.ContractCallRequest{
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1544,38 +2596,87 @@ func TestCallContractInvalidType(t *testing.T) {
 			Params:  fftypes.FFIParams{},
 			Returns: fftypes.FFIParams{},
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
 	})).Return(nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
 	assert.PanicsWithValue(t, "unknown call type: ", func() {
-		cm.InvokeContract(context.Background(), "ns1", req, false)
+		cm.InvokeContract(context.Background(), req, false)
 	})
+
+	mim.AssertExpectations(t)
+	mbi.AssertExpectations(t)
 }
 
-func TestGetContractListenerByID(t *testing.T) {
+func TestGetContractListenerByNameOrID(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
 	id := fftypes.NewUUID()
-	mdi.On("GetContractListenerByID", context.Background(), id).Return(&fftypes.ContractListener{}, nil)
+	mdi.On("GetContractListenerByID", context.Background(), "ns1", id).Return(&core.ContractListener{}, nil)
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", id.String())
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), id.String())
 	assert.NoError(t, err)
 }
 
-func TestGetContractListenerByIDFail(t *testing.T) {
+func TestGetContractListenerByNameOrIDWithStatus(t *testing.T) {
+	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+
+	id := fftypes.NewUUID()
+	backendID := "testID"
+	mdi.On("GetContractListenerByID", context.Background(), "ns1", id).Return(&core.ContractListener{BackendID: backendID}, nil)
+	mbi.On("GetContractListenerStatus", context.Background(), backendID, false).Return(true, fftypes.JSONAnyPtr(fftypes.JSONObject{}.String()), nil)
+
+	_, err := cm.GetContractListenerByNameOrIDWithStatus(context.Background(), id.String())
+	assert.NoError(t, err)
+}
+
+func TestGetContractListenerByNameOrIDWithStatusListenerFail(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
 	id := fftypes.NewUUID()
-	mdi.On("GetContractListenerByID", context.Background(), id).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetContractListenerByID", context.Background(), "ns1", id).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", id.String())
+	_, err := cm.GetContractListenerByNameOrIDWithStatus(context.Background(), id.String())
+	assert.EqualError(t, err, "pop")
+}
+
+func TestGetContractListenerByNameOrIDWithStatusPluginFail(t *testing.T) {
+	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
+
+	id := fftypes.NewUUID()
+	backendID := "testID"
+	mdi.On("GetContractListenerByID", context.Background(), "ns1", id).Return(&core.ContractListener{BackendID: backendID}, nil)
+	mbi.On("GetContractListenerStatus", context.Background(), backendID, false).Return(false, nil, fmt.Errorf("pop"))
+
+	listener, err := cm.GetContractListenerByNameOrIDWithStatus(context.Background(), id.String())
+
+	testError := core.ListenerStatusError{
+		StatusError: "pop",
+	}
+
+	assert.Equal(t, listener.Status, testError)
+	assert.NoError(t, err)
+}
+
+func TestGetContractListenerByNameOrIDFail(t *testing.T) {
+	cm := newTestContractManager()
+	mdi := cm.database.(*databasemocks.Plugin)
+
+	id := fftypes.NewUUID()
+	mdi.On("GetContractListenerByID", context.Background(), "ns1", id).Return(nil, fmt.Errorf("pop"))
+
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), id.String())
 	assert.EqualError(t, err, "pop")
 }
 
@@ -1583,16 +2684,16 @@ func TestGetContractListenerByName(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(&fftypes.ContractListener{}, nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(&core.ContractListener{}, nil)
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), "sub1")
 	assert.NoError(t, err)
 }
 
 func TestGetContractListenerBadName(t *testing.T) {
 	cm := newTestContractManager()
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", "!bad")
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), "!bad")
 	assert.Regexp(t, "FF00140", err)
 }
 
@@ -1600,9 +2701,9 @@ func TestGetContractListenerByNameFail(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), "sub1")
 	assert.EqualError(t, err, "pop")
 }
 
@@ -1610,9 +2711,9 @@ func TestGetContractListenerNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(nil, nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(nil, nil)
 
-	_, err := cm.GetContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	_, err := cm.GetContractListenerByNameOrID(context.Background(), "sub1")
 	assert.Regexp(t, "FF10109", err)
 }
 
@@ -1620,10 +2721,10 @@ func TestGetContractListeners(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
 
 	f := database.ContractListenerQueryFactory.NewFilter(context.Background())
-	_, _, err := cm.GetContractListeners(context.Background(), "ns", f.And())
+	_, _, err := cm.GetContractListeners(context.Background(), f.And())
 	assert.NoError(t, err)
 }
 
@@ -1633,7 +2734,7 @@ func TestGetContractAPIListeners(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 
 	interfaceID := fftypes.NewUUID()
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Interface: &fftypes.FFIReference{
 			ID: interfaceID,
 		},
@@ -1647,14 +2748,14 @@ func TestGetContractAPIListeners(t *testing.T) {
 		},
 	}
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(api, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
-	mdi.On("GetFFIEvent", context.Background(), "ns", interfaceID, "changed").Return(event, nil)
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(api, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
+	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, "changed").Return(event, nil)
 	mbi.On("GenerateEventSignature", context.Background(), mock.Anything).Return("changed")
-	mdi.On("GetContractListeners", context.Background(), mock.Anything).Return(nil, nil, nil)
+	mdi.On("GetContractListeners", context.Background(), "ns1", mock.Anything).Return(nil, nil, nil)
 
 	f := database.ContractListenerQueryFactory.NewFilter(context.Background())
-	_, _, err := cm.GetContractAPIListeners(context.Background(), "ns", "simple", "changed", f.And())
+	_, _, err := cm.GetContractAPIListeners(context.Background(), "simple", "changed", f.And())
 	assert.NoError(t, err)
 
 	mbi.AssertExpectations(t)
@@ -1665,10 +2766,10 @@ func TestGetContractAPIListenersNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(nil, nil)
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(nil, nil)
 
 	f := database.ContractListenerQueryFactory.NewFilter(context.Background())
-	_, _, err := cm.GetContractAPIListeners(context.Background(), "ns", "simple", "changed", f.And())
+	_, _, err := cm.GetContractAPIListeners(context.Background(), "simple", "changed", f.And())
 	assert.Regexp(t, "FF10109", err)
 
 	mdi.AssertExpectations(t)
@@ -1678,10 +2779,10 @@ func TestGetContractAPIListenersFail(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(nil, fmt.Errorf("pop"))
 
 	f := database.ContractListenerQueryFactory.NewFilter(context.Background())
-	_, _, err := cm.GetContractAPIListeners(context.Background(), "ns", "simple", "changed", f.And())
+	_, _, err := cm.GetContractAPIListeners(context.Background(), "simple", "changed", f.And())
 	assert.EqualError(t, err, "pop")
 
 	mdi.AssertExpectations(t)
@@ -1692,7 +2793,7 @@ func TestGetContractAPIListenersEventNotFound(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 
 	interfaceID := fftypes.NewUUID()
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Interface: &fftypes.FFIReference{
 			ID: interfaceID,
 		},
@@ -1701,12 +2802,12 @@ func TestGetContractAPIListenersEventNotFound(t *testing.T) {
 		}.String()),
 	}
 
-	mdi.On("GetContractAPIByName", context.Background(), "ns", "simple").Return(api, nil)
-	mdi.On("GetFFIByID", context.Background(), interfaceID).Return(&fftypes.FFI{}, nil)
-	mdi.On("GetFFIEvent", context.Background(), "ns", interfaceID, "changed").Return(nil, nil)
+	mdi.On("GetContractAPIByName", context.Background(), "ns1", "simple").Return(api, nil)
+	mdi.On("GetFFIByID", context.Background(), "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
+	mdi.On("GetFFIEvent", context.Background(), "ns1", interfaceID, "changed").Return(nil, nil)
 
 	f := database.ContractListenerQueryFactory.NewFilter(context.Background())
-	_, _, err := cm.GetContractAPIListeners(context.Background(), "ns", "simple", "changed", f.And())
+	_, _, err := cm.GetContractAPIListeners(context.Background(), "simple", "changed", f.And())
 	assert.Regexp(t, "FF10370", err)
 
 	mdi.AssertExpectations(t)
@@ -1717,15 +2818,15 @@ func TestDeleteContractListener(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListener{
+	sub := &core.ContractListener{
 		ID: fftypes.NewUUID(),
 	}
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(sub, nil)
-	mbi.On("DeleteContractListener", context.Background(), sub).Return(nil)
-	mdi.On("DeleteContractListenerByID", context.Background(), sub.ID).Return(nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(sub, nil)
+	mbi.On("DeleteContractListener", context.Background(), sub, true).Return(nil)
+	mdi.On("DeleteContractListenerByID", context.Background(), "ns1", sub.ID).Return(nil)
 
-	err := cm.DeleteContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	err := cm.DeleteContractListenerByNameOrID(context.Background(), "sub1")
 	assert.NoError(t, err)
 }
 
@@ -1734,15 +2835,15 @@ func TestDeleteContractListenerBlockchainFail(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	sub := &fftypes.ContractListener{
+	sub := &core.ContractListener{
 		ID: fftypes.NewUUID(),
 	}
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(sub, nil)
-	mbi.On("DeleteContractListener", context.Background(), sub).Return(fmt.Errorf("pop"))
-	mdi.On("DeleteContractListenerByID", context.Background(), sub.ID).Return(nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(sub, nil)
+	mbi.On("DeleteContractListener", context.Background(), sub, true).Return(fmt.Errorf("pop"))
+	mdi.On("DeleteContractListenerByID", context.Background(), "ns1", sub.ID).Return(nil)
 
-	err := cm.DeleteContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	err := cm.DeleteContractListenerByNameOrID(context.Background(), "sub1")
 	assert.EqualError(t, err, "pop")
 }
 
@@ -1750,9 +2851,9 @@ func TestDeleteContractListenerNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mdi := cm.database.(*databasemocks.Plugin)
 
-	mdi.On("GetContractListener", context.Background(), "ns", "sub1").Return(nil, nil)
+	mdi.On("GetContractListener", context.Background(), "ns1", "sub1").Return(nil, nil)
 
-	err := cm.DeleteContractListenerByNameOrID(context.Background(), "ns", "sub1")
+	err := cm.DeleteContractListenerByNameOrID(context.Background(), "sub1")
 	assert.Regexp(t, "FF10109", err)
 }
 
@@ -1763,36 +2864,39 @@ func TestInvokeContractAPI(t *testing.T) {
 	mdi := cm.database.(*databasemocks.Plugin)
 	mth := cm.txHelper.(*txcommonmocks.Helper)
 	mom := cm.operations.(*operationmocks.Manager)
+	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
 			ID:   fftypes.NewUUID(),
 			Name: "peel",
 		},
+		IdempotencyKey: "idem1",
 	}
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Interface: &fftypes.FFIReference{
 			ID: fftypes.NewUUID(),
 		},
 		Location: fftypes.JSONAnyPtr(""),
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(api, nil)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeContractInvoke).Return(fftypes.NewUUID(), nil)
-	mdi.On("InsertOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.Operation) bool {
-		return op.Namespace == "ns1" && op.Type == fftypes.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeContractInvoke, core.IdempotencyKey("idem1")).Return(fftypes.NewUUID(), nil)
+	mom.On("AddOrReuseOperation", mock.Anything, mock.MatchedBy(func(op *core.Operation) bool {
+		return op.Namespace == "ns1" && op.Type == core.OpTypeBlockchainInvoke && op.Plugin == "mockblockchain"
 	})).Return(nil)
-	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *fftypes.PreparedOperation) bool {
-		data := op.Data.(blockchainInvokeData)
-		return op.Type == fftypes.OpTypeBlockchainInvoke && data.Request == req
+	mom.On("RunOperation", mock.Anything, mock.MatchedBy(func(op *core.PreparedOperation) bool {
+		data := op.Data.(txcommon.BlockchainInvokeData)
+		return op.Type == core.OpTypeBlockchainInvoke && data.Request == req
 	})).Return(nil, nil)
+	mbi.On("ValidateInvokeRequest", mock.Anything, req.Method, req.Input, req.Errors, false).Return(nil)
 
-	_, err := cm.InvokeContractAPI(context.Background(), "ns1", "banana", "peel", req, false)
+	_, err := cm.InvokeContractAPI(context.Background(), "banana", "peel", req, false)
 
 	assert.NoError(t, err)
 
@@ -1801,14 +2905,15 @@ func TestInvokeContractAPI(t *testing.T) {
 	mdi.AssertExpectations(t)
 	mth.AssertExpectations(t)
 	mom.AssertExpectations(t)
+	mbi.AssertExpectations(t)
 }
 
 func TestInvokeContractAPIFailContractLookup(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 	mim := cm.identity.(*identitymanagermocks.Manager)
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1816,10 +2921,10 @@ func TestInvokeContractAPIFailContractLookup(t *testing.T) {
 		},
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.InvokeContractAPI(context.Background(), "ns1", "banana", "peel", req, false)
+	_, err := cm.InvokeContractAPI(context.Background(), "banana", "peel", req, false)
 
 	assert.Regexp(t, "pop", err)
 }
@@ -1828,8 +2933,8 @@ func TestInvokeContractAPIContractNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 	mim := cm.identity.(*identitymanagermocks.Manager)
-	req := &fftypes.ContractCallRequest{
-		Type:      fftypes.CallTypeInvoke,
+	req := &core.ContractCallRequest{
+		Type:      core.CallTypeInvoke,
 		Interface: fftypes.NewUUID(),
 		Location:  fftypes.JSONAnyPtr(""),
 		Method: &fftypes.FFIMethod{
@@ -1837,10 +2942,10 @@ func TestInvokeContractAPIContractNotFound(t *testing.T) {
 		},
 	}
 
-	mim.On("NormalizeSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
+	mim.On("ResolveInputSigningKey", mock.Anything, "", identity.KeyNormalizationBlockchainPlugin).Return("key-resolved", nil)
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(nil, nil)
 
-	_, err := cm.InvokeContractAPI(context.Background(), "ns1", "banana", "peel", req, false)
+	_, err := cm.InvokeContractAPI(context.Background(), "banana", "peel", req, false)
 
 	assert.Regexp(t, "FF10109", err)
 }
@@ -1849,13 +2954,13 @@ func TestGetContractAPI(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Namespace: "ns1",
 		Name:      "banana",
 	}
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(api, nil)
 
-	result, err := cm.GetContractAPI(context.Background(), "http://localhost/api", "ns1", "banana")
+	result, err := cm.GetContractAPI(context.Background(), "http://localhost/api", "banana")
 
 	assert.NoError(t, err)
 	assert.Equal(t, "http://localhost/api/namespaces/ns1/apis/banana/api/swagger.json", result.URLs.OpenAPI)
@@ -1866,16 +2971,16 @@ func TestGetContractAPIs(t *testing.T) {
 	cm := newTestContractManager()
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	apis := []*fftypes.ContractAPI{
+	apis := []*core.ContractAPI{
 		{
 			Namespace: "ns1",
 			Name:      "banana",
 		},
 	}
 	filter := database.ContractAPIQueryFactory.NewFilter(context.Background()).And()
-	mdb.On("GetContractAPIs", mock.Anything, "ns1", filter).Return(apis, &database.FilterResult{}, nil)
+	mdb.On("GetContractAPIs", mock.Anything, "ns1", filter).Return(apis, &ffapi.FilterResult{}, nil)
 
-	results, _, err := cm.GetContractAPIs(context.Background(), "http://localhost/api", "ns1", filter)
+	results, _, err := cm.GetContractAPIs(context.Background(), "http://localhost/api", filter)
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(results))
@@ -1889,25 +2994,31 @@ func TestGetContractAPIInterface(t *testing.T) {
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
 	interfaceID := fftypes.NewUUID()
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		Namespace: "ns1",
 		Name:      "banana",
 		Interface: &fftypes.FFIReference{ID: interfaceID},
 	}
 
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(api, nil)
-	mdb.On("GetFFIByID", mock.Anything, interfaceID).Return(&fftypes.FFI{}, nil)
-	mdb.On("GetFFIMethods", mock.Anything, mock.Anything).Return([]*fftypes.FFIMethod{
+	mdb.On("GetFFIByID", mock.Anything, "ns1", interfaceID).Return(&fftypes.FFI{}, nil)
+	mdb.On("GetFFIMethods", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIMethod{
 		{ID: fftypes.NewUUID(), Name: "method1"},
 	}, nil, nil)
-	mdb.On("GetFFIEvents", mock.Anything, mock.Anything).Return([]*fftypes.FFIEvent{
+	mdb.On("GetFFIEvents", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIEvent{
 		{ID: fftypes.NewUUID(), FFIEventDefinition: fftypes.FFIEventDefinition{Name: "event1"}},
 	}, nil, nil)
 	mbi.On("GenerateEventSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIEventDefinition) bool {
 		return ev.Name == "event1"
 	})).Return("event1Sig")
+	mdb.On("GetFFIErrors", mock.Anything, "ns1", mock.Anything).Return([]*fftypes.FFIError{
+		{ID: fftypes.NewUUID(), FFIErrorDefinition: fftypes.FFIErrorDefinition{Name: "customError1"}},
+	}, nil, nil)
+	mbi.On("GenerateErrorSignature", mock.Anything, mock.MatchedBy(func(ev *fftypes.FFIErrorDefinition) bool {
+		return ev.Name == "customError1"
+	})).Return("error1Sig")
 
-	result, err := cm.GetContractAPIInterface(context.Background(), "ns1", "banana")
+	result, err := cm.GetContractAPIInterface(context.Background(), "banana")
 
 	assert.NoError(t, err)
 	assert.NotNil(t, result)
@@ -1922,25 +3033,19 @@ func TestGetContractAPIInterfaceFail(t *testing.T) {
 
 	mdb.On("GetContractAPIByName", mock.Anything, "ns1", "banana").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.GetContractAPIInterface(context.Background(), "ns1", "banana")
+	_, err := cm.GetContractAPIInterface(context.Background(), "banana")
 
 	assert.EqualError(t, err, "pop")
 
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPI(t *testing.T) {
+func TestResolveContractAPI(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
 
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -1950,28 +3055,22 @@ func TestBroadcastContractAPI(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
-	mdb.On("GetFFIByID", mock.Anything, api.Interface.ID).Return(&fftypes.FFI{}, nil)
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.ContractAPI"), fftypes.SystemTagDefineContractAPI, false).Return(msg, nil)
+	mdb.On("GetFFIByID", mock.Anything, "ns1", api.Interface.ID).Return(&fftypes.FFI{}, nil)
 
-	api, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.NoError(t, err)
-	assert.NotNil(t, api)
-	assert.NotEmpty(t, api.URLs.OpenAPI)
-	assert.NotEmpty(t, api.URLs.UI)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
-	mbm.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIBadLocation(t *testing.T) {
+func TestResolveContractAPIBadLocation(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -1981,67 +3080,21 @@ func TestBroadcastContractAPIBadLocation(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(nil, fmt.Errorf("pop"))
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, fmt.Errorf("pop"))
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIExisting(t *testing.T) {
-	cm := newTestContractManager()
-	mbi := cm.blockchain.(*blockchainmocks.Plugin)
-	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
-
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	apiID := fftypes.NewUUID()
-	existing := &fftypes.ContractAPI{
-		ID:        apiID,
-		Namespace: "ns1",
-		Location:  fftypes.JSONAnyPtr(""),
-		Name:      "banana",
-		Interface: &fftypes.FFIReference{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	api := &fftypes.ContractAPI{
-		ID:        apiID,
-		Namespace: "ns1",
-		Location:  fftypes.JSONAnyPtr(""),
-		Name:      "banana",
-		Interface: &fftypes.FFIReference{
-			ID: fftypes.NewUUID(),
-		},
-	}
-
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
-	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(existing, nil)
-	mdb.On("GetFFIByID", mock.Anything, api.Interface.ID).Return(&fftypes.FFI{}, nil)
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.ContractAPI"), fftypes.SystemTagDefineContractAPI, false).Return(msg, nil)
-
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
-	assert.NoError(t, err)
-
-	mbi.AssertExpectations(t)
-	mdb.AssertExpectations(t)
-	mbm.AssertExpectations(t)
-}
-
-func TestBroadcastContractAPICannotChangeLocation(t *testing.T) {
+func TestResolveContractAPICannotChangeLocation(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
 	apiID := fftypes.NewUUID()
-	existing := &fftypes.ContractAPI{
+	existing := &core.ContractAPI{
 		ID:        apiID,
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(`"old"`),
@@ -2050,7 +3103,7 @@ func TestBroadcastContractAPICannotChangeLocation(t *testing.T) {
 			ID: fftypes.NewUUID(),
 		},
 	}
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        apiID,
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(`"new"`),
@@ -2060,29 +3113,22 @@ func TestBroadcastContractAPICannotChangeLocation(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(existing, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.Regexp(t, "FF10316", err)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceName(t *testing.T) {
+func TestResolveContractAPIInterfaceName(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
 
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
-			ID: fftypes.NewUUID(),
-		},
-	}
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2094,80 +3140,45 @@ func TestBroadcastContractAPIInterfaceName(t *testing.T) {
 	}
 	interfaceID := fftypes.NewUUID()
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
 	mdb.On("GetFFI", mock.Anything, "ns1", "my-ffi", "1").Return(&fftypes.FFI{ID: interfaceID}, nil)
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.ContractAPI"), fftypes.SystemTagDefineContractAPI, false).Return(msg, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.NoError(t, err)
-	assert.Equal(t, *interfaceID, *api.Interface.ID)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
-	mbm.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIFail(t *testing.T) {
-	cm := newTestContractManager()
-	mbi := cm.blockchain.(*blockchainmocks.Plugin)
-	mdb := cm.database.(*databasemocks.Plugin)
-	mbm := cm.broadcast.(*broadcastmocks.Manager)
-
-	api := &fftypes.ContractAPI{
-		ID:        fftypes.NewUUID(),
-		Namespace: "ns1",
-		Location:  fftypes.JSONAnyPtr(""),
-		Name:      "banana",
-		Interface: &fftypes.FFIReference{
-			ID: fftypes.NewUUID(),
-		},
-	}
-
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
-	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
-	mdb.On("GetFFIByID", mock.Anything, api.Interface.ID).Return(&fftypes.FFI{}, nil)
-	mbm.On("BroadcastDefinitionAsNode", mock.Anything, "ns1", mock.AnythingOfType("*fftypes.ContractAPI"), fftypes.SystemTagDefineContractAPI, false).Return(nil, fmt.Errorf("pop"))
-
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
-	assert.Regexp(t, "pop", err)
-
-	mbi.AssertExpectations(t)
-	mdb.AssertExpectations(t)
-	mbm.AssertExpectations(t)
-}
-
-func TestBroadcastContractAPINoInterface(t *testing.T) {
+func TestResolveContractAPINoInterface(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
 		Name:      "banana",
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.Regexp(t, "FF10303", err)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceIDFail(t *testing.T) {
+func TestResolveContractAPIInterfaceIDFail(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2177,24 +3188,23 @@ func TestBroadcastContractAPIInterfaceIDFail(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
-	mdb.On("GetFFIByID", mock.Anything, api.Interface.ID).Return(nil, fmt.Errorf("pop"))
+	mdb.On("GetFFIByID", mock.Anything, "ns1", api.Interface.ID).Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceIDNotFound(t *testing.T) {
+func TestResolveContractAPIInterfaceIDNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2204,24 +3214,23 @@ func TestBroadcastContractAPIInterfaceIDNotFound(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
-	mdb.On("GetFFIByID", mock.Anything, api.Interface.ID).Return(nil, nil)
+	mdb.On("GetFFIByID", mock.Anything, "ns1", api.Interface.ID).Return(nil, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.Regexp(t, "FF10303.*"+api.Interface.ID.String(), err)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceNameFail(t *testing.T) {
+func TestResolveContractAPIInterfaceNameFail(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2232,24 +3241,23 @@ func TestBroadcastContractAPIInterfaceNameFail(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
 	mdb.On("GetFFI", mock.Anything, "ns1", "my-ffi", "1").Return(nil, fmt.Errorf("pop"))
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.EqualError(t, err, "pop")
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceNameNotFound(t *testing.T) {
+func TestResolveContractAPIInterfaceNameNotFound(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2260,24 +3268,23 @@ func TestBroadcastContractAPIInterfaceNameNotFound(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
 	mdb.On("GetFFI", mock.Anything, "ns1", "my-ffi", "1").Return(nil, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.Regexp(t, "FF10303.*my-ffi", err)
 
 	mbi.AssertExpectations(t)
 	mdb.AssertExpectations(t)
 }
 
-func TestBroadcastContractAPIInterfaceNoVersion(t *testing.T) {
+func TestResolveContractAPIInterfaceNoVersion(t *testing.T) {
 	cm := newTestContractManager()
 	mbi := cm.blockchain.(*blockchainmocks.Plugin)
 	mdb := cm.database.(*databasemocks.Plugin)
 
-	api := &fftypes.ContractAPI{
+	api := &core.ContractAPI{
 		ID:        fftypes.NewUUID(),
 		Namespace: "ns1",
 		Location:  fftypes.JSONAnyPtr(""),
@@ -2287,11 +3294,10 @@ func TestBroadcastContractAPIInterfaceNoVersion(t *testing.T) {
 		},
 	}
 
-	mbi.On("NormalizeContractLocation", context.Background(), api.Location).Return(api.Location, nil)
+	mbi.On("NormalizeContractLocation", context.Background(), blockchain.NormalizeCall, api.Location).Return(api.Location, nil)
 	mdb.On("GetContractAPIByName", mock.Anything, api.Namespace, api.Name).Return(nil, nil)
 
-	_, err := cm.BroadcastContractAPI(context.Background(), "http://localhost/api", "ns1", api, false)
-
+	err := cm.ResolveContractAPI(context.Background(), "http://localhost/api", api)
 	assert.Regexp(t, "FF10303.*my-ffi", err)
 
 	mbi.AssertExpectations(t)
@@ -2331,7 +3337,6 @@ func TestCheckParamSchemaCompileFail(t *testing.T) {
 func TestAddJSONSchemaExtension(t *testing.T) {
 	cm := &contractManager{
 		database:          &databasemocks.Plugin{},
-		broadcast:         &broadcastmocks.Manager{},
 		identity:          &identitymanagermocks.Manager{},
 		blockchain:        &blockchainmocks.Plugin{},
 		ffiParamValidator: &MockFFIParamValidator{},
@@ -2346,7 +3351,7 @@ func TestGenerateFFI(t *testing.T) {
 	mbi.On("GenerateFFI", mock.Anything, mock.Anything).Return(&fftypes.FFI{
 		Name: "generated",
 	}, nil)
-	ffi, err := cm.GenerateFFI(context.Background(), "default", &fftypes.FFIGenerationRequest{})
+	ffi, err := cm.GenerateFFI(context.Background(), &fftypes.FFIGenerationRequest{})
 	assert.NoError(t, err)
 	assert.NotNil(t, ffi)
 	assert.Equal(t, "generated", ffi.Name)
@@ -2364,4 +3369,16 @@ func (v *MockFFIParamValidator) GetMetaSchema() *jsonschema.Schema {
 
 func (v *MockFFIParamValidator) GetExtensionName() string {
 	return "ffi"
+}
+
+func TestBuildInvokeMessageInvalidType(t *testing.T) {
+	cm := newTestContractManager()
+	_, err := cm.buildInvokeMessage(context.Background(), &core.MessageInOut{
+		Message: core.Message{
+			Header: core.MessageHeader{
+				Type: core.MessageTypeDefinition,
+			},
+		},
+	})
+	assert.Regexp(t, "FF10287", err)
 }

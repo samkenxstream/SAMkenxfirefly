@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -17,14 +17,55 @@
 package coreconfig
 
 import (
-	"net/http"
-
-	"github.com/hyperledger/firefly/pkg/config"
-	"github.com/hyperledger/firefly/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/spf13/viper"
 )
 
 var ffc = config.AddRootKey
+
+const (
+	// PluginConfigName is the user-supplied name for this plugin type
+	PluginConfigName = "name"
+	// PluginConfigType is the type of the plugin to be loaded
+	PluginConfigType = "type"
+	// PluginBroadcastName is the plugin name to be sent in multi-party broadcasts, if it differs from the local plugin name
+	PluginBroadcastName = "broadcastName"
+	// NamespaceName is the short name for a pre-defined namespace
+	NamespaceName = "name"
+	// NamespaceName is the long description for a pre-defined namespace
+	NamespaceDescription = "description"
+	// NamespacePlugins is the list of namespace plugins
+	NamespacePlugins = "plugins"
+	// NamespaceDefaultKey is the default signing key for blockchain transactions within this namespace
+	NamespaceDefaultKey = "defaultKey"
+	// NamespaceAssetKeyNormalization mechanism to normalize keys before using them. Valid options: "blockchain_plugin" - use blockchain plugin (default), "none" - do not attempt normalization
+	NamespaceAssetKeyNormalization = "asset.manager.keyNormalization"
+	// NamespaceMultiparty contains the multiparty configuration for a namespace
+	NamespaceMultiparty = "multiparty"
+	// NamespaceMultipartyEnabled specifies if multi-party mode is enabled for a namespace
+	NamespaceMultipartyEnabled = "enabled"
+	// NamespaceMultipartyNetworkNamespace is the shared namespace name to be used in off-chain messaging
+	NamespaceMultipartyNetworkNamespace = "networknamespace"
+	// NamespaceMultipartyOrgName is a short name for the local root org within a namespace
+	NamespaceMultipartyOrgName = "org.name"
+	// NamespaceMultipartyOrgDescription is a description for the local root org within a namespace
+	NamespaceMultipartyOrgDescription = "org.description"
+	// NamespaceMultipartyOrgKey is the signing key allocated to the local root org within a namespace
+	NamespaceMultipartyOrgKey = "org.key"
+	// NamespaceMultipartyNodeName is the name for the local node within a namespace
+	NamespaceMultipartyNodeName = "node.name"
+	// NamespaceMultipartyNodeName is a description for the local node within a namespace
+	NamespaceMultipartyNodeDescription = "node.description"
+	// NamespaceMultipartyContract is a list of firefly contract configurations for this namespace
+	NamespaceMultipartyContract = "contract"
+	// NamespaceMultipartyContractFirstEvent is the first event to process for this contract
+	NamespaceMultipartyContractFirstEvent = "firstEvent"
+	// NamespaceMultipartyContractLocation is an object specifying the blockchain-specific location of the contract
+	NamespaceMultipartyContractLocation = "location"
+	// NamespaceMultipartyContractOptions is an object of additional blockchain-specific configuration
+	NamespaceMultipartyContractOptions = "options"
+)
 
 // The following keys can be access from the root configuration.
 // Plugins are responsible for defining their own keys using the Config interface
@@ -39,14 +80,10 @@ var (
 	APIRequestTimeout = ffc("api.requestTimeout")
 	// APIRequestMaxTimeout is the maximum timeout an application can set using a Request-Timeout header
 	APIRequestMaxTimeout = ffc("api.requestMaxTimeout")
-	// APIShutdownTimeout is the amount of time to wait for any in-flight requests to finish before killing the HTTP server
-	APIShutdownTimeout = ffc("api.shutdownTimeout")
 	// APIOASPanicOnMissingDescription controls whether the OpenAPI Spec generator will strongly enforce descriptions on every field or not
 	APIOASPanicOnMissingDescription = ffc("api.oas.panicOnMissingDescription")
-	// BatchCacheSize
-	BatchCacheSize = ffc("batch.cache.size")
-	// BatchCacheSize
-	BatchCacheTTL = ffc("batch.cache.ttl")
+	// APIPassThroughHeaders is a list of HTTP request headers to pass through to requests made to dependency microservices
+	APIPassthroughHeaders = ffc("api.passthroughHeaders")
 	// BatchManagerReadPageSize is the size of each page of messages read from the database into memory when assembling batches
 	BatchManagerReadPageSize = ffc("batch.manager.readPageSize")
 	// BatchManagerReadPollTimeout is how long without any notifications of new messages to wait, before doing a page query
@@ -71,12 +108,7 @@ var (
 	BlobReceiverWorkerBatchTimeout = ffc("blobreceiver.worker.batchTimeout")
 	// BlobReceiverWorkerBatchMaxInserts
 	BlobReceiverWorkerBatchMaxInserts = ffc("blobreceiver.worker.batchMaxInserts")
-	// BlockchainEventCacheSize size of cache for blockchain events
-	BlockchainEventCacheSize = ffc("blockchainevent.cache.size")
-	// BlockchainEventCacheTTL time to live of cache for blockchain events
-	BlockchainEventCacheTTL = ffc("blockchainevent.cache.ttl")
-	// BlockchainType is the name of the blockchain interface plugin being used by this firefly node
-	BlockchainType = ffc("blockchain.type")
+
 	// BroadcastBatchAgentTimeout how long to keep around a batching agent for a sending identity before disposal
 	BroadcastBatchAgentTimeout = ffc("broadcast.batch.agentTimeout")
 	// BroadcastBatchSize is the maximum number of messages that can be packed into a batch
@@ -85,6 +117,55 @@ var (
 	BroadcastBatchPayloadLimit = ffc("broadcast.batch.payloadLimit")
 	// BroadcastBatchTimeout is the timeout to wait for a batch to fill, before sending
 	BroadcastBatchTimeout = ffc("broadcast.batch.timeout")
+
+	// ConfigAutoReload starts a filesystem listener against the config file, and if it changes analyzes the config file for changes that require individual namespaces to restart
+	ConfigAutoReload = ffc("config.autoReload")
+
+	// CacheEnabled determines whether cache will be enabled or not, default to true
+	CacheEnabled = ffc("cache.enabled")
+
+	// AddressResolver cache config
+	CacheAddressResolverLimit = ffc("cache.addressresolver.limit")
+	CacheAddressResolverTTL   = ffc("cache.addressresolver.ttl")
+
+	// Batch cache config
+	CacheBatchLimit = ffc("cache.batch.limit")
+	CacheBatchTTL   = ffc("cache.batch.ttl")
+
+	// Transaction - BlockchainEvent cache config
+	CacheBlockchainEventLimit = ffc("cache.blockchainevent.limit")
+	CacheBlockchainEventTTL   = ffc("cache.blockchainevent.ttl")
+	// Transaction cache config
+	CacheTransactionSize = ffc("cache.transaction.size")
+	CacheTransactionTTL  = ffc("cache.transaction.ttl")
+
+	// EventListenerTopic cache config
+	CacheEventListenerTopicLimit = ffc("cache.eventlistenertopic.limit")
+	CacheEventListenerTopicTTL   = ffc("cache.eventlistenertopic.ttl")
+
+	// Group cache config
+	CacheGroupLimit = ffc("cache.group.limit")
+	CacheGroupTTL   = ffc("cache.group.ttl")
+
+	// IdentityManager identity cache config
+	CacheIdentityLimit = ffc("cache.identity.limit")
+	CacheIdentityTTL   = ffc("cache.identity.ttl")
+
+	// DataManager Message cache config
+	CacheMessageSize = ffc("cache.message.size")
+	CacheMessageTTL  = ffc("cache.message.ttl")
+	// DataManager Validator cache config
+	CacheValidatorSize = ffc("cache.validator.size")
+	CacheValidatorTTL  = ffc("cache.validator.ttl")
+
+	// Blockchain cache config
+	CacheBlockchainTTL   = ffc("cache.blockchain.ttl")
+	CacheBlockchainLimit = ffc("cache.blockchain.limit")
+
+	// Operations cache config
+	CacheOperationsLimit = ffc("cache.operations.limit")
+	CacheOperationsTTL   = ffc("cache.operations.ttl")
+
 	// DownloadWorkerCount is the number of download workers created to pull data from shared storage to the local DX
 	DownloadWorkerCount = ffc("download.worker.count")
 	// DownloadWorkerQueueLength is the length of the work queue in the channel to the workers - defaults to 2x the worker count
@@ -111,30 +192,28 @@ var (
 	PrivateMessagingRetryInitDelay = ffc("privatemessaging.retry.initDelay")
 	// PrivateMessagingRetryMaxDelay the maximum delay to use for retry of data base operations
 	PrivateMessagingRetryMaxDelay = ffc("privatemessaging.retry.maxDelay")
-	// CorsAllowCredentials CORS setting to control whether a browser allows credentials to be sent to this API
-	CorsAllowCredentials = ffc("cors.credentials")
-	// CorsAllowedHeaders CORS setting to control the allowed headers
-	CorsAllowedHeaders = ffc("cors.headers")
-	// CorsAllowedMethods CORS setting to control the allowed methods
-	CorsAllowedMethods = ffc("cors.methods")
-	// CorsAllowedOrigins CORS setting to control the allowed origins
-	CorsAllowedOrigins = ffc("cors.origins")
-	// CorsDebug is whether debug is enabled for the CORS implementation
-	CorsDebug = ffc("cors.debug")
-	// CorsEnabled is whether cors is enabled
-	CorsEnabled = ffc("cors.enabled")
-	// CorsMaxAge is the maximum age a browser should rely on CORS checks
-	CorsMaxAge = ffc("cors.maxAge")
-	// DataexchangeType is the name of the data exchange plugin being used by this firefly node
-	DataexchangeType = ffc("dataexchange.type")
 	// DatabaseType the type of the database interface plugin to use
-	DatabaseType = ffc("database.type")
-	// HistogramsMaxChartRows the maximum rows to fetch for each histogram bucket
 	HistogramsMaxChartRows = ffc("histograms.maxChartRows")
 	// TokensList is the root key containing a list of supported token connectors
 	TokensList = ffc("tokens")
+	// PluginsTokensList is the key containing a list of supported tokens plugins
+	PluginsTokensList = ffc("plugins.tokens")
+	// PluginsAuthList is the key containing a list of supported auth plugins
+	PluginsAuthList = ffc("plugins.auth")
+	// PluginsBlockchainList is the key containing a list of configured blockchain plugins
+	PluginsBlockchainList = ffc("plugins.blockchain")
+	// PluginsSharedStorageList is the key containing a list of configured shared storage plugins
+	PluginsSharedStorageList = ffc("plugins.sharedstorage")
+	// PluginsDatabaseList is the key containing a list of configured database plugins
+	PluginsDatabaseList = ffc("plugins.database")
+	// PluginsDataExchangeList is the key containing a list of configured database plugins
+	PluginsDataExchangeList = ffc("plugins.dataexchange")
+	// PluginsIdentityList is the key containing a list of configured identity plugins
+	PluginsIdentityList = ffc("plugins.identity")
 	// DebugPort a HTTP port on which to enable the go debugger
 	DebugPort = ffc("debug.port")
+	// DebugAddress the HTTP interface for the debugger to listen on
+	DebugAddress = ffc("debug.address")
 	// EventTransportsDefault the default event transport for new subscriptions
 	EventTransportsDefault = ffc("event.transports.default")
 	// EventTransportsEnabled which event interface plugins are enabled
@@ -173,36 +252,18 @@ var (
 	EventDispatcherRetryMaxDelay = ffc("event.dispatcher.retry.maxDelay")
 	// EventDBEventsBufferSize the size of the buffer of change events
 	EventDBEventsBufferSize = ffc("event.dbevents.bufferSize")
-	// EventListenerTopicCacheSize cache size for blockchain listeners addresses
-	EventListenerTopicCacheSize = ffc("event.listenerTopic.cache.size")
-	// EventListenerTopicCacheTTL cache time-to-live for private group addresses
-	EventListenerTopicCacheTTL = ffc("event.listenerTopic.cache.ttl")
-	// GroupCacheSize cache size for private group addresses
-	GroupCacheSize = ffc("group.cache.size")
-	// GroupCacheTTL cache time-to-live for private group addresses
-	GroupCacheTTL = ffc("group.cache.ttl")
-	// AdminEnabled determines whether the admin interface will be enabled or not
-	AdminEnabled = ffc("admin.enabled")
-	// AdminPreinit waits for at least one ConfigREcord to be posted to the server before it starts (the database must be available on startup)
-	AdminPreinit = ffc("admin.preinit")
-	// AdminWebSocketEventQueueLength is the maximum number of events that will queue up on the server side of each WebSocket connection before events start being dropped
-	AdminWebSocketEventQueueLength = ffc("admin.ws.eventQueueLength")
-	// AdminWebSocketBlockedWarnInterval how often to emit a warning if an admin.ws is blocked and not receiving events
-	AdminWebSocketBlockedWarnInterval = ffc("admin.ws.blockedWarnInterval")
-	// AdminWebSocketReadBufferSize is the WebSocket read buffer size for the admin change-event WebSocket
-	AdminWebSocketReadBufferSize = ffc("admin.ws.readBufferSize")
-	// AdminWebSocketWriteBufferSize is the WebSocket write buffer size for the admin change-event WebSocket
-	AdminWebSocketWriteBufferSize = ffc("admin.ws.writeBufferSize")
-	// IdentityType the type of the identity plugin in use
-	IdentityType = ffc("identity.type")
-	// IdentityManagerCacheTTL the identity manager cache time to live
-	IdentityManagerCacheTTL = ffc("identity.manager.cache.ttl")
-	// IdentityManagerCacheLimit the identity manager cache limit in count of items
-	IdentityManagerCacheLimit = ffc("identity.manager.cache.limit")
-	// MessageCacheSize
-	MessageCacheSize = ffc("message.cache.size")
-	// MessageCacheTTL
-	MessageCacheTTL = ffc("message.cache.ttl")
+	// LegacyAdminEnabled is the deprecated key that pre-dates spi.enabled
+	LegacyAdminEnabled = ffc("admin.enabled")
+	// SPIEnabled determines whether the admin interface will be enabled or not
+	SPIEnabled = ffc("spi.enabled")
+	// SPIWebSocketEventQueueLength is the maximum number of events that will queue up on the server side of each WebSocket connection before events start being dropped
+	SPIWebSocketEventQueueLength = ffc("spi.ws.eventQueueLength")
+	// SPIWebSocketBlockedWarnInterval how often to emit a warning if an admin.ws is blocked and not receiving events
+	SPIWebSocketBlockedWarnInterval = ffc("spi.ws.blockedWarnInterval")
+	// SPIWebSocketReadBufferSize is the WebSocket read buffer size for the admin change-event WebSocket
+	SPIWebSocketReadBufferSize = ffc("spi.ws.readBufferSize")
+	// SPIWebSocketWriteBufferSize is the WebSocket write buffer size for the admin change-event WebSocket
+	SPIWebSocketWriteBufferSize = ffc("spi.ws.writeBufferSize")
 	// MessageWriterCount
 	MessageWriterCount = ffc("message.writer.count")
 	// MessageWriterBatchTimeout
@@ -217,7 +278,13 @@ var (
 	NamespacesDefault = ffc("namespaces.default")
 	// NamespacesPredefined is a list of namespaces to ensure exists, without requiring a broadcast from the network
 	NamespacesPredefined = ffc("namespaces.predefined")
-	// NodeName is a description for the node
+	// NamespacesRetryFactor is the retry backoff factor for starting/restarting individual namespaces
+	NamespacesRetryFactor = ffc("namespaces.retry.factor")
+	// NamespacesRetryInitDelay is the retry initial delay for starting/restarting individual namespaces
+	NamespacesRetryInitDelay = ffc("namespaces.retry.initDelay")
+	// NamespacesRetryMaxDelay is the maximum delay between retry attempts
+	NamespacesRetryMaxDelay = ffc("namespaces.retry.maxDelay")
+	// NodeName is the short name for the node
 	NodeName = ffc("node.name")
 	// NodeDescription is a description for the node
 	NodeDescription = ffc("node.description")
@@ -235,20 +302,14 @@ var (
 	OpUpdateWorkerBatchMaxInserts = ffc("opupdate.worker.batchMaxInserts")
 	// OpUpdateWorkerQueueLength
 	OpUpdateWorkerQueueLength = ffc("opupdate.worker.queueLength")
-	// OrgName is the short name o the org
+	// OrgName is the short name for the org
 	OrgName = ffc("org.name")
-	// OrgIdentityDeprecated deprecated synonym to org.key
-	OrgIdentityDeprecated = ffc("org.identity")
 	// OrgKey is the signing identity allocated to the organization (can be the same as the nodes)
 	OrgKey = ffc("org.key")
 	// OrgDescription is a description for the org
 	OrgDescription = ffc("org.description")
 	// OrchestratorStartupAttempts is how many time to attempt to connect to core infrastructure on startup
 	OrchestratorStartupAttempts = ffc("orchestrator.startupAttempts")
-	// SharedStorageType specifies which shared storage interface plugin to use
-	SharedStorageType = ffc("sharedstorage.type")
-	// PublicStorageType specifies which shared storage interface plugin to use - deprecated in favor of SharedStorageType
-	PublicStorageType = ffc("publicstorage.type")
 	// SubscriptionDefaultsReadAhead default read ahead to enable for subscriptions that do not explicitly configure readahead
 	SubscriptionDefaultsReadAhead = ffc("subscription.defaults.batchSize")
 	// SubscriptionMax maximum number of pre-defined subscriptions that can exist (note for high fan-out consider connecting a dedicated pub/sub broker to the dispatcher)
@@ -259,20 +320,13 @@ var (
 	SubscriptionsRetryMaxDelay = ffc("subscription.retry.maxDelay")
 	// SubscriptionsRetryFactor the backoff factor to use for retry of database operations
 	SubscriptionsRetryFactor = ffc("subscription.retry.factor")
-	// TransactionCacheSize
-	TransactionCacheSize = ffc("transaction.cache.size")
-	// TransactionCacheTTL
-	TransactionCacheTTL = ffc("transaction.cache.ttl")
+
 	// AssetManagerKeyNormalization mechanism to normalize keys before using them. Valid options: "blockchain_plugin" - use blockchain plugin (default), "none" - do not attempt normalization
 	AssetManagerKeyNormalization = ffc("asset.manager.keyNormalization")
 	// UIEnabled set to false to disable the UI (default is true, so UI will be enabled if ui.path is valid)
 	UIEnabled = ffc("ui.enabled")
 	// UIPath the path on which to serve the UI
 	UIPath = ffc("ui.path")
-	// ValidatorCacheSize
-	ValidatorCacheSize = ffc("validator.cache.size")
-	// ValidatorCacheTTL
-	ValidatorCacheTTL = ffc("validator.cache.ttl")
 )
 
 func setDefaults() {
@@ -283,10 +337,10 @@ func setDefaults() {
 	viper.SetDefault(string(APIMaxFilterLimit), 250)
 	viper.SetDefault(string(APIMaxFilterSkip), 1000) // protects database (skip+limit pagination is not for bulk operations)
 	viper.SetDefault(string(APIRequestTimeout), "120s")
-	viper.SetDefault(string(APIShutdownTimeout), "10s")
+	viper.SetDefault(string(APIPassthroughHeaders), []string{})
 	viper.SetDefault(string(AssetManagerKeyNormalization), "blockchain_plugin")
-	viper.SetDefault(string(BatchCacheSize), "1Mb")
-	viper.SetDefault(string(BatchCacheTTL), "5m")
+	viper.SetDefault(string(CacheBatchLimit), 100)
+	viper.SetDefault(string(CacheBatchTTL), "5m")
 	viper.SetDefault(string(BatchManagerReadPageSize), 100)
 	viper.SetDefault(string(BatchManagerReadPollTimeout), "30s")
 	viper.SetDefault(string(BatchManagerMinimumPollDelay), "100ms")
@@ -302,25 +356,28 @@ func setDefaults() {
 	viper.SetDefault(string(BlobReceiverWorkerBatchTimeout), "50ms")
 	viper.SetDefault(string(BlobReceiverWorkerCount), 5)
 	viper.SetDefault(string(BlobReceiverWorkerBatchMaxInserts), 200)
+	viper.SetDefault(string(CacheBlockchainEventLimit), 100)
+	viper.SetDefault(string(CacheBlockchainEventTTL), "5m")
 	viper.SetDefault(string(BroadcastBatchAgentTimeout), "2m")
 	viper.SetDefault(string(BroadcastBatchSize), 200)
 	viper.SetDefault(string(BroadcastBatchPayloadLimit), "800Kb")
 	viper.SetDefault(string(BroadcastBatchTimeout), "1s")
-	viper.SetDefault(string(CorsAllowCredentials), true)
-	viper.SetDefault(string(CorsAllowedHeaders), []string{"*"})
-	viper.SetDefault(string(CorsAllowedMethods), []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete})
-	viper.SetDefault(string(CorsAllowedOrigins), []string{"*"})
-	viper.SetDefault(string(CorsEnabled), true)
-	viper.SetDefault(string(CorsMaxAge), 600)
-	viper.SetDefault(string(DataexchangeType), "ffdx")
+	viper.SetDefault(string(CacheBlockchainLimit), 100)
+	viper.SetDefault(string(CacheBlockchainTTL), "5m")
+	viper.SetDefault(string(CacheAddressResolverLimit), 1000)
+	viper.SetDefault(string(CacheAddressResolverTTL), "24h")
+	viper.SetDefault(string(CacheEnabled), true)
+	viper.SetDefault(string(CacheOperationsLimit), 200)
+	viper.SetDefault(string(CacheOperationsTTL), "5m")
 	viper.SetDefault(string(HistogramsMaxChartRows), 100)
 	viper.SetDefault(string(DebugPort), -1)
+	viper.SetDefault(string(DebugAddress), "localhost")
 	viper.SetDefault(string(DownloadWorkerCount), 10)
 	viper.SetDefault(string(DownloadRetryMaxAttempts), 100)
 	viper.SetDefault(string(DownloadRetryInitDelay), "100ms")
 	viper.SetDefault(string(DownloadRetryMaxDelay), "1m")
 	viper.SetDefault(string(DownloadRetryFactor), 2.0)
-	viper.SetDefault(string(EventAggregatorFirstEvent), fftypes.SubOptsFirstEventOldest)
+	viper.SetDefault(string(EventAggregatorFirstEvent), core.SubOptsFirstEventOldest)
 	viper.SetDefault(string(EventAggregatorBatchSize), 200)
 	viper.SetDefault(string(EventAggregatorBatchTimeout), "250ms")
 	viper.SetDefault(string(EventAggregatorPollTimeout), "30s")
@@ -336,23 +393,24 @@ func setDefaults() {
 	viper.SetDefault(string(EventDispatcherPollTimeout), "30s")
 	viper.SetDefault(string(EventTransportsEnabled), []string{"websockets", "webhooks"})
 	viper.SetDefault(string(EventTransportsDefault), "websockets")
-	viper.SetDefault(string(EventListenerTopicCacheSize), "100Kb")
-	viper.SetDefault(string(EventListenerTopicCacheTTL), "5m")
-	viper.SetDefault(string(GroupCacheSize), "1Mb")
-	viper.SetDefault(string(GroupCacheTTL), "1h")
-	viper.SetDefault(string(AdminEnabled), false)
-	viper.SetDefault(string(AdminWebSocketReadBufferSize), "16Kb")
-	viper.SetDefault(string(AdminWebSocketWriteBufferSize), "16Kb")
-	viper.SetDefault(string(AdminWebSocketBlockedWarnInterval), "1m")
-	viper.SetDefault(string(AdminWebSocketEventQueueLength), 250)
-	viper.SetDefault(string(IdentityType), "onchain")
-	viper.SetDefault(string(MessageCacheSize), "50Mb")
-	viper.SetDefault(string(MessageCacheTTL), "5m")
+	viper.SetDefault(string(CacheEventListenerTopicLimit), 100)
+	viper.SetDefault(string(CacheEventListenerTopicTTL), "5m")
+	viper.SetDefault(string(CacheGroupLimit), 50)
+	viper.SetDefault(string(CacheGroupTTL), "1h")
+	viper.SetDefault(string(SPIEnabled), false)
+	viper.SetDefault(string(SPIWebSocketReadBufferSize), "16Kb")
+	viper.SetDefault(string(SPIWebSocketWriteBufferSize), "16Kb")
+	viper.SetDefault(string(SPIWebSocketBlockedWarnInterval), "1m")
+	viper.SetDefault(string(SPIWebSocketEventQueueLength), 250)
+	viper.SetDefault(string(CacheMessageSize), "50Mb")
+	viper.SetDefault(string(CacheMessageTTL), "5m")
 	viper.SetDefault(string(MessageWriterBatchMaxInserts), 200)
 	viper.SetDefault(string(MessageWriterBatchTimeout), "10ms")
 	viper.SetDefault(string(MessageWriterCount), 5)
 	viper.SetDefault(string(NamespacesDefault), "default")
-	viper.SetDefault(string(NamespacesPredefined), fftypes.JSONObjectArray{{"name": "default", "description": "Default predefined namespace"}})
+	viper.SetDefault(string(NamespacesRetryFactor), 2.0)
+	viper.SetDefault(string(NamespacesRetryMaxDelay), "1m")
+	viper.SetDefault(string(NamespacesRetryInitDelay), "5s")
 	viper.SetDefault(string(OrchestratorStartupAttempts), 5)
 	viper.SetDefault(string(OpUpdateRetryInitDelay), "250ms")
 	viper.SetDefault(string(OpUpdateRetryMaxDelay), "1m")
@@ -373,13 +431,13 @@ func setDefaults() {
 	viper.SetDefault(string(SubscriptionsRetryInitialDelay), "250ms")
 	viper.SetDefault(string(SubscriptionsRetryMaxDelay), "30s")
 	viper.SetDefault(string(SubscriptionsRetryFactor), 2.0)
-	viper.SetDefault(string(TransactionCacheSize), "1Mb")
-	viper.SetDefault(string(TransactionCacheTTL), "5m")
+	viper.SetDefault(string(CacheTransactionSize), "1Mb")
+	viper.SetDefault(string(CacheTransactionTTL), "5m")
 	viper.SetDefault(string(UIEnabled), true)
-	viper.SetDefault(string(ValidatorCacheSize), "1Mb")
-	viper.SetDefault(string(ValidatorCacheTTL), "1h")
-	viper.SetDefault(string(IdentityManagerCacheLimit), 100 /* items */)
-	viper.SetDefault(string(IdentityManagerCacheTTL), "1h")
+	viper.SetDefault(string(CacheValidatorSize), "1Mb")
+	viper.SetDefault(string(CacheValidatorTTL), "1h")
+	viper.SetDefault(string(CacheIdentityLimit), 100)
+	viper.SetDefault(string(CacheIdentityTTL), "1h")
 }
 
 func Reset() {

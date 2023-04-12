@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,11 +21,13 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -45,25 +47,34 @@ var (
 		"tx_type",
 		"tx_id",
 		"info",
+		"interface",
+		"interface_format",
+		"methods",
 	}
 	tokenPoolFilterFieldMap = map[string]string{
-		"message": "message_id",
-		"tx.type": "tx_type",
-		"tx.id":   "tx_id",
+		"message":         "message_id",
+		"tx.type":         "tx_type",
+		"tx.id":           "tx_id",
+		"interfaceformat": "interface_format",
 	}
 )
 
-func (s *SQLCommon) UpsertTokenPool(ctx context.Context, pool *fftypes.TokenPool) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+const tokenpoolTable = "tokenpool"
+
+func (s *SQLCommon) UpsertTokenPool(ctx context.Context, pool *core.TokenPool) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	rows, _, err := s.queryTx(ctx, tx,
+	rows, _, err := s.QueryTx(ctx, tokenpoolTable, tx,
 		sq.Select("id").
-			From("tokenpool").
-			Where(sq.And{sq.Eq{"namespace": pool.Namespace}, sq.Eq{"name": pool.Name}}),
+			From(tokenpoolTable).
+			Where(sq.Eq{
+				"namespace": pool.Namespace,
+				"name":      pool.Name,
+			}),
 	)
 	if err != nil {
 		return err
@@ -81,10 +92,14 @@ func (s *SQLCommon) UpsertTokenPool(ctx context.Context, pool *fftypes.TokenPool
 	}
 	rows.Close()
 
+	var interfaceID *fftypes.UUID
+	if pool.Interface != nil {
+		interfaceID = pool.Interface.ID
+	}
+
 	if existing {
-		if _, err = s.updateTx(ctx, tx,
-			sq.Update("tokenpool").
-				Set("namespace", pool.Namespace).
+		if _, err = s.UpdateTx(ctx, tokenpoolTable, tx,
+			sq.Update(tokenpoolTable).
 				Set("name", pool.Name).
 				Set("standard", pool.Standard).
 				Set("locator", pool.Locator).
@@ -97,17 +112,20 @@ func (s *SQLCommon) UpsertTokenPool(ctx context.Context, pool *fftypes.TokenPool
 				Set("tx_type", pool.TX.Type).
 				Set("tx_id", pool.TX.ID).
 				Set("info", pool.Info).
+				Set("interface", interfaceID).
+				Set("interface_format", pool.InterfaceFormat).
+				Set("methods", pool.Methods).
 				Where(sq.Eq{"id": pool.ID}),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenPools, fftypes.ChangeEventTypeUpdated, pool.Namespace, pool.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenPools, core.ChangeEventTypeUpdated, pool.Namespace, pool.ID)
 			},
 		); err != nil {
 			return err
 		}
 	} else {
 		pool.Created = fftypes.Now()
-		if _, err = s.insertTx(ctx, tx,
-			sq.Insert("tokenpool").
+		if _, err = s.InsertTx(ctx, tokenpoolTable, tx,
+			sq.Insert(tokenpoolTable).
 				Columns(tokenPoolColumns...).
 				Values(
 					pool.ID,
@@ -125,20 +143,24 @@ func (s *SQLCommon) UpsertTokenPool(ctx context.Context, pool *fftypes.TokenPool
 					pool.TX.Type,
 					pool.TX.ID,
 					pool.Info,
+					interfaceID,
+					pool.InterfaceFormat,
+					pool.Methods,
 				),
 			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenPools, fftypes.ChangeEventTypeCreated, pool.Namespace, pool.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionTokenPools, core.ChangeEventTypeCreated, pool.Namespace, pool.ID)
 			},
 		); err != nil {
 			return err
 		}
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) tokenPoolResult(ctx context.Context, row *sql.Rows) (*fftypes.TokenPool, error) {
-	pool := fftypes.TokenPool{}
+func (s *SQLCommon) tokenPoolResult(ctx context.Context, row *sql.Rows) (*core.TokenPool, error) {
+	pool := core.TokenPool{}
+	iface := fftypes.FFIReference{}
 	err := row.Scan(
 		&pool.ID,
 		&pool.Namespace,
@@ -155,17 +177,23 @@ func (s *SQLCommon) tokenPoolResult(ctx context.Context, row *sql.Rows) (*fftype
 		&pool.TX.Type,
 		&pool.TX.ID,
 		&pool.Info,
+		&iface.ID,
+		&pool.InterfaceFormat,
+		&pool.Methods,
 	)
+	if iface.ID != nil {
+		pool.Interface = &iface
+	}
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "tokenpool")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, tokenpoolTable)
 	}
 	return &pool, nil
 }
 
-func (s *SQLCommon) getTokenPoolPred(ctx context.Context, desc string, pred interface{}) (*fftypes.TokenPool, error) {
-	rows, _, err := s.query(ctx,
+func (s *SQLCommon) getTokenPoolPred(ctx context.Context, desc string, pred interface{}) (*core.TokenPool, error) {
+	rows, _, err := s.Query(ctx, tokenpoolTable,
 		sq.Select(tokenPoolColumns...).
-			From("tokenpool").
+			From(tokenpoolTable).
 			Where(pred),
 	)
 	if err != nil {
@@ -186,34 +214,36 @@ func (s *SQLCommon) getTokenPoolPred(ctx context.Context, desc string, pred inte
 	return pool, nil
 }
 
-func (s *SQLCommon) GetTokenPool(ctx context.Context, ns string, name string) (message *fftypes.TokenPool, err error) {
-	return s.getTokenPoolPred(ctx, ns+":"+name, sq.And{sq.Eq{"namespace": ns}, sq.Eq{"name": name}})
+func (s *SQLCommon) GetTokenPool(ctx context.Context, namespace string, name string) (message *core.TokenPool, err error) {
+	return s.getTokenPoolPred(ctx, namespace+":"+name, sq.Eq{"namespace": namespace, "name": name})
 }
 
-func (s *SQLCommon) GetTokenPoolByID(ctx context.Context, id *fftypes.UUID) (message *fftypes.TokenPool, err error) {
-	return s.getTokenPoolPred(ctx, id.String(), sq.Eq{"id": id})
+func (s *SQLCommon) GetTokenPoolByID(ctx context.Context, namespace string, id *fftypes.UUID) (message *core.TokenPool, err error) {
+	return s.getTokenPoolPred(ctx, id.String(), sq.Eq{"id": id, "namespace": namespace})
 }
 
-func (s *SQLCommon) GetTokenPoolByLocator(ctx context.Context, connector, locator string) (*fftypes.TokenPool, error) {
+func (s *SQLCommon) GetTokenPoolByLocator(ctx context.Context, namespace, connector, locator string) (*core.TokenPool, error) {
 	return s.getTokenPoolPred(ctx, locator, sq.And{
+		sq.Eq{"namespace": namespace},
 		sq.Eq{"connector": connector},
 		sq.Eq{"locator": locator},
 	})
 }
 
-func (s *SQLCommon) GetTokenPools(ctx context.Context, filter database.Filter) (message []*fftypes.TokenPool, fr *database.FilterResult, err error) {
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(tokenPoolColumns...).From("tokenpool"), filter, tokenPoolFilterFieldMap, []interface{}{"seq"})
+func (s *SQLCommon) GetTokenPools(ctx context.Context, namespace string, filter ffapi.Filter) (message []*core.TokenPool, fr *ffapi.FilterResult, err error) {
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(tokenPoolColumns...).From("tokenpool"),
+		filter, tokenPoolFilterFieldMap, []interface{}{"seq"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, tokenpoolTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	pools := []*fftypes.TokenPool{}
+	pools := []*core.TokenPool{}
 	for rows.Next() {
 		d, err := s.tokenPoolResult(ctx, rows)
 		if err != nil {
@@ -222,5 +252,5 @@ func (s *SQLCommon) GetTokenPools(ctx context.Context, filter database.Filter) (
 		pools = append(pools, d)
 	}
 
-	return pools, s.queryRes(ctx, tx, "tokenpool", fop, fi), err
+	return pools, s.QueryRes(ctx, tokenpoolTable, tx, fop, fi), err
 }

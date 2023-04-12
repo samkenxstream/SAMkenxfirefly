@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,13 +19,17 @@ package sqlcommon
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/dbsql"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -40,7 +44,9 @@ var (
 		"blob_hash",
 		"blob_public",
 		"blob_name",
+		"blob_path",
 		"blob_size",
+		"public",
 		"value_size",
 	}
 	dataColumnsWithValue = append(append([]string{}, dataColumnsNoValue...), "value")
@@ -51,23 +57,26 @@ var (
 		"blob.hash":        "blob_hash",
 		"blob.public":      "blob_public",
 		"blob.name":        "blob_name",
+		"blob.path":        "blob_path",
 		"blob.size":        "blob_size",
 	}
 )
 
-func (s *SQLCommon) attemptDataUpdate(ctx context.Context, tx *txWrapper, data *fftypes.Data) (int64, error) {
+const dataTable = "data"
+
+func (s *SQLCommon) attemptDataUpdate(ctx context.Context, tx *dbsql.TXWrapper, data *core.Data) (int64, error) {
 	datatype := data.Datatype
 	if datatype == nil {
-		datatype = &fftypes.DatatypeRef{}
+		datatype = &core.DatatypeRef{}
 	}
 	blob := data.Blob
 	if blob == nil {
-		blob = &fftypes.BlobRef{}
+		blob = &core.BlobRef{}
 	}
-	return s.updateTx(ctx, tx,
-		sq.Update("data").
+	data.CalcPath()
+	return s.UpdateTx(ctx, dataTable, tx,
+		sq.Update(dataTable).
 			Set("validator", string(data.Validator)).
-			Set("namespace", data.Namespace).
 			Set("datatype_name", datatype.Name).
 			Set("datatype_version", datatype.Version).
 			Set("hash", data.Hash).
@@ -75,27 +84,31 @@ func (s *SQLCommon) attemptDataUpdate(ctx context.Context, tx *txWrapper, data *
 			Set("blob_hash", blob.Hash).
 			Set("blob_public", blob.Public).
 			Set("blob_name", blob.Name).
+			Set("blob_path", blob.Path).
 			Set("blob_size", blob.Size).
+			Set("public", data.Public).
 			Set("value_size", data.ValueSize).
 			Set("value", data.Value).
 			Where(sq.Eq{
-				"id":   data.ID,
-				"hash": data.Hash,
+				"id":        data.ID,
+				"hash":      data.Hash,
+				"namespace": data.Namespace,
 			}),
 		func() {
-			s.callbacks.UUIDCollectionNSEvent(database.CollectionData, fftypes.ChangeEventTypeUpdated, data.Namespace, data.ID)
+			s.callbacks.UUIDCollectionNSEvent(database.CollectionData, core.ChangeEventTypeUpdated, data.Namespace, data.ID)
 		})
 }
 
-func (s *SQLCommon) setDataInsertValues(query sq.InsertBuilder, data *fftypes.Data) sq.InsertBuilder {
+func (s *SQLCommon) setDataInsertValues(query sq.InsertBuilder, data *core.Data) sq.InsertBuilder {
 	datatype := data.Datatype
 	if datatype == nil {
-		datatype = &fftypes.DatatypeRef{}
+		datatype = &core.DatatypeRef{}
 	}
 	blob := data.Blob
 	if blob == nil {
-		blob = &fftypes.BlobRef{}
+		blob = &core.BlobRef{}
 	}
+	data.CalcPath()
 	return query.Values(
 		data.ID,
 		string(data.Validator),
@@ -107,26 +120,28 @@ func (s *SQLCommon) setDataInsertValues(query sq.InsertBuilder, data *fftypes.Da
 		blob.Hash,
 		blob.Public,
 		blob.Name,
+		blob.Path,
 		blob.Size,
+		data.Public,
 		data.ValueSize,
 		data.Value,
 	)
 }
 
-func (s *SQLCommon) attemptDataInsert(ctx context.Context, tx *txWrapper, data *fftypes.Data, requestConflictEmptyResult bool) (int64, error) {
-	return s.insertTxExt(ctx, tx,
-		s.setDataInsertValues(sq.Insert("data").Columns(dataColumnsWithValue...), data),
+func (s *SQLCommon) attemptDataInsert(ctx context.Context, tx *dbsql.TXWrapper, data *core.Data, requestConflictEmptyResult bool) (int64, error) {
+	return s.InsertTxExt(ctx, dataTable, tx,
+		s.setDataInsertValues(sq.Insert(dataTable).Columns(dataColumnsWithValue...), data),
 		func() {
-			s.callbacks.UUIDCollectionNSEvent(database.CollectionData, fftypes.ChangeEventTypeCreated, data.Namespace, data.ID)
+			s.callbacks.UUIDCollectionNSEvent(database.CollectionData, core.ChangeEventTypeCreated, data.Namespace, data.ID)
 		}, requestConflictEmptyResult)
 }
 
-func (s *SQLCommon) UpsertData(ctx context.Context, data *fftypes.Data, optimization database.UpsertOptimization) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+func (s *SQLCommon) UpsertData(ctx context.Context, data *core.Data, optimization database.UpsertOptimization) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
 	// This is a performance critical function, as we stream data into the database for every message, in every batch.
 	//
@@ -144,10 +159,10 @@ func (s *SQLCommon) UpsertData(ctx context.Context, data *fftypes.Data, optimiza
 
 	if !optimized {
 		// Do a select within the transaction to determine if the UUID already exists
-		dataRows, _, err := s.queryTx(ctx, tx,
+		dataRows, _, err := s.QueryTx(ctx, dataTable, tx,
 			sq.Select("hash").
-				From("data").
-				Where(sq.Eq{"id": data.ID}),
+				From(dataTable).
+				Where(sq.Eq{"id": data.ID, "namespace": data.Namespace}),
 		)
 		if err != nil {
 			return err
@@ -176,26 +191,26 @@ func (s *SQLCommon) UpsertData(ctx context.Context, data *fftypes.Data, optimiza
 		}
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) InsertDataArray(ctx context.Context, dataArray fftypes.DataArray) (err error) {
+func (s *SQLCommon) InsertDataArray(ctx context.Context, dataArray core.DataArray) (err error) {
 
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	if s.features.MultiRowInsert {
-		query := sq.Insert("data").Columns(dataColumnsWithValue...)
+	if s.Features().MultiRowInsert {
+		query := sq.Insert(dataTable).Columns(dataColumnsWithValue...)
 		for _, data := range dataArray {
 			query = s.setDataInsertValues(query, data)
 		}
 		sequences := make([]int64, len(dataArray))
-		err := s.insertTxRows(ctx, tx, query, func() {
+		err := s.InsertTxRows(ctx, dataTable, tx, query, func() {
 			for _, data := range dataArray {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionData, fftypes.ChangeEventTypeCreated, data.Namespace, data.ID)
+				s.callbacks.UUIDCollectionNSEvent(database.CollectionData, core.ChangeEventTypeCreated, data.Namespace, data.ID)
 			}
 		}, sequences, true /* we want the caller to be able to retry with individual upserts */)
 		if err != nil {
@@ -204,21 +219,21 @@ func (s *SQLCommon) InsertDataArray(ctx context.Context, dataArray fftypes.DataA
 	} else {
 		// Fall back to individual inserts grouped in a TX
 		for _, data := range dataArray {
-			_, err := s.attemptDataInsert(ctx, tx, data, false)
+			_, err := s.attemptDataInsert(ctx, tx, data, true)
 			if err != nil {
 				return err
 			}
 		}
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 
 }
 
-func (s *SQLCommon) dataResult(ctx context.Context, row *sql.Rows, withValue bool) (*fftypes.Data, error) {
-	data := fftypes.Data{
-		Datatype: &fftypes.DatatypeRef{},
-		Blob:     &fftypes.BlobRef{},
+func (s *SQLCommon) dataResult(ctx context.Context, row *sql.Rows, withValue bool) (*core.Data, error) {
+	data := core.Data{
+		Datatype: &core.DatatypeRef{},
+		Blob:     &core.BlobRef{},
 	}
 	results := []interface{}{
 		&data.ID,
@@ -231,7 +246,9 @@ func (s *SQLCommon) dataResult(ctx context.Context, row *sql.Rows, withValue boo
 		&data.Blob.Hash,
 		&data.Blob.Public,
 		&data.Blob.Name,
+		&data.Blob.Path,
 		&data.Blob.Size,
+		&data.Public,
 		&data.ValueSize,
 	}
 	if withValue {
@@ -245,12 +262,12 @@ func (s *SQLCommon) dataResult(ctx context.Context, row *sql.Rows, withValue boo
 		data.Datatype = nil
 	}
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "data")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, dataTable)
 	}
 	return &data, nil
 }
 
-func (s *SQLCommon) GetDataByID(ctx context.Context, id *fftypes.UUID, withValue bool) (message *fftypes.Data, err error) {
+func (s *SQLCommon) GetDataByID(ctx context.Context, namespace string, id *fftypes.UUID, withValue bool) (message *core.Data, err error) {
 
 	var cols []string
 	if withValue {
@@ -258,10 +275,10 @@ func (s *SQLCommon) GetDataByID(ctx context.Context, id *fftypes.UUID, withValue
 	} else {
 		cols = dataColumnsNoValue
 	}
-	rows, _, err := s.query(ctx,
+	rows, _, err := s.Query(ctx, dataTable,
 		sq.Select(cols...).
-			From("data").
-			Where(sq.Eq{"id": id}),
+			From(dataTable).
+			Where(sq.Eq{"id": id, "namespace": namespace}),
 	)
 	if err != nil {
 		return nil, err
@@ -281,20 +298,22 @@ func (s *SQLCommon) GetDataByID(ctx context.Context, id *fftypes.UUID, withValue
 	return data, nil
 }
 
-func (s *SQLCommon) GetData(ctx context.Context, filter database.Filter) (message fftypes.DataArray, res *database.FilterResult, err error) {
+func (s *SQLCommon) GetData(ctx context.Context, namespace string, filter ffapi.Filter) (message core.DataArray, res *ffapi.FilterResult, err error) {
 
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(dataColumnsWithValue...).From("data"), filter, dataFilterFieldMap, []interface{}{"sequence"})
+	query, fop, fi, err := s.FilterSelect(
+		ctx, "", sq.Select(dataColumnsWithValue...).From(dataTable),
+		filter, dataFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, dataTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	data := fftypes.DataArray{}
+	data := core.DataArray{}
 	for rows.Next() {
 		d, err := s.dataResult(ctx, rows, true)
 		if err != nil {
@@ -303,58 +322,118 @@ func (s *SQLCommon) GetData(ctx context.Context, filter database.Filter) (messag
 		data = append(data, d)
 	}
 
-	return data, s.queryRes(ctx, tx, "data", fop, fi), err
+	return data, s.QueryRes(ctx, dataTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) GetDataRefs(ctx context.Context, filter database.Filter) (message fftypes.DataRefs, res *database.FilterResult, err error) {
+func (s *SQLCommon) GetDataRefs(ctx context.Context, namespace string, filter ffapi.Filter) (message core.DataRefs, res *ffapi.FilterResult, err error) {
 
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select("id", "hash").From("data"), filter, dataFilterFieldMap, []interface{}{"sequence"})
+	query, fop, fi, err := s.FilterSelect(
+		ctx, "", sq.Select("id", "hash").From(dataTable),
+		filter, dataFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, dataTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	refs := fftypes.DataRefs{}
+	refs := core.DataRefs{}
 	for rows.Next() {
-		ref := fftypes.DataRef{}
+		ref := core.DataRef{}
 		err := rows.Scan(
 			&ref.ID,
 			&ref.Hash,
 		)
 		if err != nil {
-			return nil, nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "data")
+			return nil, nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, dataTable)
 		}
 		refs = append(refs, &ref)
 	}
 
-	return refs, s.queryRes(ctx, tx, "data", fop, fi), err
+	return refs, s.QueryRes(ctx, dataTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) UpdateData(ctx context.Context, id *fftypes.UUID, update database.Update) (err error) {
+func (s *SQLCommon) GetDataSubPaths(ctx context.Context, namespace, path string) (subPaths []string, err error) {
 
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	// Find all distinct path entries, which are sub-paths of the specified path
+	searchPath := strings.Trim(path, "/")
+	if searchPath == "" {
+		searchPath = "/"
+	} else {
+		searchPath = "/" + searchPath + "/"
+	}
+	sel := sq.Select("blob_path").From(dataTable).Distinct().Where(
+		sq.And{
+			sq.Eq{"namespace": namespace},
+			sq.Like{
+				"blob_path": searchPath + "%",
+			},
+			sq.NotLike{
+				"blob_path": searchPath + "%/%",
+			},
+		},
+	).OrderBy("blob_path")
+	rows, _, err := s.Query(ctx, dataTable, sel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	paths := []string{}
+	for rows.Next() {
+		var path string
+		err := rows.Scan(
+			&path,
+		)
+		if err != nil {
+			return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, dataTable)
+		}
+		paths = append(paths, path)
+	}
+
+	return paths, err
+
+}
+
+func (s *SQLCommon) UpdateData(ctx context.Context, namespace string, id *fftypes.UUID, update ffapi.Update) (err error) {
+
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	query, err := s.buildUpdate(sq.Update("data"), update, dataFilterFieldMap)
+	query, err := s.BuildUpdate(sq.Update(dataTable), update, dataFilterFieldMap)
 	if err != nil {
 		return err
 	}
-	query = query.Where(sq.Eq{"id": id})
+	query = query.Where(sq.Eq{"id": id, "namespace": namespace})
 
-	_, err = s.updateTx(ctx, tx, query, nil /* no change events for filter based updates */)
+	_, err = s.UpdateTx(ctx, dataTable, tx, query, nil /* no change events for filter based updates */)
 	if err != nil {
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
+}
+
+func (s *SQLCommon) DeleteData(ctx context.Context, namespace string, id *fftypes.UUID) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.RollbackTx(ctx, tx, autoCommit)
+
+	err = s.DeleteTx(ctx, blobsTable, tx, sq.Delete(dataTable).Where(sq.Eq{"id": id, "namespace": namespace}),
+		nil /* no change events for blobs */)
+	if err != nil {
+		return err
+	}
+
+	return s.CommitTx(ctx, tx, autoCommit)
 }

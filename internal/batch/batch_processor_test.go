@@ -6,7 +6,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,15 +22,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coreconfig"
-	"github.com/hyperledger/firefly/internal/retry"
 	"github.com/hyperledger/firefly/internal/txcommon"
+	"github.com/hyperledger/firefly/mocks/cachemocks"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/datamocks"
-	"github.com/hyperledger/firefly/mocks/sysmessagingmocks"
+	"github.com/hyperledger/firefly/mocks/identitymanagermocks"
 	"github.com/hyperledger/firefly/mocks/txcommonmocks"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -38,15 +41,15 @@ import (
 func newTestBatchProcessor(t *testing.T, dispatch DispatchHandler) (func(), *databasemocks.Plugin, *batchProcessor) {
 	bm, cancel := newTestBatchManager(t)
 	mdi := bm.database.(*databasemocks.Plugin)
-	mni := bm.ni.(*sysmessagingmocks.LocalNodeInfo)
 	mdm := bm.data.(*datamocks.Manager)
-	txHelper := txcommon.NewTransactionHelper(mdi, mdm)
-	mni.On("GetNodeUUID", mock.Anything).Return(fftypes.NewUUID()).Maybe()
+	ctx := context.Background()
+	cmi := &cachemocks.Manager{}
+	cmi.On("GetCache", mock.Anything).Return(cache.NewUmanagedCache(ctx, 100, 5*time.Minute), nil)
+	txHelper, _ := txcommon.NewTransactionHelper(ctx, "ns1", mdi, mdm, cmi)
 	bp := newBatchProcessor(bm, &batchProcessorConf{
-		namespace: "ns1",
-		txType:    fftypes.TransactionTypeBatchPin,
-		signer:    fftypes.SignerRef{Author: "did:firefly:org/abcd", Key: "0x12345"},
-		dispatch:  dispatch,
+		txType:   core.TransactionTypeBatchPin,
+		signer:   core.SignerRef{Author: "did:firefly:org/abcd", Key: "0x12345"},
+		dispatch: dispatch,
 		DispatcherOptions: DispatcherOptions{
 			BatchMaxSize:   10,
 			BatchMaxBytes:  1024 * 1024,
@@ -73,29 +76,32 @@ func TestUnfilledBatch(t *testing.T) {
 	log.SetLevel("debug")
 	coreconfig.Reset()
 
-	dispatched := make(chan *DispatchState)
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		dispatched <- state
 		return nil
 	})
 	defer cancel()
 
 	mockRunAsGroupPassthrough(mdi)
-	mdi.On("UpdateMessages", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mdi.On("UpsertBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mdi.On("UpdateMessages", mock.Anything, "ns1", mock.Anything, mock.Anything).Return(nil)
+	mdi.On("InsertOrGetBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 
 	mth := bp.txHelper.(*txcommonmocks.Helper)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeBatchPin).Return(fftypes.NewUUID(), nil)
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeBatchPin, core.IdempotencyKey("")).Return(fftypes.NewUUID(), nil)
 
 	mdm := bp.data.(*datamocks.Manager)
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
+
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
 
 	// Dispatch the work
 	go func() {
 		for i := 0; i < 5; i++ {
 			msgid := fftypes.NewUUID()
 			bp.newWork <- &batchWork{
-				msg: &fftypes.Message{Header: fftypes.MessageHeader{ID: msgid}, Sequence: int64(1000 + i)},
+				msg: &core.Message{Header: core.MessageHeader{ID: msgid}, Sequence: int64(1000 + i)},
 			}
 		}
 	}()
@@ -112,35 +118,39 @@ func TestUnfilledBatch(t *testing.T) {
 	mdm.AssertExpectations(t)
 	mdi.AssertExpectations(t)
 	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
 }
 
 func TestBatchSizeOverflow(t *testing.T) {
 	log.SetLevel("debug")
 	coreconfig.Reset()
 
-	dispatched := make(chan *DispatchState)
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		dispatched <- state
 		return nil
 	})
 	defer cancel()
-	bp.conf.BatchMaxBytes = batchSizeEstimateBase + (&fftypes.Message{}).EstimateSize(false) + 100
+	bp.conf.BatchMaxBytes = batchSizeEstimateBase + (&core.Message{}).EstimateSize(false) + 100
 	mockRunAsGroupPassthrough(mdi)
-	mdi.On("UpdateMessages", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mdi.On("UpsertBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mdi.On("UpdateMessages", mock.Anything, "ns1", mock.Anything, mock.Anything).Return(nil)
+	mdi.On("InsertOrGetBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 
 	mth := bp.txHelper.(*txcommonmocks.Helper)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeBatchPin).Return(fftypes.NewUUID(), nil)
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeBatchPin, core.IdempotencyKey("")).Return(fftypes.NewUUID(), nil)
 
 	mdm := bp.data.(*datamocks.Manager)
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
+
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
 
 	// Dispatch the work
 	msgIDs := []*fftypes.UUID{fftypes.NewUUID(), fftypes.NewUUID()}
 	go func() {
 		for i := 0; i < 2; i++ {
 			bp.newWork <- &batchWork{
-				msg: &fftypes.Message{Header: fftypes.MessageHeader{ID: msgIDs[i]}, Sequence: int64(1000 + i)},
+				msg: &core.Message{Header: core.MessageHeader{ID: msgIDs[i]}, Sequence: int64(1000 + i)},
 			}
 		}
 	}()
@@ -161,21 +171,22 @@ func TestBatchSizeOverflow(t *testing.T) {
 	mdi.AssertExpectations(t)
 	mth.AssertExpectations(t)
 	mdm.AssertExpectations(t)
+	mim.AssertExpectations(t)
 }
 
 func TestCloseToUnblockDispatch(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return fmt.Errorf("pop")
 	})
 	defer cancel()
 	bp.cancelCtx()
-	bp.dispatchBatch(&DispatchState{})
+	bp.dispatchBatch(&DispatchPayload{})
 	<-bp.done
 }
 
 func TestCloseToUnblockUpsertBatch(t *testing.T) {
 
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
@@ -185,18 +196,21 @@ func TestCloseToUnblockUpsertBatch(t *testing.T) {
 	mockRunAsGroupPassthrough(mdi)
 	waitForCall := make(chan bool)
 	mth := bp.txHelper.(*txcommonmocks.Helper)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeBatchPin).
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeBatchPin, core.IdempotencyKey("")).
 		Run(func(a mock.Arguments) {
 			waitForCall <- true
 			<-waitForCall
 		}).
 		Return(nil, fmt.Errorf("pop"))
 
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
+
 	// Generate the work
 	msgid := fftypes.NewUUID()
 	go func() {
 		bp.newWork <- &batchWork{
-			msg: &fftypes.Message{Header: fftypes.MessageHeader{ID: msgid}, Sequence: int64(1000)},
+			msg: &core.Message{Header: core.MessageHeader{ID: msgid}, Sequence: int64(1000)},
 		}
 	}()
 
@@ -207,10 +221,13 @@ func TestCloseToUnblockUpsertBatch(t *testing.T) {
 	// Close to unblock
 	bp.cancelCtx()
 	<-bp.done
+
+	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
 }
 
 func TestInsertNewNonceFail(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
@@ -224,21 +241,21 @@ func TestInsertNewNonceFail(t *testing.T) {
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
 
 	gid := fftypes.NewRandB32()
-	err := bp.sealBatch(&DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := bp.sealBatch(&DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: gid,
 			},
 		},
-		Messages: []*fftypes.Message{
-			{Header: fftypes.MessageHeader{
+		Messages: []*core.Message{
+			{Header: core.MessageHeader{
 				ID:     fftypes.NewUUID(),
 				Group:  gid,
 				Topics: fftypes.FFStringArray{"topic1"},
 			}},
 		},
 	})
-	assert.Regexp(t, "FF10158", err)
+	assert.Regexp(t, "FF00154", err)
 
 	<-bp.done
 
@@ -246,16 +263,16 @@ func TestInsertNewNonceFail(t *testing.T) {
 }
 
 func TestUpdateExistingNonceFail(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
 	bp.cancelCtx()
 	mdi := bp.database.(*databasemocks.Plugin)
-	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(&fftypes.Nonce{
+	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(&core.Nonce{
 		Nonce: 12345,
 	}, nil)
-	mdi.On("UpdateNonce", mock.Anything, mock.MatchedBy(func(dbNonce *fftypes.Nonce) bool {
+	mdi.On("UpdateNonce", mock.Anything, mock.MatchedBy(func(dbNonce *core.Nonce) bool {
 		return dbNonce.Nonce == 12346
 	})).Return(fmt.Errorf("pop"))
 	mockRunAsGroupPassthrough(mdi)
@@ -264,21 +281,21 @@ func TestUpdateExistingNonceFail(t *testing.T) {
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
 
 	gid := fftypes.NewRandB32()
-	err := bp.sealBatch(&DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := bp.sealBatch(&DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: gid,
 			},
 		},
-		Messages: []*fftypes.Message{
-			{Header: fftypes.MessageHeader{
+		Messages: []*core.Message{
+			{Header: core.MessageHeader{
 				ID:     fftypes.NewUUID(),
 				Group:  gid,
 				Topics: fftypes.FFStringArray{"topic1"},
 			}},
 		},
 	})
-	assert.Regexp(t, "FF10158", err)
+	assert.Regexp(t, "FF00154", err)
 
 	<-bp.done
 
@@ -286,7 +303,7 @@ func TestUpdateExistingNonceFail(t *testing.T) {
 }
 
 func TestGetNonceFail(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
@@ -299,21 +316,21 @@ func TestGetNonceFail(t *testing.T) {
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
 
 	gid := fftypes.NewRandB32()
-	err := bp.sealBatch(&DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := bp.sealBatch(&DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: gid,
 			},
 		},
-		Messages: []*fftypes.Message{
-			{Header: fftypes.MessageHeader{
+		Messages: []*core.Message{
+			{Header: core.MessageHeader{
 				ID:     fftypes.NewUUID(),
 				Group:  gid,
 				Topics: fftypes.FFStringArray{"topic1"},
 			}},
 		},
 	})
-	assert.Regexp(t, "FF10158", err)
+	assert.Regexp(t, "FF00154", err)
 
 	<-bp.done
 
@@ -321,7 +338,7 @@ func TestGetNonceFail(t *testing.T) {
 }
 
 func TestGetNonceMigrationFail(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
@@ -335,21 +352,21 @@ func TestGetNonceMigrationFail(t *testing.T) {
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
 
 	gid := fftypes.NewRandB32()
-	err := bp.sealBatch(&DispatchState{
-		Persisted: fftypes.BatchPersisted{
-			BatchHeader: fftypes.BatchHeader{
+	err := bp.sealBatch(&DispatchPayload{
+		Batch: core.BatchPersisted{
+			BatchHeader: core.BatchHeader{
 				Group: gid,
 			},
 		},
-		Messages: []*fftypes.Message{
-			{Header: fftypes.MessageHeader{
+		Messages: []*core.Message{
+			{Header: core.MessageHeader{
 				ID:     fftypes.NewUUID(),
 				Group:  gid,
 				Topics: fftypes.FFStringArray{"topic1"},
 			}},
 		},
 	})
-	assert.Regexp(t, "FF10158", err)
+	assert.Regexp(t, "FF00154", err)
 
 	<-bp.done
 
@@ -357,30 +374,67 @@ func TestGetNonceMigrationFail(t *testing.T) {
 }
 
 func TestAddWorkInSort(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
 	bp.assemblyQueue = []*batchWork{
-		{msg: &fftypes.Message{Sequence: 200}},
-		{msg: &fftypes.Message{Sequence: 201}},
-		{msg: &fftypes.Message{Sequence: 202}},
-		{msg: &fftypes.Message{Sequence: 204}},
+		{msg: &core.Message{Sequence: 200}},
+		{msg: &core.Message{Sequence: 201}},
+		{msg: &core.Message{Sequence: 202}},
+		{msg: &core.Message{Sequence: 204}},
 	}
 	_, _ = bp.addWork(&batchWork{
-		msg: &fftypes.Message{Sequence: 203},
+		msg: &core.Message{Sequence: 203},
 	})
 	assert.Equal(t, []*batchWork{
-		{msg: &fftypes.Message{Sequence: 200}},
-		{msg: &fftypes.Message{Sequence: 201}},
-		{msg: &fftypes.Message{Sequence: 202}},
-		{msg: &fftypes.Message{Sequence: 203}},
-		{msg: &fftypes.Message{Sequence: 204}},
+		{msg: &core.Message{Sequence: 200}},
+		{msg: &core.Message{Sequence: 201}},
+		{msg: &core.Message{Sequence: 202}},
+		{msg: &core.Message{Sequence: 203}},
+		{msg: &core.Message{Sequence: 204}},
 	}, bp.assemblyQueue)
 }
 
+func TestAddWorkBatchOfOne(t *testing.T) {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
+		return nil
+	})
+	defer cancel()
+	bp.conf.txType = core.TransactionTypeContractInvokePin
+
+	full, overflow := bp.addWork(&batchWork{
+		msg: &core.Message{Sequence: 200},
+	})
+	assert.True(t, full)
+	assert.False(t, overflow)
+	assert.Equal(t, []*batchWork{
+		{msg: &core.Message{Sequence: 200}},
+	}, bp.assemblyQueue)
+
+	full, overflow = bp.addWork(&batchWork{
+		msg: &core.Message{Sequence: 201},
+	})
+	assert.True(t, full)
+	assert.True(t, overflow)
+	assert.Equal(t, []*batchWork{
+		{msg: &core.Message{Sequence: 200}},
+		{msg: &core.Message{Sequence: 201}},
+	}, bp.assemblyQueue)
+}
+
+func TestAddWorkAbandonedBatch(t *testing.T) {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
+		return nil
+	})
+	defer cancel()
+	msg := &core.Message{Sequence: 200, BatchID: fftypes.NewUUID()}
+	_, _ = bp.addWork(&batchWork{msg: msg})
+	assert.Equal(t, []*batchWork{{msg: msg}}, bp.assemblyQueue)
+}
+
 func TestStartQuiesceNonBlocking(t *testing.T) {
-	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	cancel, _, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		return nil
 	})
 	defer cancel()
@@ -392,32 +446,35 @@ func TestMarkMessageDispatchedUnpinnedOK(t *testing.T) {
 	log.SetLevel("debug")
 	coreconfig.Reset()
 
-	dispatched := make(chan *DispatchState)
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		dispatched <- state
 		return nil
 	})
 	defer cancel()
-	bp.conf.txType = fftypes.TransactionTypeUnpinned
+	bp.conf.txType = core.TransactionTypeUnpinned
 
 	mockRunAsGroupPassthrough(mdi)
-	mdi.On("UpdateMessages", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mdi.On("UpsertBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mdi.On("UpdateMessages", mock.Anything, "ns1", mock.Anything, mock.Anything).Return(nil)
+	mdi.On("InsertOrGetBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 	mdi.On("InsertEvent", mock.Anything, mock.Anything).Return(fmt.Errorf("pop")).Once()
 	mdi.On("InsertEvent", mock.Anything, mock.Anything).Return(nil)
 
 	mth := bp.txHelper.(*txcommonmocks.Helper)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeUnpinned).Return(fftypes.NewUUID(), nil)
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeUnpinned, core.IdempotencyKey("")).Return(fftypes.NewUUID(), nil)
 
 	mdm := bp.data.(*datamocks.Manager)
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
+
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
 
 	// Dispatch the work
 	go func() {
 		for i := 0; i < 5; i++ {
 			msgid := fftypes.NewUUID()
 			bp.newWork <- &batchWork{
-				msg: &fftypes.Message{Header: fftypes.MessageHeader{ID: msgid, Topics: fftypes.FFStringArray{"topic1"}}, Sequence: int64(1000 + i)},
+				msg: &core.Message{Header: core.MessageHeader{ID: msgid, Topics: fftypes.FFStringArray{"topic1"}}, Sequence: int64(1000 + i)},
 			}
 		}
 	}()
@@ -434,54 +491,60 @@ func TestMarkMessageDispatchedUnpinnedOK(t *testing.T) {
 	mdi.AssertExpectations(t)
 	mdm.AssertExpectations(t)
 	mth.AssertExpectations(t)
+	mim.AssertExpectations(t)
 }
 
 func TestMaskContextsRetryAfterPinsAssigned(t *testing.T) {
 	log.SetLevel("debug")
 	coreconfig.Reset()
 
-	dispatched := make(chan *DispatchState)
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		dispatched <- state
 		return nil
 	})
 	defer cancel()
 
 	mockRunAsGroupPassthrough(mdi)
-	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(&fftypes.Nonce{
+	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(&core.Nonce{
 		Nonce: 12345,
 	}, nil).Once()
-	mdi.On("UpdateNonce", mock.Anything, mock.MatchedBy(func(dbNonce *fftypes.Nonce) bool {
+	mdi.On("UpdateNonce", mock.Anything, mock.MatchedBy(func(dbNonce *core.Nonce) bool {
 		return dbNonce.Nonce == 12347 // twice incremented
 	})).Return(nil).Once()
-	mdi.On("UpdateMessage", mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
-	mdi.On("UpsertBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mdi.On("InsertOrGetBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 
 	mdm := bp.data.(*datamocks.Manager)
 	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
 
 	mth := bp.txHelper.(*txcommonmocks.Helper)
-	mth.On("SubmitNewTransaction", mock.Anything, "ns1", fftypes.TransactionTypeBatchPin).Return(fftypes.NewUUID(), nil)
+	mth.On("SubmitNewTransaction", mock.Anything, core.TransactionTypeBatchPin, core.IdempotencyKey("")).Return(fftypes.NewUUID(), nil)
+
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
 
 	groupID := fftypes.NewRandB32()
-	msg1 := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	msg1 := &core.Message{
+		Header: core.MessageHeader{
 			ID:     fftypes.NewUUID(),
-			Type:   fftypes.MessageTypePrivate,
+			Type:   core.MessageTypePrivate,
 			Group:  groupID,
 			Topics: fftypes.FFStringArray{"topic1"},
 		},
 	}
-	msg2 := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	msg2 := &core.Message{
+		Header: core.MessageHeader{
 			ID:     fftypes.NewUUID(),
-			Type:   fftypes.MessageTypePrivate,
+			Type:   core.MessageTypePrivate,
 			Group:  groupID,
 			Topics: fftypes.FFStringArray{"topic1"},
 		},
 	}
 
-	state := bp.initFlushState(fftypes.NewUUID(), []*batchWork{{msg: msg1}, {msg: msg2}})
+	mdi.On("UpdateMessage", mock.Anything, "ns1", msg1.Header.ID, mock.Anything).Return(nil).Once()
+	mdi.On("UpdateMessage", mock.Anything, "ns1", msg2.Header.ID, mock.Anything).Return(nil).Once()
+
+	state := bp.initPayload(fftypes.NewUUID(), []*batchWork{{msg: msg1}, {msg: msg2}})
 	err := bp.sealBatch(state)
 	assert.NoError(t, err)
 
@@ -494,14 +557,17 @@ func TestMaskContextsRetryAfterPinsAssigned(t *testing.T) {
 	<-bp.done
 
 	mdi.AssertExpectations(t)
+	mdm.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mth.AssertExpectations(t)
 }
 
 func TestMaskContextsUpdateMessageFail(t *testing.T) {
 	log.SetLevel("debug")
 	coreconfig.Reset()
 
-	dispatched := make(chan *DispatchState)
-	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchState) error {
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
 		dispatched <- state
 		return nil
 	})
@@ -510,25 +576,78 @@ func TestMaskContextsUpdateMessageFail(t *testing.T) {
 	mockRunAsGroupPassthrough(mdi)
 	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(nil, nil)
 	mdi.On("InsertNonce", mock.Anything, mock.Anything).Return(nil)
-	mdi.On("UpdateMessage", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("pop")).Once()
+	mdi.On("UpdateMessage", mock.Anything, "ns1", mock.Anything, mock.Anything).Return(fmt.Errorf("pop")).Once()
 
-	msg := &fftypes.Message{
-		Header: fftypes.MessageHeader{
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
+
+	msg := &core.Message{
+		Header: core.MessageHeader{
 			ID:     fftypes.NewUUID(),
-			Type:   fftypes.MessageTypePrivate,
+			Type:   core.MessageTypePrivate,
 			Group:  fftypes.NewRandB32(),
 			Topics: fftypes.FFStringArray{"topic1"},
 		},
 	}
 
-	state := bp.initFlushState(fftypes.NewUUID(), []*batchWork{{msg: msg}})
+	state := bp.initPayload(fftypes.NewUUID(), []*batchWork{{msg: msg}})
 	err := bp.sealBatch(state)
-	assert.Regexp(t, "FF10158", err)
+	assert.Regexp(t, "FF00154", err)
 
 	bp.cancelCtx()
 	<-bp.done
 
 	mdi.AssertExpectations(t)
+	mim.AssertExpectations(t)
+}
+
+func TestSealBatchTXAlreadyAssigned(t *testing.T) {
+	coreconfig.Reset()
+
+	dispatched := make(chan *DispatchPayload)
+	cancel, mdi, bp := newTestBatchProcessor(t, func(c context.Context, state *DispatchPayload) error {
+		dispatched <- state
+		return nil
+	})
+	cancel()
+
+	mockRunAsGroupPassthrough(mdi)
+	mdi.On("GetNonce", mock.Anything, mock.Anything).Return(nil, nil)
+	mdi.On("InsertNonce", mock.Anything, mock.Anything).Return(nil)
+	mdi.On("UpdateMessage", mock.Anything, "ns1", mock.Anything, mock.Anything).Return(nil)
+	mdi.On("InsertOrGetBatch", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+
+	mim := bp.bm.identity.(*identitymanagermocks.Manager)
+	mim.On("GetLocalNode", mock.Anything).Return(&core.Identity{}, nil)
+
+	mdm := bp.data.(*datamocks.Manager)
+	mdm.On("UpdateMessageIfCached", mock.Anything, mock.Anything).Return()
+
+	txID := fftypes.NewUUID()
+	msg := &core.Message{
+		Header: core.MessageHeader{
+			ID:     fftypes.NewUUID(),
+			Type:   core.MessageTypePrivate,
+			Group:  fftypes.NewRandB32(),
+			Topics: fftypes.FFStringArray{"topic1"},
+			TxType: core.TransactionTypeContractInvokePin,
+		},
+		TransactionID: txID,
+	}
+
+	bp.conf.txType = core.TransactionTypeContractInvokePin
+	state := bp.initPayload(fftypes.NewUUID(), []*batchWork{{msg: msg}})
+	err := bp.sealBatch(state)
+	assert.NoError(t, err)
+	assert.Equal(t, core.TransactionTypeContractInvokePin, state.Batch.TX.Type)
+	assert.Equal(t, txID, state.Batch.TX.ID)
+
+	bp.cancelCtx()
+	<-bp.done
+
+	mdi.AssertExpectations(t)
+	mim.AssertExpectations(t)
+	mdm.AssertExpectations(t)
 }
 
 func TestBigBatchEstimate(t *testing.T) {
@@ -589,7 +708,7 @@ func TestBigBatchEstimate(t *testing.T) {
 		  ]
 		}
 	  }`)
-	var batch fftypes.Batch
+	var batch core.Batch
 	err := json.Unmarshal(bd, &batch)
 	assert.NoError(t, err)
 

@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,38 +20,48 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/internal/operations"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
+	"github.com/hyperledger/firefly/pkg/core"
+	"github.com/hyperledger/firefly/pkg/database"
 )
 
 type transferBlobData struct {
-	Node *fftypes.Identity `json:"node"`
-	Blob *fftypes.Blob     `json:"blob"`
+	Node *core.Identity `json:"node"`
+	Blob *core.Blob     `json:"blob"`
 }
 
 type batchSendData struct {
-	Node      *fftypes.Identity         `json:"node"`
-	Transport *fftypes.TransportWrapper `json:"transport"`
+	Node      *core.Identity         `json:"node"`
+	Transport *core.TransportWrapper `json:"transport"`
 }
 
-func addTransferBlobInputs(op *fftypes.Operation, nodeID *fftypes.UUID, blobHash *fftypes.Bytes32) {
+func addTransferBlobInputs(op *core.Operation, nodeID *fftypes.UUID, blobHash *fftypes.Bytes32, dataID *fftypes.UUID) {
 	op.Input = fftypes.JSONObject{
-		"node": nodeID.String(),
-		"hash": blobHash.String(),
+		"node":    nodeID.String(),
+		"hash":    blobHash.String(),
+		"data_id": dataID.String(),
 	}
 }
 
-func retrieveSendBlobInputs(ctx context.Context, op *fftypes.Operation) (nodeID *fftypes.UUID, blobHash *fftypes.Bytes32, err error) {
+func retrieveSendBlobInputs(ctx context.Context, op *core.Operation) (nodeID *fftypes.UUID, blobHash *fftypes.Bytes32, dataID *fftypes.UUID, err error) {
 	nodeID, err = fftypes.ParseUUID(ctx, op.Input.GetString("node"))
-	if err == nil {
-		blobHash, err = fftypes.ParseBytes32(ctx, op.Input.GetString("hash"))
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return nodeID, blobHash, err
+	blobHash, err = fftypes.ParseBytes32(ctx, op.Input.GetString("hash"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	dataID, err = fftypes.ParseUUID(ctx, op.Input.GetString("data_id"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return nodeID, blobHash, dataID, err
 }
 
-func addBatchSendInputs(op *fftypes.Operation, nodeID *fftypes.UUID, groupHash *fftypes.Bytes32, batchID *fftypes.UUID) {
+func addBatchSendInputs(op *core.Operation, nodeID *fftypes.UUID, groupHash *fftypes.Bytes32, batchID *fftypes.UUID) {
 	op.Input = fftypes.JSONObject{
 		"node":  nodeID.String(),
 		"group": groupHash.String(),
@@ -59,7 +69,7 @@ func addBatchSendInputs(op *fftypes.Operation, nodeID *fftypes.UUID, groupHash *
 	}
 }
 
-func retrieveBatchSendInputs(ctx context.Context, op *fftypes.Operation) (nodeID *fftypes.UUID, groupHash *fftypes.Bytes32, batchID *fftypes.UUID, err error) {
+func retrieveBatchSendInputs(ctx context.Context, op *core.Operation) (nodeID *fftypes.UUID, groupHash *fftypes.Bytes32, batchID *fftypes.UUID, err error) {
 	nodeID, err = fftypes.ParseUUID(ctx, op.Input.GetString("node"))
 	if err == nil {
 		groupHash, err = fftypes.ParseBytes32(ctx, op.Input.GetString("group"))
@@ -70,45 +80,46 @@ func retrieveBatchSendInputs(ctx context.Context, op *fftypes.Operation) (nodeID
 	return nodeID, groupHash, batchID, err
 }
 
-func (pm *privateMessaging) PrepareOperation(ctx context.Context, op *fftypes.Operation) (*fftypes.PreparedOperation, error) {
+func (pm *privateMessaging) PrepareOperation(ctx context.Context, op *core.Operation) (*core.PreparedOperation, error) {
 	switch op.Type {
-	case fftypes.OpTypeDataExchangeSendBlob:
-		nodeID, blobHash, err := retrieveSendBlobInputs(ctx, op)
+	case core.OpTypeDataExchangeSendBlob:
+		nodeID, blobHash, dataID, err := retrieveSendBlobInputs(ctx, op)
 		if err != nil {
 			return nil, err
 		}
-		node, err := pm.database.GetIdentityByID(ctx, nodeID)
+		node, err := pm.identity.CachedIdentityLookupByID(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		} else if node == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		blob, err := pm.database.GetBlobMatchingHash(ctx, blobHash)
+		fb := database.BlobQueryFactory.NewFilter(ctx)
+		blobs, _, err := pm.database.GetBlobs(ctx, pm.namespace.Name, fb.And(fb.Eq("data_id", dataID), fb.Eq("hash", blobHash)))
 		if err != nil {
 			return nil, err
-		} else if blob == nil {
+		} else if len(blobs) == 0 || blobs[0] == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		return opSendBlob(op, node, blob), nil
+		return opSendBlob(op, node, blobs[0]), nil
 
-	case fftypes.OpTypeDataExchangeSendBatch:
+	case core.OpTypeDataExchangeSendBatch:
 		nodeID, groupHash, batchID, err := retrieveBatchSendInputs(ctx, op)
 		if err != nil {
 			return nil, err
 		}
-		node, err := pm.database.GetIdentityByID(ctx, nodeID)
+		node, err := pm.identity.CachedIdentityLookupByID(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		} else if node == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		group, err := pm.database.GetGroupByHash(ctx, groupHash)
+		group, err := pm.database.GetGroupByHash(ctx, pm.namespace.Name, groupHash)
 		if err != nil {
 			return nil, err
 		} else if group == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		bp, err := pm.database.GetBatchByID(ctx, batchID)
+		bp, err := pm.database.GetBatchByID(ctx, pm.namespace.Name, batchID)
 		if err != nil {
 			return nil, err
 		} else if bp == nil {
@@ -118,7 +129,7 @@ func (pm *privateMessaging) PrepareOperation(ctx context.Context, op *fftypes.Op
 		if err != nil {
 			return nil, err
 		}
-		transport := &fftypes.TransportWrapper{Group: group, Batch: batch}
+		transport := &core.TransportWrapper{Group: group, Batch: batch}
 		return opSendBatch(op, node, transport), nil
 
 	default:
@@ -126,39 +137,52 @@ func (pm *privateMessaging) PrepareOperation(ctx context.Context, op *fftypes.Op
 	}
 }
 
-func (pm *privateMessaging) RunOperation(ctx context.Context, op *fftypes.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error) {
+func (pm *privateMessaging) RunOperation(ctx context.Context, op *core.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error) {
 	switch data := op.Data.(type) {
 	case transferBlobData:
-		return nil, false, pm.exchange.TransferBlob(ctx, op.ID, data.Node.Profile.GetString("id"), data.Blob.PayloadRef)
+		localNode, err := pm.identity.GetLocalNode(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, pm.exchange.TransferBlob(ctx, op.NamespacedIDString(), data.Node.Profile, localNode.Profile, data.Blob.PayloadRef)
 
 	case batchSendData:
+		localNode, err := pm.identity.GetLocalNode(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+
 		payload, err := json.Marshal(data.Transport)
 		if err != nil {
 			return nil, false, i18n.WrapError(ctx, err, coremsgs.MsgSerializationFailed)
 		}
-		return nil, false, pm.exchange.SendMessage(ctx, op.ID, data.Node.Profile.GetString("id"), payload)
+		return nil, false, pm.exchange.SendMessage(ctx, op.NamespacedIDString(), data.Node.Profile, localNode.Profile, payload)
 
 	default:
 		return nil, false, i18n.NewError(ctx, coremsgs.MsgOperationDataIncorrect, op.Data)
 	}
 }
 
-func (pm *privateMessaging) OnOperationUpdate(ctx context.Context, op *fftypes.Operation, update *operations.OperationUpdate) error {
+func (pm *privateMessaging) OnOperationUpdate(ctx context.Context, op *core.Operation, update *core.OperationUpdate) error {
 	return nil
 }
 
-func opSendBlob(op *fftypes.Operation, node *fftypes.Identity, blob *fftypes.Blob) *fftypes.PreparedOperation {
-	return &fftypes.PreparedOperation{
-		ID:   op.ID,
-		Type: op.Type,
-		Data: transferBlobData{Node: node, Blob: blob},
+func opSendBlob(op *core.Operation, node *core.Identity, blob *core.Blob) *core.PreparedOperation {
+	return &core.PreparedOperation{
+		ID:        op.ID,
+		Namespace: op.Namespace,
+		Plugin:    op.Plugin,
+		Type:      op.Type,
+		Data:      transferBlobData{Node: node, Blob: blob},
 	}
 }
 
-func opSendBatch(op *fftypes.Operation, node *fftypes.Identity, transport *fftypes.TransportWrapper) *fftypes.PreparedOperation {
-	return &fftypes.PreparedOperation{
-		ID:   op.ID,
-		Type: op.Type,
-		Data: batchSendData{Node: node, Transport: transport},
+func opSendBatch(op *core.Operation, node *core.Identity, transport *core.TransportWrapper) *core.PreparedOperation {
+	return &core.PreparedOperation{
+		ID:        op.ID,
+		Namespace: op.Namespace,
+		Plugin:    op.Plugin,
+		Type:      op.Type,
+		Data:      batchSendData{Node: node, Transport: transport},
 	}
 }

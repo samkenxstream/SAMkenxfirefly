@@ -19,37 +19,40 @@ package privatemessaging
 import (
 	"context"
 	"encoding/json"
-	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coremsgs"
 	"github.com/hyperledger/firefly/internal/data"
+	"github.com/hyperledger/firefly/internal/identity"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
-	"github.com/karlseguin/ccache"
 )
 
 type GroupManager interface {
-	GetGroupByID(ctx context.Context, id string) (*fftypes.Group, error)
-	GetGroupsNS(ctx context.Context, ns string, filter database.AndFilter) ([]*fftypes.Group, *database.FilterResult, error)
-	ResolveInitGroup(ctx context.Context, msg *fftypes.Message) (*fftypes.Group, error)
-	EnsureLocalGroup(ctx context.Context, group *fftypes.Group) (ok bool, err error)
+	GetGroupByID(ctx context.Context, id string) (*core.Group, error)
+	GetGroups(ctx context.Context, filter ffapi.AndFilter) ([]*core.Group, *ffapi.FilterResult, error)
+	ResolveInitGroup(ctx context.Context, msg *core.Message, creator *core.Member) (*core.Group, error)
+	EnsureLocalGroup(ctx context.Context, group *core.Group, creator *core.Member) (ok bool, err error)
 }
 
 type groupManager struct {
-	database      database.Plugin
-	data          data.Manager
-	groupCacheTTL time.Duration
-	groupCache    *ccache.Cache
+	namespace  *core.Namespace
+	database   database.Plugin
+	identity   identity.Manager
+	data       data.Manager
+	groupCache cache.CInterface
 }
 
 type groupHashEntry struct {
-	group *fftypes.Group
-	nodes []*fftypes.Identity
+	group *core.Group
+	nodes []*core.Identity
 }
 
-func (gm *groupManager) EnsureLocalGroup(ctx context.Context, group *fftypes.Group) (ok bool, err error) {
+func (gm *groupManager) EnsureLocalGroup(ctx context.Context, group *core.Group, creator *core.Member) (ok bool, err error) {
 	if group == nil {
 		return false, i18n.NewError(ctx, coremsgs.MsgGroupRequired)
 	}
@@ -59,7 +62,7 @@ func (gm *groupManager) EnsureLocalGroup(ctx context.Context, group *fftypes.Gro
 	// the group via the blockchain.
 	// So this method checks if a group exists, and if it doesn't inserts it.
 	// We do assume the other side has sent the batch init of the group (rather than generating a second one)
-	if g, err := gm.database.GetGroupByHash(ctx, group.Hash); err != nil {
+	if g, err := gm.database.GetGroupByHash(ctx, gm.namespace.Name, group.Hash); err != nil {
 		return false, err
 	} else if g != nil {
 		// The group already exists
@@ -68,9 +71,13 @@ func (gm *groupManager) EnsureLocalGroup(ctx context.Context, group *fftypes.Gro
 
 	err = group.Validate(ctx, true)
 	if err != nil {
-		log.L(ctx).Errorf("Attempt to insert invalid group %s:%s: %s", group.Namespace, group.Hash, err)
+		log.L(ctx).Errorf("Attempt to insert invalid group %s: %s", group.Hash, err)
 		return false, nil
 	}
+	if !gm.groupContains(ctx, group, creator) {
+		return false, nil
+	}
+
 	err = gm.database.UpsertGroup(ctx, group, database.UpsertOptimizationNew /* it could have been created by another thread, but we think we're first */)
 	if err != nil {
 		return false, err
@@ -78,13 +85,13 @@ func (gm *groupManager) EnsureLocalGroup(ctx context.Context, group *fftypes.Gro
 	return true, nil
 }
 
-func (gm *groupManager) groupInit(ctx context.Context, signer *fftypes.SignerRef, group *fftypes.Group) (err error) {
+func (gm *groupManager) groupInit(ctx context.Context, signer *core.SignerRef, group *core.Group) (err error) {
 
 	// Serialize it into a data object, as a piece of data we can write to a message
-	data := &fftypes.Data{
-		Validator: fftypes.ValidatorTypeSystemDefinition,
+	data := &core.Data{
+		Validator: core.ValidatorTypeSystemDefinition,
 		ID:        fftypes.NewUUID(),
-		Namespace: group.Namespace, // must go in the same ordering context as the message
+		Namespace: gm.namespace.Name, // must go in the same ordering context as the message
 		Created:   fftypes.Now(),
 	}
 	b, err := json.Marshal(&group)
@@ -98,75 +105,87 @@ func (gm *groupManager) groupInit(ctx context.Context, signer *fftypes.SignerRef
 	if err != nil {
 		return i18n.WrapError(ctx, err, coremsgs.MsgSerializationFailed)
 	}
+	group.LocalNamespace = gm.namespace.Name
 
-	// In the case of groups, we actually write the unconfirmed group directly to our database.
-	// So it can be used straight away.
-	// We're able to do this by making the identifier of the group a hash of the identity fields
-	// (name, ledger and member list), as that is all the group contains. There's no data in there.
-	if err = gm.database.UpsertGroup(ctx, group, database.UpsertOptimizationNew /* we think we're first */); err != nil {
-		return err
-	}
-
-	// Write as data to the local store
-	if err = gm.database.UpsertData(ctx, data, database.UpsertOptimizationNew); err != nil {
-		return err
+	// Ensure all group members are valid
+	for _, member := range group.Members {
+		node, err := gm.identity.CachedIdentityLookupByID(ctx, member.Node)
+		if err != nil {
+			return err
+		}
+		org, _, err := gm.identity.CachedIdentityLookupMustExist(ctx, member.Identity)
+		if err != nil {
+			return err
+		}
+		valid, err := gm.identity.ValidateNodeOwner(ctx, node, org)
+		if err != nil {
+			return err
+		} else if !valid {
+			return i18n.NewError(ctx, coremsgs.MsgInvalidGroupMember, node.DID, member.Identity)
+		}
 	}
 
 	// Create a private send message referring to the data
-	msg := &fftypes.Message{
-		State: fftypes.MessageStateReady,
-		Header: fftypes.MessageHeader{
+	msg := &core.Message{
+		State:          core.MessageStateReady,
+		LocalNamespace: gm.namespace.Name, // Must go into the same ordering context as the message itself
+		Header: core.MessageHeader{
 			Group:     group.Hash,
-			Namespace: group.Namespace, // Must go into the same ordering context as the message itself
-			Type:      fftypes.MessageTypeGroupInit,
+			Namespace: gm.namespace.NetworkName,
+			Type:      core.MessageTypeGroupInit,
 			SignerRef: *signer,
-			Tag:       fftypes.SystemTagDefineGroup,
+			Tag:       core.SystemTagDefineGroup,
 			Topics:    fftypes.FFStringArray{group.Topic()},
-			TxType:    fftypes.TransactionTypeBatchPin,
+			TxType:    core.TransactionTypeBatchPin,
 		},
-		Data: fftypes.DataRefs{
+		Data: core.DataRefs{
 			{ID: data.ID, Hash: data.Hash},
 		},
 	}
+	if err = msg.Seal(ctx); err == nil {
+		err = gm.database.RunAsGroup(ctx, func(ctx context.Context) error {
+			// Write as data to the local store
+			if err = gm.database.UpsertData(ctx, data, database.UpsertOptimizationNew); err != nil {
+				return err
+			}
 
-	// Seal the message
-	err = msg.Seal(ctx)
-	if err == nil {
-		// Store the message - this asynchronously triggers the next step in process
-		err = gm.database.UpsertMessage(ctx, msg, database.UpsertOptimizationNew)
-	}
-	if err == nil {
-		log.L(ctx).Infof("Created new group %s", group.Hash)
+			// Store the message - this asynchronously triggers the next step in process
+			if err = gm.database.UpsertMessage(ctx, msg, database.UpsertOptimizationNew); err != nil {
+				return err
+			}
+
+			// Write the unconfirmed group directly to our database, so it can be used straight away.
+			// We're able to do this by making the identifier of the group a hash of the identity fields
+			// (name, ledger and member list), as that is all the group contains. There's no data in there.
+			return gm.database.UpsertGroup(ctx, group, database.UpsertOptimizationNew /* we think we're first */)
+		})
+		if err == nil {
+			log.L(ctx).Infof("Created new group %s", group.Hash)
+		}
 	}
 	return err
-
 }
 
-func (gm *groupManager) GetGroupByID(ctx context.Context, hash string) (*fftypes.Group, error) {
+func (gm *groupManager) GetGroupByID(ctx context.Context, hash string) (*core.Group, error) {
 	h, err := fftypes.ParseBytes32(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
-	return gm.database.GetGroupByHash(ctx, h)
+	return gm.database.GetGroupByHash(ctx, gm.namespace.Name, h)
 }
 
-func (gm *groupManager) GetGroupsNS(ctx context.Context, ns string, filter database.AndFilter) ([]*fftypes.Group, *database.FilterResult, error) {
-	return gm.GetGroups(ctx, filter.Condition(filter.Builder().Eq("namespace", ns)))
+func (gm *groupManager) GetGroups(ctx context.Context, filter ffapi.AndFilter) ([]*core.Group, *ffapi.FilterResult, error) {
+	return gm.database.GetGroups(ctx, gm.namespace.Name, filter)
 }
 
-func (gm *groupManager) GetGroups(ctx context.Context, filter database.AndFilter) ([]*fftypes.Group, *database.FilterResult, error) {
-	return gm.database.GetGroups(ctx, filter)
-}
+func (gm *groupManager) getGroupNodes(ctx context.Context, groupHash *fftypes.Bytes32, allowNil bool) (*core.Group, []*core.Identity, error) {
 
-func (gm *groupManager) getGroupNodes(ctx context.Context, groupHash *fftypes.Bytes32, allowNil bool) (*fftypes.Group, []*fftypes.Identity, error) {
-
-	if cached := gm.groupCache.Get(groupHash.String()); cached != nil {
-		cached.Extend(gm.groupCacheTTL)
-		ghe := cached.Value().(*groupHashEntry)
+	if cachedValue := gm.groupCache.Get(groupHash.String()); cachedValue != nil {
+		ghe := cachedValue.(*groupHashEntry)
 		return ghe.group, ghe.nodes, nil
 	}
 
-	group, err := gm.database.GetGroupByHash(ctx, groupHash)
+	group, err := gm.database.GetGroupByHash(ctx, gm.namespace.Name, groupHash)
 	if err != nil || (allowNil && group == nil) {
 		return nil, nil, err
 	}
@@ -176,14 +195,14 @@ func (gm *groupManager) getGroupNodes(ctx context.Context, groupHash *fftypes.By
 
 	// We de-duplicate nodes in the case that the payload needs to be received by multiple org identities
 	// that share a single node.
-	nodes := make([]*fftypes.Identity, 0, len(group.Members))
+	nodes := make([]*core.Identity, 0, len(group.Members))
 	knownIDs := make(map[fftypes.UUID]bool)
 	for _, r := range group.Members {
-		node, err := gm.database.GetIdentityByID(ctx, r.Node)
+		node, err := gm.identity.CachedIdentityLookupByID(ctx, r.Node)
 		if err != nil {
 			return nil, nil, err
 		}
-		if node == nil || node.Type != fftypes.IdentityTypeNode {
+		if node == nil || node.Type != core.IdentityTypeNode {
 			return nil, nil, i18n.NewError(ctx, coremsgs.MsgNodeNotFound, r.Node)
 		}
 		if !knownIDs[*node.ID] {
@@ -195,7 +214,7 @@ func (gm *groupManager) getGroupNodes(ctx context.Context, groupHash *fftypes.By
 	gm.groupCache.Set(group.Hash.String(), &groupHashEntry{
 		group: group,
 		nodes: nodes,
-	}, gm.groupCacheTTL)
+	})
 	return group, nodes, nil
 }
 
@@ -204,15 +223,15 @@ func (gm *groupManager) getGroupNodes(ctx context.Context, groupHash *fftypes.By
 // Otherwise, the existing group must exist.
 //
 // Errors are only returned for database issues. For validation issues, a nil group is returned without an error.
-func (gm *groupManager) ResolveInitGroup(ctx context.Context, msg *fftypes.Message) (*fftypes.Group, error) {
-	if msg.Header.Tag == fftypes.SystemTagDefineGroup {
+func (gm *groupManager) ResolveInitGroup(ctx context.Context, msg *core.Message, member *core.Member) (*core.Group, error) {
+	if msg.Header.Tag == core.SystemTagDefineGroup {
 		// Store the new group
 		data, foundAll, err := gm.data.GetMessageDataCached(ctx, msg)
 		if err != nil || !foundAll || len(data) == 0 {
 			log.L(ctx).Warnf("Group %s definition in message %s invalid: missing data", msg.Header.Group, msg.Header.ID)
 			return nil, err
 		}
-		var newGroup fftypes.Group
+		var newGroup core.Group
 		err = json.Unmarshal(data[0].Value.Bytes(), &newGroup)
 		if err != nil {
 			log.L(ctx).Warnf("Group %s definition in message %s invalid: %s", msg.Header.Group, msg.Header.ID, err)
@@ -228,6 +247,7 @@ func (gm *groupManager) ResolveInitGroup(ctx context.Context, msg *fftypes.Messa
 			return nil, nil
 		}
 		newGroup.Message = msg.Header.ID
+		newGroup.LocalNamespace = gm.namespace.Name
 		err = gm.database.UpsertGroup(ctx, &newGroup, database.UpsertOptimizationNew /* we think we're first to create this */)
 		if err != nil {
 			return nil, err
@@ -236,13 +256,27 @@ func (gm *groupManager) ResolveInitGroup(ctx context.Context, msg *fftypes.Messa
 	}
 
 	// Get the existing group
-	group, err := gm.database.GetGroupByHash(ctx, msg.Header.Group)
+	group, err := gm.database.GetGroupByHash(ctx, gm.namespace.Name, msg.Header.Group)
 	if err != nil {
 		return group, err
 	}
 	if group == nil {
-		log.L(ctx).Warnf("Group %s not found for first message in context. type=%s namespace=%s", msg.Header.Group, msg.Header.Type, msg.Header.Namespace)
+		log.L(ctx).Warnf("Group %s not found for first message in context. type=%s", msg.Header.Group, msg.Header.Type)
+		return nil, nil
+	}
+
+	if !gm.groupContains(ctx, group, member) {
 		return nil, nil
 	}
 	return group, nil
+}
+
+func (gm *groupManager) groupContains(ctx context.Context, group *core.Group, member *core.Member) (valid bool) {
+	for _, m := range group.Members {
+		if m.Identity == member.Identity && m.Node.Equals(member.Node) {
+			return true
+		}
+	}
+	log.L(ctx).Errorf("Group '%s' does not contain member identity=%s node=%s", group.Hash, member.Identity, member.Node)
+	return false
 }

@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -19,56 +19,54 @@ package assets
 import (
 	"context"
 
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/internal/sysmessaging"
+	"github.com/hyperledger/firefly/internal/database/sqlcommon"
+	"github.com/hyperledger/firefly/internal/syncasync"
 	"github.com/hyperledger/firefly/internal/txcommon"
-	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
-func (am *assetManager) GetTokenApprovals(ctx context.Context, ns string, filter database.AndFilter) ([]*fftypes.TokenApproval, *database.FilterResult, error) {
-	return am.database.GetTokenApprovals(ctx, am.scopeNS(ns, filter))
+func (am *assetManager) GetTokenApprovals(ctx context.Context, filter ffapi.AndFilter) ([]*core.TokenApproval, *ffapi.FilterResult, error) {
+	return am.database.GetTokenApprovals(ctx, am.namespace, filter)
 }
 
 type approveSender struct {
 	mgr       *assetManager
-	namespace string
-	approval  *fftypes.TokenApprovalInput
+	approval  *core.TokenApprovalInput
+	resolved  bool
+	msgSender syncasync.Sender
 }
 
 func (s *approveSender) Prepare(ctx context.Context) error {
-	return s.sendInternal(ctx, methodPrepare)
+	return s.resolveAndSend(ctx, methodPrepare)
 }
 
 func (s *approveSender) Send(ctx context.Context) error {
-	return s.sendInternal(ctx, methodSend)
+	return s.resolveAndSend(ctx, methodSend)
 }
 
 func (s *approveSender) SendAndWait(ctx context.Context) error {
-	return s.sendInternal(ctx, methodSendAndWait)
+	return s.resolveAndSend(ctx, methodSendAndWait)
 }
 
 func (s *approveSender) setDefaults() {
 	s.approval.LocalID = fftypes.NewUUID()
 }
 
-func (am *assetManager) NewApproval(ns string, approval *fftypes.TokenApprovalInput) sysmessaging.MessageSender {
+func (am *assetManager) NewApproval(approval *core.TokenApprovalInput) syncasync.Sender {
 	sender := &approveSender{
-		mgr:       am,
-		namespace: ns,
-		approval:  approval,
+		mgr:      am,
+		approval: approval,
 	}
 	sender.setDefaults()
 	return sender
 }
 
-func (am *assetManager) TokenApproval(ctx context.Context, ns string, approval *fftypes.TokenApprovalInput, waitConfirm bool) (out *fftypes.TokenApproval, err error) {
-	if err := am.validateApproval(ctx, ns, approval); err != nil {
-		return nil, err
-	}
-
-	sender := am.NewApproval(ns, approval)
+func (am *assetManager) TokenApproval(ctx context.Context, approval *core.TokenApprovalInput, waitConfirm bool) (out *core.TokenApproval, err error) {
+	sender := am.NewApproval(approval)
 	if waitConfirm {
 		err = sender.SendAndWait(ctx)
 	} else {
@@ -77,77 +75,170 @@ func (am *assetManager) TokenApproval(ctx context.Context, ns string, approval *
 	return &approval.TokenApproval, err
 }
 
-func (s *approveSender) sendInternal(ctx context.Context, method sendMethod) error {
+func (s *approveSender) resolveAndSend(ctx context.Context, method sendMethod) (err error) {
+	if !s.resolved {
+		var opResubmit bool
+		if opResubmit, err = s.resolve(ctx); err != nil {
+			return err
+		}
+		s.resolved = true
+		if opResubmit {
+			// Operation had already been created on a previous call but never got submitted. We've resubmitted
+			// it now so no need to carry on
+			return nil
+		}
+	}
+
+	if method == methodSendAndWait && s.approval.Message != nil {
+		// Begin waiting for the message, and trigger the approval.
+		// A successful approval will trigger the message via the event handler, so we can wait for it all to complete.
+		_, err := s.mgr.syncasync.WaitForMessage(ctx, s.approval.Message.Header.ID, func(ctx context.Context) error {
+			return s.sendInternal(ctx, methodSendAndWait)
+		})
+		return err
+	}
+
+	return s.sendInternal(ctx, method)
+}
+
+func (s *approveSender) resolve(ctx context.Context) (opResubmitted bool, err error) {
+	// Create a transaction and attach to the approval
+	txid, err := s.mgr.txHelper.SubmitNewTransaction(ctx, core.TransactionTypeTokenApproval, s.approval.IdempotencyKey)
+	if err != nil {
+		// Check if we've clashed on idempotency key. There might be operations still in "Initialized" state that need
+		// submitting to their handlers
+		if idemErr, ok := err.(*sqlcommon.IdempotencyError); ok {
+			operation, resubmitErr := s.mgr.operations.ResubmitOperations(ctx, idemErr.ExistingTXID)
+			if resubmitErr != nil {
+				// Error doing resubmit, return the new error
+				err = resubmitErr
+			} else if operation != nil {
+				// We successfully resubmitted an initialized operation, return 2xx not 409
+				return true, nil
+			}
+		}
+		return false, err
+	}
+	s.approval.TX.ID = txid
+	s.approval.TX.Type = core.TransactionTypeTokenApproval
+
+	// Resolve the attached message
+	if s.approval.Message != nil {
+		s.approval.Message.Header.TxParent = &core.TransactionRef{
+			ID:   txid,
+			Type: core.TransactionTypeTokenApproval,
+		}
+		s.msgSender, err = s.buildApprovalMessage(ctx, s.approval.Message)
+		if err != nil {
+			return false, err
+		}
+		if err = s.msgSender.Prepare(ctx); err != nil {
+			return false, err
+		}
+		s.approval.TokenApproval.Message = s.approval.Message.Header.ID
+		s.approval.TokenApproval.MessageHash = s.approval.Message.Hash
+	}
+	return false, err
+}
+
+func (s *approveSender) sendInternal(ctx context.Context, method sendMethod) (err error) {
 	if method == methodSendAndWait {
-		out, err := s.mgr.syncasync.WaitForTokenApproval(ctx, s.namespace, s.approval.LocalID, s.Send)
+		out, err := s.mgr.syncasync.WaitForTokenApproval(ctx, s.approval.LocalID, s.Send)
 		if out != nil {
 			s.approval.TokenApproval = *out
 		}
 		return err
 	}
 
-	plugin, err := s.mgr.selectTokenPlugin(ctx, s.approval.Connector)
-	if err != nil {
-		return err
-	}
-
-	if method == methodPrepare {
-		return nil
-	}
-
-	var pool *fftypes.TokenPool
-	var op *fftypes.Operation
+	var op *core.Operation
+	var pool *core.TokenPool
 	err = s.mgr.database.RunAsGroup(ctx, func(ctx context.Context) (err error) {
-		pool, err = s.mgr.GetTokenPoolByNameOrID(ctx, s.namespace, s.approval.Pool)
-		if err != nil {
-			return err
-		}
-		if pool.State != fftypes.TokenPoolStateConfirmed {
-			return i18n.NewError(ctx, coremsgs.MsgTokenPoolNotConfirmed)
-		}
-
-		txid, err := s.mgr.txHelper.SubmitNewTransaction(ctx, s.namespace, fftypes.TransactionTypeTokenApproval)
+		pool, err = s.mgr.validateApproval(ctx, s.approval)
 		if err != nil {
 			return err
 		}
 
-		s.approval.TX.ID = txid
-		s.approval.TX.Type = fftypes.TransactionTypeTokenApproval
-		s.approval.TokenApproval.Pool = pool.ID
+		plugin, err := s.mgr.selectTokenPlugin(ctx, s.approval.Connector)
+		if err != nil {
+			return err
+		}
 
-		op = fftypes.NewOperation(
+		if method == methodPrepare {
+			return nil
+		}
+
+		op = core.NewOperation(
 			plugin,
-			s.namespace,
-			txid,
-			fftypes.TransactionTypeTokenApproval)
+			s.mgr.namespace,
+			s.approval.TX.ID,
+			core.TransactionTypeTokenApproval)
 		if err = txcommon.AddTokenApprovalInputs(op, &s.approval.TokenApproval); err == nil {
-			err = s.mgr.database.InsertOperation(ctx, op)
+			err = s.mgr.operations.AddOrReuseOperation(ctx, op)
 		}
 		return err
 	})
 	if err != nil {
 		return err
+	} else if method == methodPrepare {
+		return nil
+	}
+
+	// Write the approval message outside of any DB transaction, as it will use the background message writer.
+	if s.approval.Message != nil {
+		s.approval.Message.State = core.MessageStateStaged
+		if err = s.msgSender.Send(ctx); err != nil {
+			return err
+		}
 	}
 
 	_, err = s.mgr.operations.RunOperation(ctx, opApproval(op, pool, &s.approval.TokenApproval))
 	return err
 }
 
-func (am *assetManager) validateApproval(ctx context.Context, ns string, approval *fftypes.TokenApprovalInput) (err error) {
-	if approval.Connector == "" {
-		connector, err := am.getTokenConnectorName(ctx, ns)
-		if err != nil {
-			return err
-		}
-		approval.Connector = connector
-	}
+func (am *assetManager) validateApproval(ctx context.Context, approval *core.TokenApprovalInput) (pool *core.TokenPool, err error) {
 	if approval.Pool == "" {
-		pool, err := am.getTokenPoolName(ctx, ns)
+		pool, err = am.getDefaultTokenPool(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		approval.Pool = pool
+	} else {
+		pool, err = am.GetTokenPoolByNameOrID(ctx, approval.Pool)
+		if err != nil {
+			return nil, err
+		}
 	}
-	approval.Key, err = am.identity.NormalizeSigningKey(ctx, approval.Key, am.keyNormalization)
-	return err
+	approval.TokenApproval.Pool = pool.ID
+	approval.TokenApproval.Connector = pool.Connector
+
+	if pool.State != core.TokenPoolStateConfirmed {
+		return nil, i18n.NewError(ctx, coremsgs.MsgTokenPoolNotConfirmed)
+	}
+	approval.Key, err = am.identity.ResolveInputSigningKey(ctx, approval.Key, am.keyNormalization)
+	return pool, err
+}
+
+func (s *approveSender) buildApprovalMessage(ctx context.Context, in *core.MessageInOut) (syncasync.Sender, error) {
+	allowedTypes := []fftypes.FFEnum{
+		core.MessageTypeBroadcast,
+		core.MessageTypePrivate,
+		core.MessageTypeDeprecatedApprovalBroadcast,
+		core.MessageTypeDeprecatedApprovalPrivate,
+	}
+	if in.Header.Type == "" {
+		in.Header.Type = core.MessageTypeBroadcast
+	}
+	switch in.Header.Type {
+	case core.MessageTypeBroadcast, core.MessageTypeDeprecatedApprovalBroadcast:
+		if s.mgr.broadcast == nil {
+			return nil, i18n.NewError(ctx, coremsgs.MsgMessagesNotSupported)
+		}
+		return s.mgr.broadcast.NewBroadcast(in), nil
+	case core.MessageTypePrivate, core.MessageTypeDeprecatedApprovalPrivate:
+		if s.mgr.messaging == nil {
+			return nil, i18n.NewError(ctx, coremsgs.MsgMessagesNotSupported)
+		}
+		return s.mgr.messaging.NewMessage(in), nil
+	default:
+		return nil, i18n.NewError(ctx, coremsgs.MsgInvalidMessageType, allowedTypes)
+	}
 }

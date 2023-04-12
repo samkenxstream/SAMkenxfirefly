@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,11 +21,14 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/dbsql"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -60,17 +63,22 @@ var (
 // items on top of a SQL database, means taking a lock (see below).
 // This is not safe to do unless you are really sure what other locks will be taken after
 // that in the transaction. So we defer the emission of the events to a pre-commit capture.
-func (s *SQLCommon) InsertEvent(ctx context.Context, event *fftypes.Event) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+func (s *SQLCommon) InsertEvent(ctx context.Context, event *core.Event) (err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
 	event.Sequence = -1 // the sequence is not allocated until the post-commit callback
-	s.addPreCommitEvent(tx, event)
-	return s.commitTx(ctx, tx, autoCommit)
+	pca := tx.PreCommitAccumulator()
+	if pca == nil {
+		pca = &eventsPCA{s: s}
+		tx.SetPreCommitAccumulator(pca)
+	}
+	pca.(*eventsPCA).events = append(pca.(*eventsPCA).events, event)
+	return s.CommitTx(ctx, tx, autoCommit)
 }
 
-func (s *SQLCommon) setEventInsertValues(query sq.InsertBuilder, event *fftypes.Event) sq.InsertBuilder {
+func (s *SQLCommon) setEventInsertValues(query sq.InsertBuilder, event *core.Event) sq.InsertBuilder {
 	return query.Values(
 		event.ID,
 		string(event.Type),
@@ -83,30 +91,43 @@ func (s *SQLCommon) setEventInsertValues(query sq.InsertBuilder, event *fftypes.
 	)
 }
 
-func (s *SQLCommon) eventInserted(ctx context.Context, event *fftypes.Event) {
-	s.callbacks.OrderedUUIDCollectionNSEvent(database.CollectionEvents, fftypes.ChangeEventTypeCreated, event.Namespace, event.ID, event.Sequence)
+const eventsTable = "events"
+
+func (s *SQLCommon) eventInserted(ctx context.Context, event *core.Event) {
+	s.callbacks.OrderedUUIDCollectionNSEvent(database.CollectionEvents, core.ChangeEventTypeCreated, event.Namespace, event.ID, event.Sequence)
 	log.L(ctx).Infof("Emitted %s event %s for %s:%s (correlator=%v,topic=%s)", event.Type, event.ID, event.Namespace, event.Reference, event.Correlator, event.Topic)
 }
 
-func (s *SQLCommon) insertEventsPreCommit(ctx context.Context, tx *txWrapper, events []*fftypes.Event) (err error) {
+type eventsPCA struct {
+	s      *SQLCommon
+	events []*core.Event
+}
 
-	// We take the cost of a full table lock on the events table.
-	// This allows us to rely on the sequence to always be increasing, even when writing events
-	// concurrently (it does not guarantee we won't get a gap in the sequences).
-	if err = s.lockTableExclusiveTx(ctx, tx, "events"); err != nil {
-		return err
+func (p *eventsPCA) PreCommit(ctx context.Context, tx *dbsql.TXWrapper) (err error) {
+
+	namespaces := make(map[string]bool)
+	for _, event := range p.events {
+		namespaces[event.Namespace] = true
+	}
+	for namespace := range namespaces {
+		// We take the cost of a lock - scoped to the namespace(s) being updated.
+		// This allows us to rely on the sequence to always be increasing, even when writing events
+		// concurrently (it does not guarantee we won't get a gap in the sequences).
+		if err = p.s.AcquireLockTx(ctx, namespace, tx); err != nil {
+			return err
+		}
 	}
 
-	if s.features.MultiRowInsert {
-		query := sq.Insert("events").Columns(eventColumns...)
-		for _, event := range events {
-			query = s.setEventInsertValues(query, event)
+	if p.s.Features().MultiRowInsert {
+		query := sq.Insert(eventsTable).Columns(eventColumns...)
+		for _, event := range p.events {
+			query = p.s.setEventInsertValues(query, event)
 		}
-		sequences := make([]int64, len(events))
-		err := s.insertTxRows(ctx, tx, query, func() {
-			for i, event := range events {
+		sequences := make([]int64, len(p.events))
+		err := p.s.InsertTxRows(ctx, eventsTable, tx, query, func() {
+			for i, event := range p.events {
 				event.Sequence = sequences[i]
-				s.eventInserted(ctx, event)
+				p.s.eventInserted(ctx, event)
 			}
 		}, sequences, true /* we want the caller to be able to retry with individual upserts */)
 		if err != nil {
@@ -114,10 +135,10 @@ func (s *SQLCommon) insertEventsPreCommit(ctx context.Context, tx *txWrapper, ev
 		}
 	} else {
 		// Fall back to individual inserts grouped in a TX
-		for _, event := range events {
-			query := s.setEventInsertValues(sq.Insert("events").Columns(eventColumns...), event)
-			event.Sequence, err = s.insertTx(ctx, tx, query, func() {
-				s.eventInserted(ctx, event)
+		for _, event := range p.events {
+			query := p.s.setEventInsertValues(sq.Insert(eventsTable).Columns(eventColumns...), event)
+			event.Sequence, err = p.s.InsertTx(ctx, eventsTable, tx, query, func() {
+				p.s.eventInserted(ctx, event)
 			})
 			if err != nil {
 				return err
@@ -128,8 +149,8 @@ func (s *SQLCommon) insertEventsPreCommit(ctx context.Context, tx *txWrapper, ev
 	return nil
 }
 
-func (s *SQLCommon) eventResult(ctx context.Context, row *sql.Rows) (*fftypes.Event, error) {
-	var event fftypes.Event
+func (s *SQLCommon) eventResult(ctx context.Context, row *sql.Rows) (*core.Event, error) {
+	var event core.Event
 	err := row.Scan(
 		&event.ID,
 		&event.Type,
@@ -143,19 +164,19 @@ func (s *SQLCommon) eventResult(ctx context.Context, row *sql.Rows) (*fftypes.Ev
 		&event.Sequence,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "events")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, eventsTable)
 	}
 	return &event, nil
 }
 
-func (s *SQLCommon) GetEventByID(ctx context.Context, id *fftypes.UUID) (message *fftypes.Event, err error) {
+func (s *SQLCommon) GetEventByID(ctx context.Context, namespace string, id *fftypes.UUID) (message *core.Event, err error) {
 
 	cols := append([]string{}, eventColumns...)
-	cols = append(cols, sequenceColumn)
-	rows, _, err := s.query(ctx,
+	cols = append(cols, s.SequenceColumn())
+	rows, _, err := s.Query(ctx, eventsTable,
 		sq.Select(cols...).
-			From("events").
-			Where(sq.Eq{"id": id}),
+			From(eventsTable).
+			Where(sq.Eq{"id": id, "namespace": namespace}),
 	)
 	if err != nil {
 		return nil, err
@@ -175,22 +196,24 @@ func (s *SQLCommon) GetEventByID(ctx context.Context, id *fftypes.UUID) (message
 	return event, nil
 }
 
-func (s *SQLCommon) GetEvents(ctx context.Context, filter database.Filter) (message []*fftypes.Event, res *database.FilterResult, err error) {
+func (s *SQLCommon) GetEvents(ctx context.Context, namespace string, filter ffapi.Filter) (message []*core.Event, res *ffapi.FilterResult, err error) {
 
 	cols := append([]string{}, eventColumns...)
-	cols = append(cols, sequenceColumn)
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(cols...).From("events"), filter, eventFilterFieldMap, []interface{}{"sequence"})
+	cols = append(cols, s.SequenceColumn())
+	query, fop, fi, err := s.FilterSelect(
+		ctx, "", sq.Select(cols...).From(eventsTable),
+		filter, eventFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, eventsTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	events := []*fftypes.Event{}
+	events := []*core.Event{}
 	for rows.Next() {
 		event, err := s.eventResult(ctx, rows)
 		if err != nil {
@@ -199,28 +222,6 @@ func (s *SQLCommon) GetEvents(ctx context.Context, filter database.Filter) (mess
 		events = append(events, event)
 	}
 
-	return events, s.queryRes(ctx, tx, "events", fop, fi), err
+	return events, s.QueryRes(ctx, eventsTable, tx, fop, fi), err
 
-}
-
-func (s *SQLCommon) UpdateEvent(ctx context.Context, id *fftypes.UUID, update database.Update) (err error) {
-
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
-
-	query, err := s.buildUpdate(sq.Update("events"), update, eventFilterFieldMap)
-	if err != nil {
-		return err
-	}
-	query = query.Where(sq.Eq{"id": id})
-
-	_, err = s.updateTx(ctx, tx, query, nil /* no change events on filter based update */)
-	if err != nil {
-		return err
-	}
-
-	return s.commitTx(ctx, tx, autoCommit)
 }

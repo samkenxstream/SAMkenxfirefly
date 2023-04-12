@@ -23,9 +23,10 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,7 +38,7 @@ func TestNoncesE2EWithDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a new nonce entry
-	nonceZero := &fftypes.Nonce{
+	nonceZero := &core.Nonce{
 		Hash: fftypes.NewRandB32(),
 	}
 	err := s.InsertNonce(ctx, nonceZero)
@@ -52,7 +53,7 @@ func TestNoncesE2EWithDB(t *testing.T) {
 	assert.Equal(t, string(nonceJson), string(nonceReadJson))
 
 	// Update the nonce
-	nonceUpdated := fftypes.Nonce{
+	nonceUpdated := core.Nonce{
 		Hash:  nonceZero.Hash,
 		Nonce: 12345,
 	}
@@ -94,8 +95,8 @@ func TestNoncesE2EWithDB(t *testing.T) {
 func TestInsertNonceFailBegin(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.InsertNonce(context.Background(), &fftypes.Nonce{})
-	assert.Regexp(t, "FF10114", err)
+	err := s.InsertNonce(context.Background(), &core.Nonce{})
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -104,16 +105,16 @@ func TestInsertNonceFailInsert(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
-	err := s.InsertNonce(context.Background(), &fftypes.Nonce{Hash: fftypes.NewRandB32()})
-	assert.Regexp(t, "FF10116", err)
+	err := s.InsertNonce(context.Background(), &core.Nonce{Hash: fftypes.NewRandB32()})
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestUpdateNonceFailBegin(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.UpdateNonce(context.Background(), &fftypes.Nonce{})
-	assert.Regexp(t, "FF10114", err)
+	err := s.UpdateNonce(context.Background(), &core.Nonce{})
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -122,8 +123,8 @@ func TestUpdateNonceFailUpdate(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("UPDATE .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
-	err := s.UpdateNonce(context.Background(), &fftypes.Nonce{Hash: fftypes.NewRandB32()})
-	assert.Regexp(t, "FF10117", err)
+	err := s.UpdateNonce(context.Background(), &core.Nonce{Hash: fftypes.NewRandB32()})
+	assert.Regexp(t, "FF00178", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -131,7 +132,7 @@ func TestGetNonceSelectFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
 	_, err := s.GetNonce(context.Background(), fftypes.NewRandB32())
-	assert.Regexp(t, "FF10115", err)
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -157,7 +158,7 @@ func TestGetNonceQueryFail(t *testing.T) {
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
 	f := database.NonceQueryFactory.NewFilter(context.Background()).Eq("hash", "")
 	_, _, err := s.GetNonces(context.Background(), f)
-	assert.Regexp(t, "FF10115", err)
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -181,7 +182,7 @@ func TestNonceDeleteBeginFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
 	err := s.DeleteNonce(context.Background(), fftypes.NewRandB32())
-	assert.Regexp(t, "FF10114", err)
+	assert.Regexp(t, "FF00175", err)
 }
 
 func TestNonceDeleteFail(t *testing.T) {
@@ -190,5 +191,5 @@ func TestNonceDeleteFail(t *testing.T) {
 	mock.ExpectExec("DELETE .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
 	err := s.DeleteNonce(context.Background(), fftypes.NewRandB32())
-	assert.Regexp(t, "FF10118", err)
+	assert.Regexp(t, "FF00179", err)
 }

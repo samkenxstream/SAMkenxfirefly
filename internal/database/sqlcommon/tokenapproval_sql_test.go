@@ -23,8 +23,9 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -34,7 +35,7 @@ func TestApprovalE2EWithDB(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	approval := &fftypes.TokenApproval{
+	approval := &core.TokenApproval{
 		LocalID:    fftypes.NewUUID(),
 		Pool:       fftypes.NewUUID(),
 		Connector:  "erc1155",
@@ -45,40 +46,46 @@ func TestApprovalE2EWithDB(t *testing.T) {
 		ProtocolID: "0001/01/01",
 		Subject:    "12345",
 		Active:     true,
-		TX: fftypes.TransactionRef{
-			Type: fftypes.TransactionTypeTokenApproval,
+		TX: core.TransactionRef{
+			Type: core.TransactionTypeTokenApproval,
 			ID:   fftypes.NewUUID(),
 		},
 		BlockchainEvent: fftypes.NewUUID(),
 	}
 
-	s.callbacks.On("UUIDCollectionNSEvent", database.CollectionTokenApprovals, fftypes.ChangeEventTypeCreated, approval.Namespace, approval.LocalID, mock.Anything).
+	s.callbacks.On("UUIDCollectionNSEvent", database.CollectionTokenApprovals, core.ChangeEventTypeCreated, approval.Namespace, approval.LocalID, mock.Anything).
 		Return().Once()
-	s.callbacks.On("UUIDCollectionNSEvent", database.CollectionTokenApprovals, fftypes.ChangeEventTypeUpdated, approval.Namespace, approval.LocalID, mock.Anything).
+	s.callbacks.On("UUIDCollectionNSEvent", database.CollectionTokenApprovals, core.ChangeEventTypeUpdated, approval.Namespace, approval.LocalID, mock.Anything).
 		Return().Once()
 
-	err := s.UpsertTokenApproval(ctx, approval)
+	// Initial list is empty
+	fb := database.TokenApprovalQueryFactory.NewFilter(ctx)
+	approvals, _, err := s.GetTokenApprovals(ctx, "ns1", fb.And())
 	assert.NoError(t, err)
+	assert.NotNil(t, approvals)
+	assert.Equal(t, 0, len(approvals))
 
+	// Add one approval
+	err = s.UpsertTokenApproval(ctx, approval)
+	assert.NoError(t, err)
 	assert.NotNil(t, approval.Created)
 	approvalJson, _ := json.Marshal(&approval)
 
 	// Query back token approval by ID
-	approvalRead, err := s.GetTokenApprovalByID(ctx, approval.LocalID)
+	approvalRead, err := s.GetTokenApprovalByID(ctx, "ns1", approval.LocalID)
 	assert.NoError(t, err)
 	assert.NotNil(t, approvalRead)
 	approvalReadJson, _ := json.Marshal(&approvalRead)
 	assert.Equal(t, string(approvalJson), string(approvalReadJson))
 
 	// Query back token approval by protocol ID
-	approvalRead, err = s.GetTokenApprovalByProtocolID(ctx, approval.Pool, approval.ProtocolID)
+	approvalRead, err = s.GetTokenApprovalByProtocolID(ctx, "ns1", approval.Connector, approval.ProtocolID)
 	assert.NoError(t, err)
 	assert.NotNil(t, approvalRead)
 	approvalReadJson, _ = json.Marshal(&approvalRead)
 	assert.Equal(t, string(approvalJson), string(approvalReadJson))
 
 	// Query back token approval by query filter
-	fb := database.TokenApprovalQueryFactory.NewFilter(ctx)
 	filter := fb.And(
 		fb.Eq("pool", approval.Pool),
 		fb.Eq("key", approval.Key),
@@ -86,7 +93,7 @@ func TestApprovalE2EWithDB(t *testing.T) {
 		fb.Eq("subject", approval.Subject),
 		fb.Eq("created", approval.Created),
 	)
-	approvals, res, err := s.GetTokenApprovals(ctx, filter.Count(true))
+	approvals, res, err := s.GetTokenApprovals(ctx, "ns1", filter.Count(true))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(approvals))
 	assert.Equal(t, int64(1), *res.TotalCount)
@@ -106,7 +113,7 @@ func TestApprovalE2EWithDB(t *testing.T) {
 	approval.Active = false
 
 	// Query back token approval by ID
-	approvalRead, err = s.GetTokenApprovalByID(ctx, approval.LocalID)
+	approvalRead, err = s.GetTokenApprovalByID(ctx, "ns1", approval.LocalID)
 	assert.NoError(t, err)
 	assert.NotNil(t, approvalRead)
 	approvalJson, _ = json.Marshal(&approval)
@@ -117,8 +124,8 @@ func TestApprovalE2EWithDB(t *testing.T) {
 func TestUpsertApprovalFailBegin(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.UpsertTokenApproval(context.Background(), &fftypes.TokenApproval{})
-	assert.Regexp(t, "FF10114", err)
+	err := s.UpsertTokenApproval(context.Background(), &core.TokenApproval{})
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -126,8 +133,8 @@ func TestUpsertApprovalFailSelect(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
-	err := s.UpsertTokenApproval(context.Background(), &fftypes.TokenApproval{})
-	assert.Regexp(t, "FF10115", err)
+	err := s.UpsertTokenApproval(context.Background(), &core.TokenApproval{})
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -137,8 +144,8 @@ func TestUpsertApprovalFailInsert(t *testing.T) {
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{}))
 	mock.ExpectExec("INSERT .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
-	err := s.UpsertTokenApproval(context.Background(), &fftypes.TokenApproval{})
-	assert.Regexp(t, "FF10116", err)
+	err := s.UpsertTokenApproval(context.Background(), &core.TokenApproval{})
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -148,8 +155,8 @@ func TestUpsertApprovalFailUpdate(t *testing.T) {
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"subject"}).AddRow("1"))
 	mock.ExpectExec("UPDATE .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
-	err := s.UpsertTokenApproval(context.Background(), &fftypes.TokenApproval{})
-	assert.Regexp(t, "FF10117", err)
+	err := s.UpsertTokenApproval(context.Background(), &core.TokenApproval{})
+	assert.Regexp(t, "FF00178", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -159,23 +166,23 @@ func TestUpsertApprovalFailCommit(t *testing.T) {
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"subject"}))
 	mock.ExpectExec("INSERT .*").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit().WillReturnError(fmt.Errorf("pop"))
-	err := s.UpsertTokenApproval(context.Background(), &fftypes.TokenApproval{})
-	assert.Regexp(t, "FF10119", err)
+	err := s.UpsertTokenApproval(context.Background(), &core.TokenApproval{})
+	assert.Regexp(t, "FF00180", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGetApprovalByIDSelectFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
-	_, err := s.GetTokenApprovalByID(context.Background(), fftypes.NewUUID())
-	assert.Regexp(t, "FF10115", err)
+	_, err := s.GetTokenApprovalByID(context.Background(), "ns1", fftypes.NewUUID())
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGetApprovalByIDNotFound(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"subject"}))
-	a, err := s.GetTokenApprovalByID(context.Background(), fftypes.NewUUID())
+	a, err := s.GetTokenApprovalByID(context.Background(), "ns1", fftypes.NewUUID())
 	assert.NoError(t, err)
 	assert.Nil(t, a)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -184,7 +191,7 @@ func TestGetApprovalByIDNotFound(t *testing.T) {
 func TestGetApprovalByIDScanFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"subject"}).AddRow("1"))
-	_, err := s.GetTokenApprovalByID(context.Background(), fftypes.NewUUID())
+	_, err := s.GetTokenApprovalByID(context.Background(), "ns1", fftypes.NewUUID())
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -193,15 +200,15 @@ func TestGetApprovalsQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
 	f := database.TokenApprovalQueryFactory.NewFilter(context.Background()).Eq("subject", "")
-	_, _, err := s.GetTokenApprovals(context.Background(), f)
-	assert.Regexp(t, "FF10115", err)
+	_, _, err := s.GetTokenApprovals(context.Background(), "ns1", f)
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 func TestGetApprovalsBuildQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
 	f := database.TokenApprovalQueryFactory.NewFilter(context.Background()).Eq("subject", map[bool]bool{true: false})
-	_, _, err := s.GetTokenApprovals(context.Background(), f)
+	_, _, err := s.GetTokenApprovals(context.Background(), "ns1", f)
 	assert.Regexp(t, "FF00143.*subject", err)
 }
 
@@ -209,7 +216,7 @@ func TestGetApprovalsScanFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"subject"}).AddRow("1"))
 	f := database.TokenApprovalQueryFactory.NewFilter(context.Background()).Eq("subject", "")
-	_, _, err := s.GetTokenApprovals(context.Background(), f)
+	_, _, err := s.GetTokenApprovals(context.Background(), "ns1", f)
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -220,7 +227,7 @@ func TestUpdateApprovalsFailBegin(t *testing.T) {
 	f := database.TokenApprovalQueryFactory.NewFilter(context.Background()).Eq("subject", "test")
 	u := database.TokenApprovalQueryFactory.NewUpdate(context.Background()).Set("active", false)
 	err := s.UpdateTokenApprovals(context.Background(), f, u)
-	assert.Regexp(t, "FF10114", err)
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -250,5 +257,5 @@ func TestUpdateApprovalsUpdateFail(t *testing.T) {
 	f := database.TokenApprovalQueryFactory.NewFilter(context.Background()).Eq("subject", "test")
 	u := database.TokenApprovalQueryFactory.NewUpdate(context.Background()).Set("active", false)
 	err := s.UpdateTokenApprovals(context.Background(), f, u)
-	assert.Regexp(t, "FF10117", err)
+	assert.Regexp(t, "FF00178", err)
 }

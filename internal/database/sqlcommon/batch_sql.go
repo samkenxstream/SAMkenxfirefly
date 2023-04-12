@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,11 +21,13 @@ import (
 	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 var (
@@ -53,92 +55,55 @@ var (
 	}
 )
 
-func (s *SQLCommon) UpsertBatch(ctx context.Context, batch *fftypes.BatchPersisted) (err error) {
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+const batchesTable = "batches"
 
-	// Do a select within the transaction to detemine if the UUID already exists
-	batchRows, _, err := s.queryTx(ctx, tx,
-		sq.Select("hash").
-			From("batches").
-			Where(sq.Eq{"id": batch.ID}),
+func (s *SQLCommon) InsertOrGetBatch(ctx context.Context, batch *core.BatchPersisted) (existing *core.BatchPersisted, err error) {
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.RollbackTx(ctx, tx, autoCommit)
+
+	// Try the insert first
+	_, insertErr := s.InsertTxExt(ctx, batchesTable, tx,
+		sq.Insert(batchesTable).
+			Columns(batchColumns...).
+			Values(
+				batch.ID,
+				string(batch.Type),
+				batch.Namespace,
+				batch.Author,
+				batch.Key,
+				batch.Group,
+				batch.Created,
+				batch.Hash,
+				batch.Manifest,
+				batch.Confirmed,
+				batch.TX.Type,
+				batch.TX.ID,
+				batch.Node,
+			),
+		func() {
+			s.callbacks.UUIDCollectionNSEvent(database.CollectionBatches, core.ChangeEventTypeCreated, batch.Namespace, batch.ID)
+		},
+		true, /* we want a failure here we can progress past */
 	)
-	if err != nil {
-		return err
+	if insertErr == nil {
+		return nil, s.CommitTx(ctx, tx, autoCommit)
 	}
 
-	existing := batchRows.Next()
-	if existing {
-		var hash *fftypes.Bytes32
-		_ = batchRows.Scan(&hash)
-		if !fftypes.SafeHashCompare(hash, batch.Hash) {
-			batchRows.Close()
-			log.L(ctx).Errorf("Existing=%s New=%s", hash, batch.Hash)
-			return database.HashMismatch
-		}
-	}
-	batchRows.Close()
-
-	if existing {
-
-		// Update the batch
-		if _, err = s.updateTx(ctx, tx,
-			sq.Update("batches").
-				Set("btype", string(batch.Type)).
-				Set("namespace", batch.Namespace).
-				Set("author", batch.Author).
-				Set("key", batch.Key).
-				Set("group_hash", batch.Group).
-				Set("created", batch.Created).
-				Set("hash", batch.Hash).
-				Set("manifest", batch.Manifest).
-				Set("confirmed", batch.Confirmed).
-				Set("tx_type", batch.TX.Type).
-				Set("tx_id", batch.TX.ID).
-				Set("node_id", batch.Node).
-				Where(sq.Eq{"id": batch.ID}),
-			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionBatches, fftypes.ChangeEventTypeUpdated, batch.Namespace, batch.ID)
-			},
-		); err != nil {
-			return err
-		}
-	} else {
-
-		if _, err = s.insertTx(ctx, tx,
-			sq.Insert("batches").
-				Columns(batchColumns...).
-				Values(
-					batch.ID,
-					string(batch.Type),
-					batch.Namespace,
-					batch.Author,
-					batch.Key,
-					batch.Group,
-					batch.Created,
-					batch.Hash,
-					batch.Manifest,
-					batch.Confirmed,
-					batch.TX.Type,
-					batch.TX.ID,
-					batch.Node,
-				),
-			func() {
-				s.callbacks.UUIDCollectionNSEvent(database.CollectionBatches, fftypes.ChangeEventTypeCreated, batch.Namespace, batch.ID)
-			},
-		); err != nil {
-			return err
-		}
+	// Do a select within the transaction to determine if the batch already exists
+	existing, err = s.GetBatchByID(ctx, batch.Namespace, batch.ID)
+	if err != nil || existing != nil {
+		return existing, err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	// Error was apparently not an ID conflict - must have been something else
+	return nil, insertErr
 }
 
-func (s *SQLCommon) batchResult(ctx context.Context, row *sql.Rows) (*fftypes.BatchPersisted, error) {
-	var batch fftypes.BatchPersisted
+func (s *SQLCommon) batchResult(ctx context.Context, row *sql.Rows) (*core.BatchPersisted, error) {
+	var batch core.BatchPersisted
 	err := row.Scan(
 		&batch.ID,
 		&batch.Type,
@@ -155,17 +120,17 @@ func (s *SQLCommon) batchResult(ctx context.Context, row *sql.Rows) (*fftypes.Ba
 		&batch.Node,
 	)
 	if err != nil {
-		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, "batches")
+		return nil, i18n.WrapError(ctx, err, coremsgs.MsgDBReadErr, batchesTable)
 	}
 	return &batch, nil
 }
 
-func (s *SQLCommon) GetBatchByID(ctx context.Context, id *fftypes.UUID) (message *fftypes.BatchPersisted, err error) {
+func (s *SQLCommon) GetBatchByID(ctx context.Context, namespace string, id *fftypes.UUID) (message *core.BatchPersisted, err error) {
 
-	rows, _, err := s.query(ctx,
+	rows, _, err := s.Query(ctx, batchesTable,
 		sq.Select(batchColumns...).
-			From("batches").
-			Where(sq.Eq{"id": id}),
+			From(batchesTable).
+			Where(sq.Eq{"id": id, "namespace": namespace}),
 	)
 	if err != nil {
 		return nil, err
@@ -185,20 +150,20 @@ func (s *SQLCommon) GetBatchByID(ctx context.Context, id *fftypes.UUID) (message
 	return batch, nil
 }
 
-func (s *SQLCommon) GetBatches(ctx context.Context, filter database.Filter) (message []*fftypes.BatchPersisted, res *database.FilterResult, err error) {
+func (s *SQLCommon) GetBatches(ctx context.Context, namespace string, filter ffapi.Filter) (message []*core.BatchPersisted, res *ffapi.FilterResult, err error) {
 
-	query, fop, fi, err := s.filterSelect(ctx, "", sq.Select(batchColumns...).From("batches"), filter, batchFilterFieldMap, []interface{}{"sequence"})
+	query, fop, fi, err := s.FilterSelect(ctx, "", sq.Select(batchColumns...).From(batchesTable), filter, batchFilterFieldMap, []interface{}{"sequence"}, sq.Eq{"namespace": namespace})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, tx, err := s.query(ctx, query)
+	rows, tx, err := s.Query(ctx, batchesTable, query)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	batches := []*fftypes.BatchPersisted{}
+	batches := []*core.BatchPersisted{}
 	for rows.Next() {
 		batch, err := s.batchResult(ctx, rows)
 		if err != nil {
@@ -207,28 +172,28 @@ func (s *SQLCommon) GetBatches(ctx context.Context, filter database.Filter) (mes
 		batches = append(batches, batch)
 	}
 
-	return batches, s.queryRes(ctx, tx, "batches", fop, fi), err
+	return batches, s.QueryRes(ctx, batchesTable, tx, fop, fi), err
 
 }
 
-func (s *SQLCommon) UpdateBatch(ctx context.Context, id *fftypes.UUID, update database.Update) (err error) {
+func (s *SQLCommon) UpdateBatch(ctx context.Context, namespace string, id *fftypes.UUID, update ffapi.Update) (err error) {
 
-	ctx, tx, autoCommit, err := s.beginOrUseTx(ctx)
+	ctx, tx, autoCommit, err := s.BeginOrUseTx(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.rollbackTx(ctx, tx, autoCommit)
+	defer s.RollbackTx(ctx, tx, autoCommit)
 
-	query, err := s.buildUpdate(sq.Update("batches"), update, batchFilterFieldMap)
+	query, err := s.BuildUpdate(sq.Update(batchesTable), update, batchFilterFieldMap)
 	if err != nil {
 		return err
 	}
-	query = query.Where(sq.Eq{"id": id})
+	query = query.Where(sq.Eq{"id": id, "namespace": namespace})
 
-	_, err = s.updateTx(ctx, tx, query, nil /* no change events on filter update */)
+	_, err = s.UpdateTx(ctx, batchesTable, tx, query, nil /* no change events on filter update */)
 	if err != nil {
 		return err
 	}
 
-	return s.commitTx(ctx, tx, autoCommit)
+	return s.CommitTx(ctx, tx, autoCommit)
 }

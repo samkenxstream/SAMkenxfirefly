@@ -17,8 +17,8 @@
 package ffdx
 
 import (
-	"github.com/hyperledger/firefly/internal/coreconfig/wsconfig"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/wsclient"
 )
 
 const (
@@ -28,8 +28,8 @@ const (
 	DataExchangeInitEnabled = "initEnabled"
 )
 
-func (h *FFDX) InitPrefix(prefix config.Prefix) {
-	wsconfig.InitPrefix(prefix)
-	prefix.AddKnownKey(DataExchangeManifestEnabled, false)
-	prefix.AddKnownKey(DataExchangeInitEnabled, false)
+func (h *FFDX) InitConfig(config config.Section) {
+	wsclient.InitConfig(config)
+	config.AddKnownKey(DataExchangeManifestEnabled, false)
+	config.AddKnownKey(DataExchangeInitEnabled, false)
 }

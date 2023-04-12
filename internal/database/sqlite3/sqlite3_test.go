@@ -24,19 +24,22 @@ import (
 	"testing"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/hyperledger/firefly-common/pkg/config"
 	"github.com/hyperledger/firefly/internal/database/sqlcommon"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
-	"github.com/hyperledger/firefly/pkg/config"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestSQLite3GoProvider(t *testing.T) {
+
+	tmpDir := t.TempDir() // SQLite will fail if we point it at an existing directory (not file)
+
 	sqlite := &SQLite3{}
-	dcb := &databasemocks.Callbacks{}
-	prefix := config.NewPluginConfig("unittest")
-	sqlite.InitPrefix(prefix)
-	prefix.Set(sqlcommon.SQLConfDatasourceURL, "!wrong://")
-	err := sqlite.Init(context.Background(), prefix, dcb)
+	sqlite.SetHandler("ns", &databasemocks.Callbacks{})
+	config := config.RootSection("unittest")
+	sqlite.InitConfig(config)
+	config.Set(sqlcommon.SQLConfDatasourceURL, tmpDir)
+	err := sqlite.Init(context.Background(), config)
 	assert.NoError(t, err)
 	_, err = sqlite.GetMigrationDriver(sqlite.DB())
 	assert.Error(t, err)
@@ -48,6 +51,7 @@ func TestSQLite3GoProvider(t *testing.T) {
 	conn.Close()
 
 	assert.Equal(t, "sqlite3", sqlite.Name())
+	assert.Equal(t, "seq", sqlite.SequenceColumn())
 	assert.Equal(t, sq.Dollar, sqlite.Features().PlaceholderFormat)
 
 	insert := sq.Insert("test").Columns("col1").Values("val1")

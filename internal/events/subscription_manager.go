@@ -21,25 +21,24 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
+	"github.com/hyperledger/firefly/internal/broadcast"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
 	"github.com/hyperledger/firefly/internal/data"
-	"github.com/hyperledger/firefly/internal/definitions"
-	"github.com/hyperledger/firefly/internal/events/eifactory"
-	"github.com/hyperledger/firefly/internal/events/system"
-	"github.com/hyperledger/firefly/internal/events/websockets"
-	"github.com/hyperledger/firefly/internal/retry"
+	"github.com/hyperledger/firefly/internal/privatemessaging"
 	"github.com/hyperledger/firefly/internal/txcommon"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
 	"github.com/hyperledger/firefly/pkg/events"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 type subscription struct {
-	definition *fftypes.Subscription
+	definition *core.Subscription
 
 	dispatcherElection chan bool
 	eventMatcher       *regexp.Regexp
@@ -74,11 +73,14 @@ type connection struct {
 
 type subscriptionManager struct {
 	ctx                       context.Context
+	namespace                 string
+	enricher                  *eventEnricher
 	database                  database.Plugin
 	data                      data.Manager
 	txHelper                  txcommon.Helper
 	eventNotifier             *eventNotifier
-	definitions               definitions.DefinitionHandlers
+	broadcast                 broadcast.Manager
+	messaging                 privatemessaging.Manager
 	transports                map[string]events.Plugin
 	connections               map[string]*connection
 	mux                       sync.Mutex
@@ -90,13 +92,15 @@ type subscriptionManager struct {
 	retry                     retry.Retry
 }
 
-func newSubscriptionManager(ctx context.Context, di database.Plugin, dm data.Manager, en *eventNotifier, sh definitions.DefinitionHandlers, txHelper txcommon.Helper) (*subscriptionManager, error) {
+func newSubscriptionManager(ctx context.Context, ns string, enricher *eventEnricher, di database.Plugin, dm data.Manager, en *eventNotifier, bm broadcast.Manager, pm privatemessaging.Manager, txHelper txcommon.Helper, transports map[string]events.Plugin) (*subscriptionManager, error) {
 	ctx, cancelCtx := context.WithCancel(ctx)
 	sm := &subscriptionManager{
 		ctx:                       ctx,
+		namespace:                 ns,
+		enricher:                  enricher,
 		database:                  di,
 		data:                      dm,
-		transports:                make(map[string]events.Plugin),
+		transports:                transports,
 		connections:               make(map[string]*connection),
 		durableSubs:               make(map[fftypes.UUID]*subscription),
 		newOrUpdatedSubscriptions: make(chan *fftypes.UUID),
@@ -104,7 +108,8 @@ func newSubscriptionManager(ctx context.Context, di database.Plugin, dm data.Man
 		maxSubs:                   uint64(config.GetUint(coreconfig.SubscriptionMax)),
 		cancelCtx:                 cancelCtx,
 		eventNotifier:             en,
-		definitions:               sh,
+		broadcast:                 bm, // optional
+		messaging:                 pm, // optional
 		txHelper:                  txHelper,
 		retry: retry.Retry{
 			InitialDelay: config.GetDuration(coreconfig.SubscriptionsRetryInitialDelay),
@@ -113,48 +118,19 @@ func newSubscriptionManager(ctx context.Context, di database.Plugin, dm data.Man
 		},
 	}
 
-	err := sm.loadTransports()
-	if err == nil {
-		err = sm.initTransports()
-	}
-	return sm, err
-}
-
-func (sm *subscriptionManager) loadTransports() error {
-	var err error
-	enabledTransports := config.GetStringSlice(coreconfig.EventTransportsEnabled)
-	uniqueTransports := make(map[string]bool)
-	for _, transport := range enabledTransports {
-		uniqueTransports[transport] = true
-	}
-	// Cannot disable the internal listener
-	uniqueTransports[system.SystemEventsTransport] = true
-	for transport := range uniqueTransports {
-		sm.transports[transport], err = eifactory.GetPlugin(sm.ctx, transport)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (sm *subscriptionManager) initTransports() error {
-	var err error
 	for _, ei := range sm.transports {
-		prefix := config.NewPluginConfig("events").SubPrefix(ei.Name())
-		ei.InitPrefix(prefix)
-		err = ei.Init(sm.ctx, prefix, &boundCallbacks{sm: sm, ei: ei})
-		if err != nil {
-			return err
+		if err := ei.SetHandler(sm.namespace, &boundCallbacks{sm: sm, ei: ei}); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+
+	return sm, nil
 }
 
 func (sm *subscriptionManager) start() error {
 	fb := database.SubscriptionQueryFactory.NewFilter(sm.ctx)
 	filter := fb.And().Limit(sm.maxSubs)
-	persistedSubs, _, err := sm.database.GetSubscriptions(sm.ctx, filter)
+	persistedSubs, _, err := sm.database.GetSubscriptions(sm.ctx, sm.namespace, filter)
 	if err != nil {
 		return err
 	}
@@ -191,9 +167,9 @@ func (sm *subscriptionManager) subscriptionEventListener() {
 }
 
 func (sm *subscriptionManager) newOrUpdatedDurableSubscription(id *fftypes.UUID) {
-	var subDef *fftypes.Subscription
+	var subDef *core.Subscription
 	err := sm.retry.Do(sm.ctx, "retrieve subscription", func(attempt int) (retry bool, err error) {
-		subDef, err = sm.database.GetSubscriptionByID(sm.ctx, id)
+		subDef, err = sm.database.GetSubscriptionByID(sm.ctx, sm.namespace, id)
 		return err != nil, err // indefinite retry
 	})
 	if err != nil || subDef == nil {
@@ -267,13 +243,13 @@ func (sm *subscriptionManager) deletedDurableSubscription(id *fftypes.UUID) {
 		dispatcher.close()
 	}
 	// Delete the offsets, as the durable subscriptions are gone
-	err := sm.database.DeleteOffset(sm.ctx, fftypes.OffsetTypeSubscription, id.String())
+	err := sm.database.DeleteOffset(sm.ctx, core.OffsetTypeSubscription, id.String())
 	if err != nil {
 		log.L(sm.ctx).Errorf("Failed to cleanup subscription offset: %s", err)
 	}
 }
 
-func (sm *subscriptionManager) parseSubscriptionDef(ctx context.Context, subDef *fftypes.Subscription) (sub *subscription, err error) {
+func (sm *subscriptionManager) parseSubscriptionDef(ctx context.Context, subDef *core.Subscription) (sub *subscription, err error) {
 	filter := subDef.Filter
 
 	transport, ok := sm.transports[subDef.Transport]
@@ -372,7 +348,7 @@ func (sm *subscriptionManager) parseSubscriptionDef(ctx context.Context, subDef 
 		},
 	}
 
-	if (filter.BlockchainEvent != fftypes.BlockchainEventFilter{}) {
+	if (filter.BlockchainEvent != core.BlockchainEventFilter{}) {
 		var nameFilter *regexp.Regexp
 		if filter.BlockchainEvent.Name != "" {
 			nameFilter, err = regexp.Compile(filter.BlockchainEvent.Name)
@@ -396,7 +372,7 @@ func (sm *subscriptionManager) parseSubscriptionDef(ctx context.Context, subDef 
 		sub.blockchainFilter = bf
 	}
 
-	if (filter.Transaction != fftypes.TransactionFilter{}) {
+	if (filter.Transaction != core.TransactionFilter{}) {
 		var typeFilter *regexp.Regexp
 		if filter.Transaction.Type != "" {
 			typeFilter, err = regexp.Compile(filter.Transaction.Type)
@@ -476,14 +452,14 @@ func (sm *subscriptionManager) matchSubToConnLocked(conn *connection, sub *subsc
 	}
 	if conn.transport == sub.definition.Transport && conn.matcher(sub.definition.SubscriptionRef) {
 		if _, ok := conn.dispatchers[*sub.definition.ID]; !ok {
-			dispatcher := newEventDispatcher(sm.ctx, conn.ei, sm.database, sm.data, sm.definitions, conn.id, sub, sm.eventNotifier, sm.txHelper)
+			dispatcher := newEventDispatcher(sm.ctx, sm.enricher, conn.ei, sm.database, sm.data, sm.broadcast, sm.messaging, conn.id, sub, sm.eventNotifier, sm.txHelper)
 			conn.dispatchers[*sub.definition.ID] = dispatcher
 			dispatcher.start()
 		}
 	}
 }
 
-func (sm *subscriptionManager) ephemeralSubscription(ei events.Plugin, connID, namespace string, filter *fftypes.SubscriptionFilter, options *fftypes.SubscriptionOptions) error {
+func (sm *subscriptionManager) ephemeralSubscription(ei events.Plugin, connID, namespace string, filter *core.SubscriptionFilter, options *core.SubscriptionOptions) error {
 	sm.mux.Lock()
 	defer sm.mux.Unlock()
 
@@ -494,8 +470,8 @@ func (sm *subscriptionManager) ephemeralSubscription(ei events.Plugin, connID, n
 	}
 
 	subID := fftypes.NewUUID()
-	subDefinition := &fftypes.Subscription{
-		SubscriptionRef: fftypes.SubscriptionRef{
+	subDefinition := &core.Subscription{
+		SubscriptionRef: core.SubscriptionRef{
 			ID:        subID,
 			Name:      subID.String(),
 			Namespace: namespace,
@@ -513,7 +489,7 @@ func (sm *subscriptionManager) ephemeralSubscription(ei events.Plugin, connID, n
 	}
 
 	// Create the dispatcher, and start immediately
-	dispatcher := newEventDispatcher(sm.ctx, ei, sm.database, sm.data, sm.definitions, connID, newSub, sm.eventNotifier, sm.txHelper)
+	dispatcher := newEventDispatcher(sm.ctx, sm.enricher, ei, sm.database, sm.data, sm.broadcast, sm.messaging, connID, newSub, sm.eventNotifier, sm.txHelper)
 	dispatcher.start()
 
 	conn.dispatchers[*subID] = dispatcher
@@ -544,7 +520,7 @@ func (sm *subscriptionManager) connectionClosed(ei events.Plugin, connID string)
 	}
 }
 
-func (sm *subscriptionManager) deliveryResponse(ei events.Plugin, connID string, inflight *fftypes.EventDeliveryResponse) {
+func (sm *subscriptionManager) deliveryResponse(ei events.Plugin, connID string, inflight *core.EventDeliveryResponse) {
 	sm.mux.Lock()
 	var dispatcher *eventDispatcher
 	conn, ok := sm.connections[connID]
@@ -565,12 +541,4 @@ func (sm *subscriptionManager) deliveryResponse(ei events.Plugin, connID string,
 	}
 	sm.mux.Unlock()
 	dispatcher.deliveryResponse(inflight)
-}
-
-func (sm *subscriptionManager) getWebSocketStatus() *fftypes.WebSocketStatus {
-	pluginName := (*websockets.WebSockets)(nil).Name()
-	if plugin, ok := sm.transports[pluginName]; ok {
-		return plugin.(*websockets.WebSockets).GetStatus()
-	}
-	return &fftypes.WebSocketStatus{Enabled: false}
 }

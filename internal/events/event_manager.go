@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,10 +21,15 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
-	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
 	"github.com/hyperledger/firefly/internal/assets"
 	"github.com/hyperledger/firefly/internal/broadcast"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
 	"github.com/hyperledger/firefly/internal/data"
@@ -33,21 +38,18 @@ import (
 	"github.com/hyperledger/firefly/internal/events/system"
 	"github.com/hyperledger/firefly/internal/identity"
 	"github.com/hyperledger/firefly/internal/metrics"
+	"github.com/hyperledger/firefly/internal/multiparty"
+	"github.com/hyperledger/firefly/internal/operations"
 	"github.com/hyperledger/firefly/internal/privatemessaging"
-	"github.com/hyperledger/firefly/internal/retry"
 	"github.com/hyperledger/firefly/internal/shareddownload"
-	"github.com/hyperledger/firefly/internal/sysmessaging"
 	"github.com/hyperledger/firefly/internal/txcommon"
 	"github.com/hyperledger/firefly/pkg/blockchain"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
 	"github.com/hyperledger/firefly/pkg/dataexchange"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/events"
 	"github.com/hyperledger/firefly/pkg/sharedstorage"
 	"github.com/hyperledger/firefly/pkg/tokens"
-	"github.com/karlseguin/ccache"
 )
 
 type EventManager interface {
@@ -56,98 +58,121 @@ type EventManager interface {
 	NewSubscriptions() chan<- *fftypes.UUID
 	SubscriptionUpdates() chan<- *fftypes.UUID
 	DeletedSubscriptions() chan<- *fftypes.UUID
-	DeleteDurableSubscription(ctx context.Context, subDef *fftypes.Subscription) (err error)
-	CreateUpdateDurableSubscription(ctx context.Context, subDef *fftypes.Subscription, mustNew bool) (err error)
-	GetWebSocketStatus() *fftypes.WebSocketStatus
+	DeleteDurableSubscription(ctx context.Context, subDef *core.Subscription) (err error)
+	CreateUpdateDurableSubscription(ctx context.Context, subDef *core.Subscription, mustNew bool) (err error)
+	EnrichEvent(ctx context.Context, event *core.Event) (*core.EnrichedEvent, error)
+	QueueBatchRewind(batchID *fftypes.UUID)
 	Start() error
 	WaitStop()
 
 	// Bound blockchain callbacks
-	BatchPinComplete(bi blockchain.Plugin, batch *blockchain.BatchPin, signingKey *fftypes.VerifierRef) error
+	BatchPinComplete(namespace string, batch *blockchain.BatchPin, signingKey *core.VerifierRef) error
 	BlockchainEvent(event *blockchain.EventWithSubscription) error
+	BlockchainNetworkAction(action string, location *fftypes.JSONAny, event *blockchain.Event, signingKey *core.VerifierRef) error
 
 	// Bound dataexchange callbacks
-	DXEvent(dx dataexchange.Plugin, event dataexchange.DXEvent)
+	DXEvent(plugin dataexchange.Plugin, event dataexchange.DXEvent)
 
 	// Bound sharedstorage callbacks
-	SharedStorageBatchDownloaded(ss sharedstorage.Plugin, ns, payloadRef string, data []byte) (*fftypes.UUID, error)
-	SharedStorageBlobDownloaded(ss sharedstorage.Plugin, hash fftypes.Bytes32, size int64, payloadRef string)
+	SharedStorageBatchDownloaded(ss sharedstorage.Plugin, payloadRef string, data []byte) (*fftypes.UUID, error)
+	SharedStorageBlobDownloaded(ss sharedstorage.Plugin, hash fftypes.Bytes32, size int64, payloadRef string, dataID *fftypes.UUID)
 
 	// Bound token callbacks
-	TokenPoolCreated(ti tokens.Plugin, pool *tokens.TokenPool) error
+	TokenPoolCreated(ctx context.Context /* allows security context to be propagated when called in-line with the send TX */, ti tokens.Plugin, pool *tokens.TokenPool) error
 	TokensTransferred(ti tokens.Plugin, transfer *tokens.TokenTransfer) error
 	TokensApproved(ti tokens.Plugin, approval *tokens.TokenApproval) error
 
-	GetPlugins() []*fftypes.NodeStatusPlugin
+	GetPlugins() []*core.NamespaceStatusPlugin
 
 	// Internal events
-	sysmessaging.SystemEvents
+	system.EventInterface
 }
 
 type eventManager struct {
-	ctx                   context.Context
-	ni                    sysmessaging.LocalNodeInfo
-	sharedstorage         sharedstorage.Plugin
-	database              database.Plugin
-	txHelper              txcommon.Helper
-	identity              identity.Manager
-	definitions           definitions.DefinitionHandlers
-	data                  data.Manager
-	subManager            *subscriptionManager
-	retry                 retry.Retry
-	aggregator            *aggregator
-	broadcast             broadcast.Manager
-	messaging             privatemessaging.Manager
-	assets                assets.Manager
-	sharedDownload        shareddownload.Manager
-	blobReceiver          *blobReceiver
-	newEventNotifier      *eventNotifier
-	newPinNotifier        *eventNotifier
-	defaultTransport      string
-	internalEvents        *system.Events
-	metrics               metrics.Manager
-	chainListenerCache    *ccache.Cache
-	chainListenerCacheTTL time.Duration
+	ctx                context.Context
+	namespace          *core.Namespace
+	enricher           *eventEnricher
+	database           database.Plugin
+	txHelper           txcommon.Helper
+	identity           identity.Manager
+	defsender          definitions.Sender
+	defhandler         definitions.Handler
+	data               data.Manager
+	subManager         *subscriptionManager
+	retry              retry.Retry
+	aggregator         *aggregator              // optional
+	broadcast          broadcast.Manager        // optional
+	messaging          privatemessaging.Manager // optional
+	assets             assets.Manager
+	sharedDownload     shareddownload.Manager // optional
+	blobReceiver       *blobReceiver          // optional
+	newEventNotifier   *eventNotifier
+	newPinNotifier     *eventNotifier
+	defaultTransport   string
+	internalEvents     *system.Events
+	metrics            metrics.Manager
+	chainListenerCache cache.CInterface
+	multiparty         multiparty.Manager // optional
 }
 
-func NewEventManager(ctx context.Context, ni sysmessaging.LocalNodeInfo, si sharedstorage.Plugin, di database.Plugin, bi blockchain.Plugin, im identity.Manager, dh definitions.DefinitionHandlers, dm data.Manager, bm broadcast.Manager, pm privatemessaging.Manager, am assets.Manager, sd shareddownload.Manager, mm metrics.Manager, txHelper txcommon.Helper) (EventManager, error) {
-	if ni == nil || si == nil || di == nil || bi == nil || im == nil || dh == nil || dm == nil || bm == nil || pm == nil || am == nil {
-		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError)
+func NewEventManager(ctx context.Context, ns *core.Namespace, di database.Plugin, bi blockchain.Plugin, im identity.Manager, dh definitions.Handler, dm data.Manager, ds definitions.Sender, bm broadcast.Manager, pm privatemessaging.Manager, am assets.Manager, sd shareddownload.Manager, mm metrics.Manager, om operations.Manager, txHelper txcommon.Helper, transports map[string]events.Plugin, mp multiparty.Manager, cacheManager cache.Manager) (EventManager, error) {
+	if di == nil || im == nil || dh == nil || dm == nil || om == nil || ds == nil || am == nil {
+		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError, "EventManager")
 	}
 	newPinNotifier := newEventNotifier(ctx, "pins")
 	newEventNotifier := newEventNotifier(ctx, "events")
+
+	eventListenerCache, err := cacheManager.GetCache(
+		cache.NewCacheConfig(
+			ctx,
+			coreconfig.CacheEventListenerTopicLimit,
+			coreconfig.CacheEventListenerTopicTTL,
+			ns.Name,
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	em := &eventManager{
 		ctx:            log.WithLogField(ctx, "role", "event-manager"),
-		ni:             ni,
-		sharedstorage:  si,
+		namespace:      ns,
 		database:       di,
 		txHelper:       txHelper,
 		identity:       im,
-		definitions:    dh,
+		defsender:      ds,
+		defhandler:     dh,
 		data:           dm,
 		broadcast:      bm,
 		messaging:      pm,
 		assets:         am,
 		sharedDownload: sd,
+		multiparty:     mp,
 		retry: retry.Retry{
 			InitialDelay: config.GetDuration(coreconfig.EventAggregatorRetryInitDelay),
 			MaximumDelay: config.GetDuration(coreconfig.EventAggregatorRetryMaxDelay),
 			Factor:       config.GetFloat64(coreconfig.EventAggregatorRetryFactor),
 		},
-		defaultTransport:      config.GetString(coreconfig.EventTransportsDefault),
-		newEventNotifier:      newEventNotifier,
-		newPinNotifier:        newPinNotifier,
-		aggregator:            newAggregator(ctx, di, bi, dh, im, dm, newPinNotifier, mm),
-		metrics:               mm,
-		chainListenerCache:    ccache.New(ccache.Configure().MaxSize(config.GetByteSize(coreconfig.EventListenerTopicCacheSize))),
-		chainListenerCacheTTL: config.GetDuration(coreconfig.EventListenerTopicCacheTTL),
+		defaultTransport:   config.GetString(coreconfig.EventTransportsDefault),
+		newEventNotifier:   newEventNotifier,
+		newPinNotifier:     newPinNotifier,
+		metrics:            mm,
+		chainListenerCache: eventListenerCache,
 	}
 	ie, _ := eifactory.GetPlugin(ctx, system.SystemEventsTransport)
 	em.internalEvents = ie.(*system.Events)
-	em.blobReceiver = newBlobReceiver(ctx, em.aggregator)
+	if bi != nil {
+		aggregator, err := newAggregator(ctx, ns.Name, di, bi, pm, dh, im, dm, newPinNotifier, mm, cacheManager)
+		if err != nil {
+			return nil, err
+		}
+		em.aggregator = aggregator
+		em.blobReceiver = newBlobReceiver(ctx, em.aggregator)
+	}
 
-	var err error
-	if em.subManager, err = newSubscriptionManager(ctx, di, dm, newEventNotifier, dh, txHelper); err != nil {
+	em.enricher = newEventEnricher(ns.Name, di, dm, om, txHelper)
+
+	if em.subManager, err = newSubscriptionManager(ctx, ns.Name, em.enricher, di, dm, newEventNotifier, bm, pm, txHelper, transports); err != nil {
 		return nil, err
 	}
 
@@ -157,8 +182,10 @@ func NewEventManager(ctx context.Context, ni sysmessaging.LocalNodeInfo, si shar
 func (em *eventManager) Start() (err error) {
 	err = em.subManager.start()
 	if err == nil {
-		em.aggregator.start()
-		em.blobReceiver.start()
+		if em.aggregator != nil {
+			em.aggregator.start()
+			em.blobReceiver.start()
+		}
 	}
 	return err
 }
@@ -185,11 +212,16 @@ func (em *eventManager) DeletedSubscriptions() chan<- *fftypes.UUID {
 
 func (em *eventManager) WaitStop() {
 	em.subManager.close()
-	em.blobReceiver.stop()
-	<-em.aggregator.eventPoller.closed
+	if em.blobReceiver != nil {
+		em.blobReceiver.stop()
+		em.blobReceiver = nil
+	}
+	if em.aggregator != nil {
+		<-em.aggregator.eventPoller.closed
+	}
 }
 
-func (em *eventManager) CreateUpdateDurableSubscription(ctx context.Context, subDef *fftypes.Subscription, mustNew bool) (err error) {
+func (em *eventManager) CreateUpdateDurableSubscription(ctx context.Context, subDef *core.Subscription, mustNew bool) (err error) {
 	if subDef.Namespace == "" || subDef.Name == "" || subDef.ID == nil {
 		return i18n.NewError(ctx, coremsgs.MsgInvalidSubscription)
 	}
@@ -224,11 +256,11 @@ func (em *eventManager) CreateUpdateDurableSubscription(ctx context.Context, sub
 	} else {
 		// We lock in the starting sequence at creation time, rather than when the first dispatcher
 		// starts, as that's a more obvious behavior for users
-		sequence, err := calcFirstOffset(ctx, em.database, subDef.Options.FirstEvent)
+		sequence, err := calcFirstOffset(ctx, em.namespace.Name, em.database, subDef.Options.FirstEvent)
 		if err != nil {
 			return err
 		}
-		lockedInFirstEvent := fftypes.SubOptsFirstEvent(strconv.FormatInt(sequence, 10))
+		lockedInFirstEvent := core.SubOptsFirstEvent(strconv.FormatInt(sequence, 10))
 		subDef.Options.FirstEvent = &lockedInFirstEvent
 	}
 
@@ -236,28 +268,32 @@ func (em *eventManager) CreateUpdateDurableSubscription(ctx context.Context, sub
 	return em.database.UpsertSubscription(ctx, subDef, !mustNew)
 }
 
-func (em *eventManager) DeleteDurableSubscription(ctx context.Context, subDef *fftypes.Subscription) (err error) {
+func (em *eventManager) DeleteDurableSubscription(ctx context.Context, subDef *core.Subscription) (err error) {
 	// The event in the database for the deletion of the susbscription, will asynchronously update the submanager
-	return em.database.DeleteSubscriptionByID(ctx, subDef.ID)
+	return em.database.DeleteSubscriptionByID(ctx, em.namespace.Name, subDef.ID)
 }
 
 func (em *eventManager) AddSystemEventListener(ns string, el system.EventListener) error {
 	return em.internalEvents.AddListener(ns, el)
 }
 
-func (em *eventManager) GetPlugins() []*fftypes.NodeStatusPlugin {
-	eventsArray := make([]*fftypes.NodeStatusPlugin, 0)
+func (em *eventManager) GetPlugins() []*core.NamespaceStatusPlugin {
+	eventsArray := make([]*core.NamespaceStatusPlugin, 0)
 	plugins := em.subManager.transports
 
-	for _, plugin := range plugins {
-		eventsArray = append(eventsArray, &fftypes.NodeStatusPlugin{
-			PluginType: plugin.Name(),
+	for name := range plugins {
+		eventsArray = append(eventsArray, &core.NamespaceStatusPlugin{
+			PluginType: name,
 		})
 	}
 
 	return eventsArray
 }
 
-func (em *eventManager) GetWebSocketStatus() *fftypes.WebSocketStatus {
-	return em.subManager.getWebSocketStatus()
+func (em *eventManager) EnrichEvent(ctx context.Context, event *core.Event) (*core.EnrichedEvent, error) {
+	return em.enricher.enrichEvent(ctx, event)
+}
+
+func (em *eventManager) QueueBatchRewind(batchID *fftypes.UUID) {
+	em.aggregator.queueBatchRewind(batchID)
 }

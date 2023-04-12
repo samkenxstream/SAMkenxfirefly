@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -18,33 +18,37 @@ package batch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly-common/pkg/retry"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
 	"github.com/hyperledger/firefly/internal/data"
-	"github.com/hyperledger/firefly/internal/retry"
-	"github.com/hyperledger/firefly/internal/sysmessaging"
+	"github.com/hyperledger/firefly/internal/identity"
 	"github.com/hyperledger/firefly/internal/txcommon"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
-func NewBatchManager(ctx context.Context, ni sysmessaging.LocalNodeInfo, di database.Plugin, dm data.Manager, txHelper txcommon.Helper) (Manager, error) {
-	if di == nil || dm == nil {
-		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError)
+func NewBatchManager(ctx context.Context, ns string, di database.Plugin, dm data.Manager, im identity.Manager, txHelper txcommon.Helper) (Manager, error) {
+	if di == nil || dm == nil || im == nil {
+		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError, "BatchManager")
 	}
 	pCtx, cancelCtx := context.WithCancel(log.WithLogField(ctx, "role", "batchmgr"))
 	readPageSize := config.GetUint(coreconfig.BatchManagerReadPageSize)
 	bm := &batchManager{
 		ctx:                        pCtx,
 		cancelCtx:                  cancelCtx,
-		ni:                         ni,
+		namespace:                  ns,
+		identity:                   im,
 		database:                   di,
 		data:                       dm,
 		txHelper:                   txHelper,
@@ -70,7 +74,8 @@ func NewBatchManager(ctx context.Context, ni sysmessaging.LocalNodeInfo, di data
 }
 
 type Manager interface {
-	RegisterDispatcher(name string, txType fftypes.TransactionType, msgTypes []fftypes.MessageType, handler DispatchHandler, batchOptions DispatcherOptions)
+	RegisterDispatcher(name string, txType core.TransactionType, msgTypes []core.MessageType, handler DispatchHandler, batchOptions DispatcherOptions)
+	LoadContexts(ctx context.Context, payload *DispatchPayload) error
 	NewMessages() chan<- int64
 	Start() error
 	Close()
@@ -91,7 +96,8 @@ type ProcessorStatus struct {
 type batchManager struct {
 	ctx                        context.Context
 	cancelCtx                  func()
-	ni                         sysmessaging.LocalNodeInfo
+	namespace                  string
+	identity                   identity.Manager
 	database                   database.Plugin
 	data                       data.Manager
 	txHelper                   txcommon.Helper
@@ -114,10 +120,10 @@ type batchManager struct {
 	startupOffsetRetryAttempts int
 }
 
-type DispatchHandler func(context.Context, *DispatchState) error
+type DispatchHandler func(context.Context, *DispatchPayload) error
 
 type DispatcherOptions struct {
-	BatchType      fftypes.BatchType
+	BatchType      core.BatchType
 	BatchMaxSize   uint
 	BatchMaxBytes  int64
 	BatchTimeout   time.Duration
@@ -131,15 +137,15 @@ type dispatcher struct {
 	options    DispatcherOptions
 }
 
-func (bm *batchManager) getProcessorKey(namespace string, identity *fftypes.SignerRef, groupID *fftypes.Bytes32) string {
-	return fmt.Sprintf("%s|%s|%v", namespace, identity.Author, groupID)
+func (bm *batchManager) getProcessorKey(identity *core.SignerRef, groupID *fftypes.Bytes32) string {
+	return fmt.Sprintf("%s|%s|%v", identity.Author, identity.Key, groupID)
 }
 
-func (bm *batchManager) getDispatcherKey(txType fftypes.TransactionType, msgType fftypes.MessageType) string {
+func (bm *batchManager) getDispatcherKey(txType core.TransactionType, msgType core.MessageType) string {
 	return fmt.Sprintf("tx:%s/%s", txType, msgType)
 }
 
-func (bm *batchManager) RegisterDispatcher(name string, txType fftypes.TransactionType, msgTypes []fftypes.MessageType, handler DispatchHandler, options DispatcherOptions) {
+func (bm *batchManager) RegisterDispatcher(name string, txType core.TransactionType, msgTypes []core.MessageType, handler DispatchHandler, options DispatcherOptions) {
 	bm.dispatcherMux.Lock()
 	defer bm.dispatcherMux.Unlock()
 
@@ -166,7 +172,7 @@ func (bm *batchManager) NewMessages() chan<- int64 {
 	return bm.newMessages
 }
 
-func (bm *batchManager) getProcessor(txType fftypes.TransactionType, msgType fftypes.MessageType, group *fftypes.Bytes32, namespace string, signer *fftypes.SignerRef) (*batchProcessor, error) {
+func (bm *batchManager) getProcessor(txType core.TransactionType, msgType core.MessageType, group *fftypes.Bytes32, signer *core.SignerRef) (*batchProcessor, error) {
 	bm.dispatcherMux.Lock()
 	defer bm.dispatcherMux.Unlock()
 
@@ -175,7 +181,7 @@ func (bm *batchManager) getProcessor(txType fftypes.TransactionType, msgType fft
 	if !ok {
 		return nil, i18n.NewError(bm.ctx, coremsgs.MsgUnregisteredBatchType, dispatcherKey)
 	}
-	name := bm.getProcessorKey(namespace, signer, group)
+	name := bm.getProcessorKey(signer, group)
 	processor, ok := dispatcher.processors[name]
 	if !ok {
 		processor = newBatchProcessor(
@@ -185,7 +191,6 @@ func (bm *batchManager) getProcessor(txType fftypes.TransactionType, msgType fft
 				name:              name,
 				txType:            txType,
 				dispatcherName:    dispatcher.name,
-				namespace:         namespace,
 				signer:            *signer,
 				group:             group,
 				dispatch:          dispatcher.handler,
@@ -199,7 +204,7 @@ func (bm *batchManager) getProcessor(txType fftypes.TransactionType, msgType fft
 	return processor, nil
 }
 
-func (bm *batchManager) assembleMessageData(id *fftypes.UUID) (msg *fftypes.Message, retData fftypes.DataArray, err error) {
+func (bm *batchManager) assembleMessageData(id *fftypes.UUID) (msg *core.Message, retData core.DataArray, err error) {
 	var foundAll = false
 	err = bm.retry.Do(bm.ctx, "retrieve message", func(attempt int) (retry bool, err error) {
 		msg, retData, foundAll, err = bm.data.GetMessageWithDataCached(bm.ctx, id)
@@ -226,11 +231,11 @@ func (bm *batchManager) popRewind() {
 }
 
 // filterFlushed is called after we read a page, to remove in-flight IDs, and clean up our flush map
-func (bm *batchManager) filterFlushed(entries []*fftypes.IDAndSequence) []*fftypes.IDAndSequence {
+func (bm *batchManager) filterFlushed(entries []*core.IDAndSequence) []*core.IDAndSequence {
 	bm.inflightMux.Lock()
 
 	// Remove inflight entries
-	unflushedEntries := make([]*fftypes.IDAndSequence, 0, len(entries))
+	unflushedEntries := make([]*core.IDAndSequence, 0, len(entries))
 	for _, entry := range entries {
 		if _, inflight := bm.inflightSequences[entry.Sequence]; !inflight {
 			unflushedEntries = append(unflushedEntries, entry)
@@ -257,7 +262,7 @@ func (bm *batchManager) notifyFlushed(sequences []int64) {
 	bm.inflightMux.Unlock()
 }
 
-func (bm *batchManager) readPage(lastPageFull bool) ([]*fftypes.IDAndSequence, bool, error) {
+func (bm *batchManager) readPage(lastPageFull bool) ([]*core.IDAndSequence, bool, error) {
 
 	// Pop out any rewind that has been queued, but each time we read to the front before we rewind
 	if !lastPageFull {
@@ -265,12 +270,12 @@ func (bm *batchManager) readPage(lastPageFull bool) ([]*fftypes.IDAndSequence, b
 	}
 
 	// Read a page from the DB
-	var ids []*fftypes.IDAndSequence
+	var ids []*core.IDAndSequence
 	err := bm.retry.Do(bm.ctx, "retrieve messages", func(attempt int) (retry bool, err error) {
 		fb := database.MessageQueryFactory.NewFilterLimit(bm.ctx, bm.readPageSize)
-		ids, err = bm.database.GetMessageIDs(bm.ctx, fb.And(
+		ids, err = bm.database.GetMessageIDs(bm.ctx, bm.namespace, fb.And(
 			fb.Gt("sequence", bm.readOffset),
-			fb.Eq("state", fftypes.MessageStateReady),
+			fb.Eq("state", core.MessageStateReady),
 		).Sort("sequence").Limit(bm.readPageSize))
 		return true, err
 	})
@@ -315,7 +320,7 @@ func (bm *batchManager) messageSequencer() {
 				// the database store. Meaning we cannot rely on the sequence having been set.
 				msg.Sequence = entry.Sequence
 
-				processor, err := bm.getProcessor(msg.Header.TxType, msg.Header.Type, msg.Header.Group, msg.Header.Namespace, &msg.Header.SignerRef)
+				processor, err := bm.getProcessor(msg.Header.TxType, msg.Header.Type, msg.Header.Group, &msg.Header.SignerRef)
 				if err != nil {
 					l.Errorf("Failed to dispatch message %s: %s", msg.Header.ID, err)
 					continue
@@ -393,7 +398,7 @@ func (bm *batchManager) waitForNewMessages() (done bool) {
 	}
 }
 
-func (bm *batchManager) dispatchMessage(processor *batchProcessor, msg *fftypes.Message, data fftypes.DataArray) {
+func (bm *batchManager) dispatchMessage(processor *batchProcessor, msg *core.Message, data core.DataArray) {
 	l := log.L(bm.ctx)
 	l.Debugf("Dispatching message %s (seq=%d) to %s batch processor %s", msg.Header.ID, msg.Sequence, msg.Header.Type, processor.conf.name)
 
@@ -468,4 +473,118 @@ func (bm *batchManager) WaitStop() {
 	for _, p := range processors {
 		<-p.done
 	}
+}
+
+func (bm *batchManager) getNextNonce(ctx context.Context, state *dispatchState, nonceKeyHash *fftypes.Bytes32, contextHash *fftypes.Bytes32) (int64, error) {
+
+	// See if the nonceKeyHash is in our cached state already
+	if cached, ok := state.noncesAssigned[*nonceKeyHash]; ok {
+		cached.latest++
+		return cached.latest, nil
+	}
+
+	// Query the database for an existing record
+	dbNonce, err := bm.database.GetNonce(ctx, nonceKeyHash)
+	if err != nil {
+		return -1, err
+	}
+	if dbNonce == nil {
+		// For migration we need to query the base contextHash the first time we pass through this for a v0.14.1 or earlier migration
+		if dbNonce, err = bm.database.GetNonce(ctx, contextHash); err != nil {
+			return -1, err
+		}
+	}
+
+	// Determine if we're the first - so get nonce zero - or if we need to add one to the DB nonce
+	nonceState := &nonceState{}
+	if dbNonce == nil {
+		nonceState.new = true
+	} else {
+		nonceState.latest = dbNonce.Nonce + 1
+	}
+
+	// Cache it either way for additional messages in this batch to the same nonceKeyHash
+	state.noncesAssigned[*nonceKeyHash] = nonceState
+	return nonceState.latest, nil
+}
+
+func (bm *batchManager) maskContext(ctx context.Context, state *dispatchState, msg *core.Message, topic string) (msgPinString string, contextOrPin *fftypes.Bytes32, err error) {
+
+	hashBuilder := sha256.New()
+	hashBuilder.Write([]byte(topic))
+
+	// For broadcast we do not need to mask the context, which is just the hash
+	// of the topic. There would be no way to unmask it if we did, because we don't have
+	// the full list of senders to know what their next hashes should be.
+	if msg.Header.Group == nil {
+		return "", fftypes.HashResult(hashBuilder), nil
+	}
+
+	// For private groups, we need to make the topic specific to the group (which is
+	// a salt for the hash as it is not on chain)
+	hashBuilder.Write((*msg.Header.Group)[:])
+
+	// The combination of the topic and group is the context
+	contextHash := fftypes.HashResult(hashBuilder)
+
+	// Now combine our sending identity, and this nonce, to produce the hash that should
+	// be expected by all members of the group as the next nonce from us on this topic.
+	// Note we use our identity DID (not signing key) for this.
+	hashBuilder.Write([]byte(msg.Header.Author))
+
+	// Our DB of nonces we own, is keyed off of the hash at this point.
+	// However, before v0.14.2 we didn't include the Author - so we need to pass the contextHash as a fallback.
+	nonceKeyHash := fftypes.HashResult(hashBuilder)
+	nonce, err := bm.getNextNonce(ctx, state, nonceKeyHash, contextHash)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Now we have the nonce, add that at the end of the hash to make it unqiue to this message
+	nonceBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(nonceBytes, uint64(nonce))
+	hashBuilder.Write(nonceBytes)
+
+	pin := fftypes.HashResult(hashBuilder)
+	pinStr := fmt.Sprintf("%s:%.16d", pin, nonce)
+	log.L(ctx).Debugf("Assigned pin '%s' to message %s for topic '%s'", pinStr, msg.Header.ID, topic)
+	return pinStr, pin, err
+}
+
+func (bm *batchManager) loadContext(ctx context.Context, msg *core.Message) ([]*fftypes.Bytes32, error) {
+	pins := make([]*fftypes.Bytes32, 0)
+	isPrivate := msg.Header.Group != nil
+	if isPrivate {
+		if len(msg.Pins) == 0 {
+			return nil, i18n.NewError(ctx, coremsgs.MsgPinsNotAssigned)
+		}
+		for _, pinStr := range msg.Pins {
+			pin, err := fftypes.ParseBytes32(ctx, pinStr)
+			if err != nil {
+				return nil, err
+			}
+			pins = append(pins, pin)
+		}
+		return pins, nil
+	}
+
+	for _, topic := range msg.Header.Topics {
+		_, context, _ := bm.maskContext(ctx, nil, msg, topic) // no error checking (cannot fail)
+		pins = append(pins, context)
+	}
+	return pins, nil
+}
+
+// Reconstruct the contexts/pins that were assigned to this batch payload
+// Fails if pins have not been calculated
+func (bm *batchManager) LoadContexts(ctx context.Context, payload *DispatchPayload) error {
+	payload.Pins = make([]*fftypes.Bytes32, 0)
+	for _, msg := range payload.Messages {
+		pins, err := bm.loadContext(ctx, msg)
+		if err != nil {
+			return err
+		}
+		payload.Pins = append(payload.Pins, pins...)
+	}
+	return nil
 }

@@ -1,8 +1,8 @@
 ---
 layout: default
 title: Listen for events
-parent: Tutorials
-nav_order: 6
+parent: pages.tutorials
+nav_order: 5
 ---
 
 # Listen for events
@@ -36,7 +36,7 @@ We focus on WebSockets in this getting started guide.
 
 ## Additional info
 
-- Key Concepts: [Multi-party process flow](/firefly/keyconcepts/multiparty_process_flow.html)
+- Key Concepts: [Multi-party process flow](../overview/multiparty/multiparty_flow.html)
 - Reference: _coming soon_
 
 ## WebSockets Example 1: Ephemeral subscription with auto-commit
@@ -134,7 +134,7 @@ it received):
 { "type": "ack", "id": "617db63-2cf5-4fa3-8320-46150cbb5372" }
 ```
 
-> _You must send an acknowledgement for every message, or you will stop receiving messages.
+> _You must send an acknowledgement for every message, or you will stop receiving messages_.
 
 ### Set up the WebSocket subscription
 
@@ -180,3 +180,7 @@ Example connection URL:
 - `namespace=default` - event listeners are scoped to a namespace
 - `name=app1` - the subscription name
 
+
+## Custom Contract Events
+
+If you are interested in learning more about events for custom smart contracts, please see the [Working with custom smart contracts](./custom_contracts/index.md) section.

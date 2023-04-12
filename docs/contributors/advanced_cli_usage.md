@@ -1,7 +1,7 @@
 ---
-layout: default
-title: Advanced CLI Usage
-parent: Contributors
+layout: i18n_page
+title: pages.advanced_cli_usage
+parent: pages.contributors
 nav_order: 5
 ---
 
@@ -108,19 +108,7 @@ You may have noticed that FireFly core is actually not listed in the `manifest.j
 From the firefly project directory, build and tag a new Docker image:
 
 ```
-docker build -t ghcr.io/hyperledger/firefly .
-```
-
-## Edit your `manifest.json` file
-Next, edit the `fabconnect` section of the `manifest.json` file and add the following section:
-
-```json
-...
-  "firefly": {
-    "image": "ghcr.io/hyperledger/firefly",
-    "local": true
-  },
-...
+make docker
 ```
 
 ### Initialize the stack with the custom `manifest.json` file

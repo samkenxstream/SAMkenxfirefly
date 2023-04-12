@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -18,17 +18,21 @@ package fabric
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/hyperledger/firefly-common/pkg/ffresty"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/ffresty"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 )
 
 type streamManager struct {
 	client *resty.Client
 	signer string
+	cache  cache.CInterface
 }
 
 type eventStream struct {
@@ -57,6 +61,14 @@ type eventFilter struct {
 	EventFilter string `json:"eventFilter"`
 }
 
+func newStreamManager(client *resty.Client, signer string, cache cache.CInterface) *streamManager {
+	return &streamManager{
+		client: client,
+		signer: signer,
+		cache:  cache,
+	}
+}
+
 func (s *streamManager) getEventStreams(ctx context.Context) (streams []*eventStream, err error) {
 	res, err := s.client.R().
 		SetContext(ctx).
@@ -68,25 +80,31 @@ func (s *streamManager) getEventStreams(ctx context.Context) (streams []*eventSt
 	return streams, nil
 }
 
-func (s *streamManager) createEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
-	stream := eventStream{
+func buildEventStream(topic string, batchSize, batchTimeout uint) *eventStream {
+	return &eventStream{
 		Name:           topic,
 		ErrorHandling:  "block",
 		BatchSize:      batchSize,
 		BatchTimeoutMS: batchTimeout,
 		Type:           "websocket",
-		WebSocket:      eventStreamWebsocket{Topic: topic},
-		Timestamps:     true,
+		// Some implementations require a "topic" to be set separately, while others rely only on the name.
+		// We set them to the same thing for cross compatibility.
+		WebSocket:  eventStreamWebsocket{Topic: topic},
+		Timestamps: true,
 	}
+}
+
+func (s *streamManager) createEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
+	stream := buildEventStream(topic, batchSize, batchTimeout)
 	res, err := s.client.R().
 		SetContext(ctx).
-		SetBody(&stream).
-		SetResult(&stream).
+		SetBody(stream).
+		SetResult(stream).
 		Post("/eventstreams")
 	if err != nil || !res.IsSuccess() {
 		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgFabconnectRESTErr)
 	}
-	return &stream, nil
+	return stream, nil
 }
 
 func (s *streamManager) ensureEventStream(ctx context.Context, topic string, batchSize, batchTimeout uint) (*eventStream, error) {
@@ -95,7 +113,7 @@ func (s *streamManager) ensureEventStream(ctx context.Context, topic string, bat
 		return nil, err
 	}
 	for _, stream := range existingStreams {
-		if stream.WebSocket.Topic == topic {
+		if stream.Name == topic {
 			return stream, nil
 		}
 	}
@@ -113,10 +131,33 @@ func (s *streamManager) getSubscriptions(ctx context.Context) (subs []*subscript
 	return subs, nil
 }
 
-func (s *streamManager) createSubscription(ctx context.Context, location *Location, stream, name, event, fromBlock string) (*subscription, error) {
+func (s *streamManager) getSubscription(ctx context.Context, subID string) (sub *subscription, err error) {
+	res, err := s.client.R().
+		SetContext(ctx).
+		SetResult(&sub).
+		Get(fmt.Sprintf("/subscriptions/%s", subID))
+	if err != nil || !res.IsSuccess() {
+		return nil, ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgFabconnectRESTErr)
+	}
+	return sub, nil
+}
+
+func (s *streamManager) getSubscriptionName(ctx context.Context, subID string) (string, error) {
+	if cachedValue := s.cache.GetString("sub:" + subID); cachedValue != "" {
+		return cachedValue, nil
+	}
+	sub, err := s.getSubscription(ctx, subID)
+	if err != nil {
+		return "", err
+	}
+	s.cache.SetString("sub:"+subID, sub.Name)
+	return sub.Name, nil
+}
+
+func (s *streamManager) createSubscription(ctx context.Context, location *Location, stream, name, event, firstEvent string) (*subscription, error) {
 	// Map FireFly "firstEvent" values to Fabric "fromBlock" values
-	if fromBlock == string(fftypes.SubOptsFirstEventOldest) {
-		fromBlock = "0"
+	if firstEvent == string(core.SubOptsFirstEventOldest) {
+		firstEvent = "0"
 	}
 	sub := subscription{
 		Name:    name,
@@ -124,11 +165,15 @@ func (s *streamManager) createSubscription(ctx context.Context, location *Locati
 		Signer:  s.signer,
 		Stream:  stream,
 		Filter: eventFilter{
-			ChaincodeID: location.Chaincode,
 			EventFilter: event,
 		},
-		FromBlock: fromBlock,
+		FromBlock: firstEvent,
 	}
+
+	if location.Chaincode != "" {
+		sub.Filter.ChaincodeID = location.Chaincode
+	}
+
 	res, err := s.client.R().
 		SetContext(ctx).
 		SetBody(&sub).
@@ -140,35 +185,51 @@ func (s *streamManager) createSubscription(ctx context.Context, location *Locati
 	return &sub, nil
 }
 
-func (s *streamManager) deleteSubscription(ctx context.Context, subID string) error {
+func (s *streamManager) deleteSubscription(ctx context.Context, subID string, okNotFound bool) error {
 	res, err := s.client.R().
 		SetContext(ctx).
 		Delete("/subscriptions/" + subID)
 	if err != nil || !res.IsSuccess() {
+		if okNotFound && res.StatusCode() == 404 {
+			return nil
+		}
 		return ffresty.WrapRestErr(ctx, res, err, coremsgs.MsgFabconnectRESTErr)
 	}
 	return nil
 }
 
-func (s *streamManager) ensureSubscription(ctx context.Context, location *Location, stream, event string) (sub *subscription, err error) {
+func (s *streamManager) ensureFireFlySubscription(ctx context.Context, namespace string, version int, location *Location, firstEvent, stream, event string) (sub *subscription, err error) {
 	existingSubs, err := s.getSubscriptions(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	subName := event
+	v1Name := event
+	v2Name := fmt.Sprintf("%s_%s", namespace, event)
+
 	for _, s := range existingSubs {
-		if s.Stream == stream && s.Name == subName {
-			sub = s
+		if s.Stream == stream {
+			if version == 1 {
+				if s.Name == v1Name {
+					return s, nil
+				}
+			} else {
+				if s.Name == v1Name {
+					return nil, i18n.NewError(ctx, coremsgs.MsgInvalidSubscriptionForNetwork, s.Name, version)
+				} else if s.Name == v2Name {
+					return s, nil
+				}
+			}
 		}
 	}
 
-	if sub == nil {
-		if sub, err = s.createSubscription(ctx, location, stream, subName, event, string(fftypes.SubOptsFirstEventOldest)); err != nil {
-			return nil, err
-		}
+	name := v2Name
+	if version == 1 {
+		name = v1Name
 	}
-
+	if sub, err = s.createSubscription(ctx, location, stream, name, event, firstEvent); err != nil {
+		return nil, err
+	}
 	log.L(ctx).Infof("%s subscription: %s", event, sub.ID)
 	return sub, nil
 }

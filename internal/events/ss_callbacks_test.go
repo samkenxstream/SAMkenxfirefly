@@ -1,4 +1,4 @@
-// Copyright © 2021 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,83 +21,98 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/hyperledger/firefly/mocks/databasemocks"
-	"github.com/hyperledger/firefly/mocks/datamocks"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
 	"github.com/hyperledger/firefly/mocks/sharedstoragemocks"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
 
 func TestSharedStorageBatchDownloadedOk(t *testing.T) {
 
-	em, cancel := newTestEventManager(t)
-	defer cancel()
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
 
-	data := &fftypes.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
-	batch := sampleBatch(t, fftypes.BatchTypeBroadcast, fftypes.TransactionTypeBatchPin, fftypes.DataArray{data})
+	data := &core.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
+	batch := sampleBatch(t, core.BatchTypeBroadcast, core.TransactionTypeBatchPin, core.DataArray{data})
 	b, _ := json.Marshal(&batch)
 
-	mdi := em.database.(*databasemocks.Plugin)
-	mss := em.sharedstorage.(*sharedstoragemocks.Plugin)
-	mdi.On("UpsertBatch", em.ctx, mock.Anything).Return(nil, nil)
-	mdi.On("InsertDataArray", em.ctx, mock.Anything).Return(nil, nil)
-	mdi.On("InsertMessages", em.ctx, mock.Anything, mock.AnythingOfType("database.PostCompletionHook")).Return(nil, nil).Run(func(args mock.Arguments) {
+	mss := &sharedstoragemocks.Plugin{}
+	em.mdi.On("InsertOrGetBatch", em.ctx, mock.Anything).Return(nil, nil)
+	em.mdi.On("InsertDataArray", em.ctx, mock.Anything).Return(nil, nil)
+	em.mdi.On("InsertMessages", em.ctx, mock.Anything, mock.AnythingOfType("database.PostCompletionHook")).Return(nil, nil).Run(func(args mock.Arguments) {
 		args[2].(database.PostCompletionHook)()
 	})
 	mss.On("Name").Return("utdx").Maybe()
-	mdm := em.data.(*datamocks.Manager)
-	mdm.On("UpdateMessageCache", mock.Anything, mock.Anything).Return()
+	em.mdm.On("UpdateMessageCache", mock.Anything, mock.Anything).Return()
 
-	bid, err := em.SharedStorageBatchDownloaded(mss, batch.Namespace, "payload1", b)
+	em.mim.On("GetLocalNode", mock.Anything).Return(testNode, nil)
+
+	bid, err := em.SharedStorageBatchDownloaded(mss, "payload1", b)
 	assert.NoError(t, err)
 	assert.Equal(t, batch.ID, bid)
 
 	brw := <-em.aggregator.rewinder.rewindRequests
 	assert.Equal(t, *batch.ID, brw.uuid)
 
-	mdi.AssertExpectations(t)
 	mss.AssertExpectations(t)
-	mdm.AssertExpectations(t)
 
 }
 
 func TestSharedStorageBatchDownloadedPersistFail(t *testing.T) {
 
-	em, cancel := newTestEventManager(t)
-	cancel()
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
+	em.cancel()
 
-	data := &fftypes.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
-	batch := sampleBatch(t, fftypes.BatchTypeBroadcast, fftypes.TransactionTypeBatchPin, fftypes.DataArray{data})
+	data := &core.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
+	batch := sampleBatch(t, core.BatchTypeBroadcast, core.TransactionTypeBatchPin, core.DataArray{data})
 	b, _ := json.Marshal(&batch)
 
-	mdi := em.database.(*databasemocks.Plugin)
-	mss := em.sharedstorage.(*sharedstoragemocks.Plugin)
-	mdi.On("UpsertBatch", em.ctx, mock.Anything).Return(fmt.Errorf("pop"))
+	mss := &sharedstoragemocks.Plugin{}
+	em.mdi.On("InsertOrGetBatch", em.ctx, mock.Anything).Return(nil, fmt.Errorf("pop"))
 	mss.On("Name").Return("utdx").Maybe()
 
-	_, err := em.SharedStorageBatchDownloaded(mss, batch.Namespace, "payload1", b)
-	assert.Regexp(t, "FF10158", err)
+	_, err := em.SharedStorageBatchDownloaded(mss, "payload1", b)
+	assert.Regexp(t, "FF00154", err)
 
-	mdi.AssertExpectations(t)
 	mss.AssertExpectations(t)
 
 }
 
 func TestSharedStorageBatchDownloadedNSMismatch(t *testing.T) {
 
-	em, cancel := newTestEventManager(t)
-	defer cancel()
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
 
-	data := &fftypes.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
-	batch := sampleBatch(t, fftypes.BatchTypeBroadcast, fftypes.TransactionTypeBatchPin, fftypes.DataArray{data})
+	data := &core.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
+	batch := sampleBatch(t, core.BatchTypeBroadcast, core.TransactionTypeBatchPin, core.DataArray{data})
 	b, _ := json.Marshal(&batch)
 
-	mss := em.sharedstorage.(*sharedstoragemocks.Plugin)
+	mss := &sharedstoragemocks.Plugin{}
 	mss.On("Name").Return("utdx").Maybe()
 
-	_, err := em.SharedStorageBatchDownloaded(mss, "srong", "payload1", b)
+	em.namespace.NetworkName = "ns2"
+	_, err := em.SharedStorageBatchDownloaded(mss, "payload1", b)
+	assert.NoError(t, err)
+
+	mss.AssertExpectations(t)
+
+}
+
+func TestSharedStorageBatchDownloadedNonMultiparty(t *testing.T) {
+
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
+	em.multiparty = nil
+
+	data := &core.Data{ID: fftypes.NewUUID(), Value: fftypes.JSONAnyPtr(`"test"`)}
+	batch := sampleBatch(t, core.BatchTypeBroadcast, core.TransactionTypeBatchPin, core.DataArray{data})
+	b, _ := json.Marshal(&batch)
+
+	mss := &sharedstoragemocks.Plugin{}
+	_, err := em.SharedStorageBatchDownloaded(mss, "payload1", b)
 	assert.NoError(t, err)
 
 	mss.AssertExpectations(t)
@@ -106,13 +121,13 @@ func TestSharedStorageBatchDownloadedNSMismatch(t *testing.T) {
 
 func TestSharedStorageBatchDownloadedBadData(t *testing.T) {
 
-	em, cancel := newTestEventManager(t)
-	defer cancel()
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
 
-	mss := em.sharedstorage.(*sharedstoragemocks.Plugin)
+	mss := &sharedstoragemocks.Plugin{}
 	mss.On("Name").Return("utdx").Maybe()
 
-	_, err := em.SharedStorageBatchDownloaded(mss, "srong", "payload1", []byte("!json"))
+	_, err := em.SharedStorageBatchDownloaded(mss, "payload1", []byte("!json"))
 	assert.NoError(t, err)
 
 	mss.AssertExpectations(t)
@@ -121,22 +136,21 @@ func TestSharedStorageBatchDownloadedBadData(t *testing.T) {
 
 func TestSharedStorageBlobDownloadedOk(t *testing.T) {
 
-	em, cancel := newTestEventManager(t)
-	defer cancel()
+	em := newTestEventManager(t)
+	defer em.cleanup(t)
 
-	mdi := em.database.(*databasemocks.Plugin)
-	mss := em.sharedstorage.(*sharedstoragemocks.Plugin)
+	mss := &sharedstoragemocks.Plugin{}
 	mss.On("Name").Return("utsd")
-	mdi.On("GetBlobs", em.ctx, mock.Anything).Return([]*fftypes.Blob{}, nil, nil)
-	mdi.On("InsertBlobs", em.ctx, mock.Anything).Return(nil, nil)
+	em.mdi.On("GetBlobs", em.ctx, mock.Anything, mock.Anything).Return(nil, nil, nil)
+	em.mdi.On("InsertBlobs", em.ctx, mock.Anything).Return(nil, nil)
 
 	hash := fftypes.NewRandB32()
-	em.SharedStorageBlobDownloaded(mss, *hash, 12345, "payload1")
+	dataID := fftypes.NewUUID()
+	em.SharedStorageBlobDownloaded(mss, *hash, 12345, "payload1", dataID)
 
 	brw := <-em.aggregator.rewinder.rewindRequests
 	assert.Equal(t, rewind{hash: *hash, rewindType: rewindBlob}, brw)
 
-	mdi.AssertExpectations(t)
 	mss.AssertExpectations(t)
 
 }

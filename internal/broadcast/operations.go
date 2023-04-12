@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,25 +21,28 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/internal/operations"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
 )
 
 type uploadBatchData struct {
-	BatchPersisted *fftypes.BatchPersisted `json:"batchPersisted"`
-	Batch          *fftypes.Batch          `json:"batch"`
+	Batch *core.Batch `json:"batch"`
 }
 
 type uploadBlobData struct {
-	Data *fftypes.Data `json:"data"`
-	Blob *fftypes.Blob `json:"batch"`
+	Data *core.Data `json:"data"`
+	Blob *core.Blob `json:"blob"`
 }
 
-func addUploadBatchInputs(op *fftypes.Operation, batchID *fftypes.UUID) {
+type uploadValue struct {
+	Data *core.Data `json:"data"`
+}
+
+func addUploadBatchInputs(op *core.Operation, batchID *fftypes.UUID) {
 	op.Input = fftypes.JSONObject{
 		"id": batchID.String(),
 	}
@@ -51,7 +54,13 @@ func getUploadBatchOutputs(payloadRef string) fftypes.JSONObject {
 	}
 }
 
-func addUploadBlobInputs(op *fftypes.Operation, dataID *fftypes.UUID) {
+func addUploadBlobInputs(op *core.Operation, dataID *fftypes.UUID) {
+	op.Input = fftypes.JSONObject{
+		"dataId": dataID.String(),
+	}
+}
+
+func addUploadValueInputs(op *core.Operation, dataID *fftypes.UUID) {
 	op.Input = fftypes.JSONObject{
 		"dataId": dataID.String(),
 	}
@@ -63,22 +72,26 @@ func getUploadBlobOutputs(payloadRef string) fftypes.JSONObject {
 	}
 }
 
-func retrieveUploadBatchInputs(ctx context.Context, op *fftypes.Operation) (*fftypes.UUID, error) {
+func retrieveUploadBatchInputs(ctx context.Context, op *core.Operation) (*fftypes.UUID, error) {
 	return fftypes.ParseUUID(ctx, op.Input.GetString("id"))
 }
 
-func retrieveUploadBlobInputs(ctx context.Context, op *fftypes.Operation) (*fftypes.UUID, error) {
+func retrieveUploadBlobInputs(ctx context.Context, op *core.Operation) (*fftypes.UUID, error) {
 	return fftypes.ParseUUID(ctx, op.Input.GetString("dataId"))
 }
 
-func (bm *broadcastManager) PrepareOperation(ctx context.Context, op *fftypes.Operation) (*fftypes.PreparedOperation, error) {
+func retrieveUploadValueInputs(ctx context.Context, op *core.Operation) (*fftypes.UUID, error) {
+	return fftypes.ParseUUID(ctx, op.Input.GetString("dataId"))
+}
+
+func (bm *broadcastManager) PrepareOperation(ctx context.Context, op *core.Operation) (*core.PreparedOperation, error) {
 	switch op.Type {
-	case fftypes.OpTypeSharedStorageUploadBatch:
+	case core.OpTypeSharedStorageUploadBatch:
 		id, err := retrieveUploadBatchInputs(ctx, op)
 		if err != nil {
 			return nil, err
 		}
-		bp, err := bm.database.GetBatchByID(ctx, id)
+		bp, err := bm.database.GetBatchByID(ctx, bm.namespace.Name, id)
 		if err != nil {
 			return nil, err
 		} else if bp == nil {
@@ -88,38 +101,53 @@ func (bm *broadcastManager) PrepareOperation(ctx context.Context, op *fftypes.Op
 		if err != nil {
 			return nil, err
 		}
-		return opUploadBatch(op, batch, bp), nil
+		return opUploadBatch(op, batch), nil
 
-	case fftypes.OpTypeSharedStorageUploadBlob:
+	case core.OpTypeSharedStorageUploadBlob:
 		dataID, err := retrieveUploadBlobInputs(ctx, op)
 		if err != nil {
 			return nil, err
 		}
-		d, err := bm.database.GetDataByID(ctx, dataID, false)
+		d, err := bm.database.GetDataByID(ctx, bm.namespace.Name, dataID, false)
 		if err != nil {
 			return nil, err
 		} else if d == nil || d.Blob == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		blob, err := bm.database.GetBlobMatchingHash(ctx, d.Blob.Hash)
+		fb := database.BlobQueryFactory.NewFilter(ctx)
+		blobs, _, err := bm.database.GetBlobs(ctx, bm.namespace.Name, fb.And(fb.Eq("data_id", dataID), fb.Eq("hash", d.Blob.Hash)))
 		if err != nil {
 			return nil, err
-		} else if blob == nil {
+		} else if len(blobs) == 0 || blobs[0] == nil {
 			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
 		}
-		return opUploadBlob(op, d, blob), nil
+		return opUploadBlob(op, d, blobs[0]), nil
 
+	case core.OpTypeSharedStorageUploadValue:
+		dataID, err := retrieveUploadValueInputs(ctx, op)
+		if err != nil {
+			return nil, err
+		}
+		d, err := bm.database.GetDataByID(ctx, bm.namespace.Name, dataID, false)
+		if err != nil {
+			return nil, err
+		} else if d == nil {
+			return nil, i18n.NewError(ctx, coremsgs.Msg404NotFound)
+		}
+		return opUploadValue(op, d), nil
 	default:
 		return nil, i18n.NewError(ctx, coremsgs.MsgOperationNotSupported, op.Type)
 	}
 }
 
-func (bm *broadcastManager) RunOperation(ctx context.Context, op *fftypes.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error) {
+func (bm *broadcastManager) RunOperation(ctx context.Context, op *core.PreparedOperation) (outputs fftypes.JSONObject, complete bool, err error) {
 	switch data := op.Data.(type) {
 	case uploadBatchData:
 		return bm.uploadBatch(ctx, data)
 	case uploadBlobData:
 		return bm.uploadBlob(ctx, data)
+	case uploadValue:
+		return bm.uploadValue(ctx, data)
 	default:
 		return nil, false, i18n.NewError(ctx, coremsgs.MsgOperationDataIncorrect, op.Data)
 	}
@@ -128,6 +156,7 @@ func (bm *broadcastManager) RunOperation(ctx context.Context, op *fftypes.Prepar
 // uploadBatch uploads the serialized batch to public storage
 func (bm *broadcastManager) uploadBatch(ctx context.Context, data uploadBatchData) (outputs fftypes.JSONObject, complete bool, err error) {
 	// Serialize the full payload, which has already been sealed for us by the BatchManager
+	data.Batch.Namespace = bm.namespace.NetworkName
 	payload, err := json.Marshal(data.Batch)
 	if err != nil {
 		return nil, false, i18n.WrapError(ctx, err, coremsgs.MsgSerializationFailed)
@@ -159,7 +188,7 @@ func (bm *broadcastManager) uploadBlob(ctx context.Context, data uploadBlobData)
 	}
 
 	// Update the data in the DB
-	err = bm.database.UpdateData(ctx, data.Data.ID, database.DataQueryFactory.NewUpdate(ctx).Set("blob.public", data.Data.Blob.Public))
+	err = bm.database.UpdateData(ctx, bm.namespace.Name, data.Data.ID, database.DataQueryFactory.NewUpdate(ctx).Set("blob.public", data.Data.Blob.Public))
 	if err != nil {
 		return nil, false, err
 	}
@@ -168,22 +197,55 @@ func (bm *broadcastManager) uploadBlob(ctx context.Context, data uploadBlobData)
 	return getUploadBlobOutputs(data.Data.Blob.Public), true, nil
 }
 
-func (bm *broadcastManager) OnOperationUpdate(ctx context.Context, op *fftypes.Operation, update *operations.OperationUpdate) error {
+// uploadValue streams the value JSON from a data record to public storage
+func (bm *broadcastManager) uploadValue(ctx context.Context, data uploadValue) (outputs fftypes.JSONObject, complete bool, err error) {
+
+	// Upload to shared storage
+	data.Data.Public, err = bm.sharedstorage.UploadData(ctx, bytes.NewReader(data.Data.Value.Bytes()))
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Update the public reference for the data in the DB
+	err = bm.database.UpdateData(ctx, bm.namespace.Name, data.Data.ID, database.DataQueryFactory.NewUpdate(ctx).Set("public", data.Data.Public))
+	if err != nil {
+		return nil, false, err
+	}
+
+	log.L(ctx).Infof("Published value for data '%s' to shared storage: '%s'", data.Data.ID, data.Data.Public)
+	return getUploadBlobOutputs(data.Data.Public), true, nil
+}
+
+func (bm *broadcastManager) OnOperationUpdate(ctx context.Context, op *core.Operation, update *core.OperationUpdate) error {
 	return nil
 }
 
-func opUploadBatch(op *fftypes.Operation, batch *fftypes.Batch, batchPersisted *fftypes.BatchPersisted) *fftypes.PreparedOperation {
-	return &fftypes.PreparedOperation{
-		ID:   op.ID,
-		Type: op.Type,
-		Data: uploadBatchData{Batch: batch, BatchPersisted: batchPersisted},
+func opUploadBatch(op *core.Operation, batch *core.Batch) *core.PreparedOperation {
+	return &core.PreparedOperation{
+		ID:        op.ID,
+		Namespace: op.Namespace,
+		Plugin:    op.Plugin,
+		Type:      op.Type,
+		Data:      uploadBatchData{Batch: batch},
 	}
 }
 
-func opUploadBlob(op *fftypes.Operation, data *fftypes.Data, blob *fftypes.Blob) *fftypes.PreparedOperation {
-	return &fftypes.PreparedOperation{
-		ID:   op.ID,
-		Type: op.Type,
-		Data: uploadBlobData{Data: data, Blob: blob},
+func opUploadBlob(op *core.Operation, data *core.Data, blob *core.Blob) *core.PreparedOperation {
+	return &core.PreparedOperation{
+		ID:        op.ID,
+		Namespace: op.Namespace,
+		Plugin:    op.Plugin,
+		Type:      op.Type,
+		Data:      uploadBlobData{Data: data, Blob: blob},
+	}
+}
+
+func opUploadValue(op *core.Operation, data *core.Data) *core.PreparedOperation {
+	return &core.PreparedOperation{
+		ID:        op.ID,
+		Namespace: op.Namespace,
+		Plugin:    op.Plugin,
+		Type:      op.Type,
+		Data:      uploadValue{Data: data},
 	}
 }

@@ -27,10 +27,12 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
 	"github.com/hyperledger/firefly/mocks/databasemocks"
 	"github.com/hyperledger/firefly/mocks/dataexchangemocks"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -68,17 +70,29 @@ func TestUploadBlobOk(t *testing.T) {
 		dxUpload.ReturnArguments = mock.Arguments{fmt.Sprintf("ns1/%s", uuid), &hash, int64(len(b)), err}
 	}
 
-	data, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: bytes.NewReader(b)}, false)
+	data, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader(b)}, false)
 	assert.NoError(t, err)
 
 	// Check the hashes and other details of the data
 	assert.Equal(t, [32]byte(sha256.Sum256(b)), [32]byte(*data.Hash))
 	assert.Equal(t, <-dxID, *data.ID)
-	assert.Equal(t, fftypes.ValidatorTypeJSON, data.Validator)
+	assert.Equal(t, core.ValidatorTypeJSON, data.Validator)
 	assert.Nil(t, data.Datatype)
 
 	mdi.AssertExpectations(t)
 	mdx.AssertExpectations(t)
+
+}
+
+func TestUploadBlobDisabled(t *testing.T) {
+
+	dm, ctx, cancel := newTestDataManager(t)
+	defer cancel()
+	dm.exchange = nil
+
+	b := make([]byte, 10)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader(b)}, false)
+	assert.Regexp(t, "FF10414", err)
 
 }
 
@@ -109,9 +123,9 @@ func TestUploadBlobAutoMetaOk(t *testing.T) {
 		dxUpload.ReturnArguments = mock.Arguments{fmt.Sprintf("ns1/%s", uuid), &hash, int64(len(readBytes)), err}
 	}
 
-	data, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{
+	data, err := dm.UploadBlob(ctx, &core.DataRefOrValue{
 		Value: fftypes.JSONAnyPtr(`{"custom": "value1"}`),
-	}, &fftypes.Multipart{
+	}, &ffapi.Multipart{
 		Data:     bytes.NewReader([]byte(`hello`)),
 		Filename: "myfile.csv",
 		Mimetype: "text/csv",
@@ -144,10 +158,10 @@ func TestUploadBlobBadValidator(t *testing.T) {
 		dxUpload.ReturnArguments = mock.Arguments{fmt.Sprintf("ns1/%s", uuid), &hash, int64(len(readBytes)), err}
 	}
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{
 		Value:     fftypes.JSONAnyPtr(`{"custom": "value1"}`),
 		Validator: "wrong",
-	}, &fftypes.Multipart{
+	}, &ffapi.Multipart{
 		Data:     bytes.NewReader([]byte(`hello`)),
 		Filename: "myfile.csv",
 		Mimetype: "text/csv",
@@ -170,7 +184,7 @@ func TestUploadBlobReadFail(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: iotest.ErrReader(fmt.Errorf("pop"))}, false)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: iotest.ErrReader(fmt.Errorf("pop"))}, false)
 	assert.Regexp(t, "FF10217.*pop", err)
 
 }
@@ -183,7 +197,7 @@ func TestUploadBlobWriteFailDoesNotRead(t *testing.T) {
 	mdx := dm.exchange.(*dataexchangemocks.Plugin)
 	mdx.On("UploadBlob", ctx, "ns1", mock.Anything, mock.Anything).Return("", nil, int64(0), fmt.Errorf("pop"))
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: bytes.NewReader([]byte(`any old data`))}, false)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader([]byte(`any old data`))}, false)
 	assert.Regexp(t, "pop", err)
 
 }
@@ -201,7 +215,7 @@ func TestUploadBlobHashMismatchCalculated(t *testing.T) {
 		assert.Nil(t, err)
 	}
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: bytes.NewReader([]byte(b))}, false)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader([]byte(b))}, false)
 	assert.Regexp(t, "FF10238", err)
 
 }
@@ -220,7 +234,7 @@ func TestUploadBlobSizeMismatch(t *testing.T) {
 		assert.Nil(t, err)
 	}
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: bytes.NewReader([]byte(b))}, false)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader([]byte(b))}, false)
 	assert.Regexp(t, "FF10323", err)
 
 }
@@ -241,7 +255,7 @@ func TestUploadBlobUpsertFail(t *testing.T) {
 	mdi := dm.database.(*databasemocks.Plugin)
 	mdi.On("RunAsGroup", mock.Anything, mock.Anything).Return(fmt.Errorf("pop"))
 
-	_, err := dm.UploadBlob(ctx, "ns1", &fftypes.DataRefOrValue{}, &fftypes.Multipart{Data: bytes.NewReader([]byte(b))}, false)
+	_, err := dm.UploadBlob(ctx, &core.DataRefOrValue{}, &ffapi.Multipart{Data: bytes.NewReader([]byte(b))}, false)
 	assert.Regexp(t, "pop", err)
 
 }
@@ -255,29 +269,40 @@ func TestDownloadBlobOk(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(&fftypes.Data{
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(&core.Data{
 		ID:        dataID,
 		Namespace: "ns1",
-		Blob: &fftypes.BlobRef{
+		Blob: &core.BlobRef{
 			Hash: blobHash,
 		},
 	}, nil)
-	mdi.On("GetBlobMatchingHash", ctx, blobHash).Return(&fftypes.Blob{
+	mdi.On("GetBlobs", ctx, "ns1", mock.Anything).Return([]*core.Blob{{
 		Hash:       blobHash,
 		PayloadRef: "ns1/blob1",
-	}, nil)
+	}}, nil, nil)
 
 	mdx := dm.exchange.(*dataexchangemocks.Plugin)
 	mdx.On("DownloadBlob", ctx, "ns1/blob1").Return(
 		ioutil.NopCloser(bytes.NewReader([]byte("some blob"))),
 		nil)
 
-	blob, reader, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	blob, reader, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.NoError(t, err)
 	assert.Equal(t, blobHash.String(), blob.Hash.String())
 	b, err := ioutil.ReadAll(reader)
 	reader.Close()
 	assert.Equal(t, "some blob", string(b))
+
+}
+
+func TestDownloadBlobDisabled(t *testing.T) {
+
+	dm, ctx, cancel := newTestDataManager(t)
+	defer cancel()
+	dm.exchange = nil
+
+	_, _, err := dm.DownloadBlob(ctx, "")
+	assert.Regexp(t, "FF10414", err)
 
 }
 
@@ -290,16 +315,16 @@ func TestDownloadBlobNotFound(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(&fftypes.Data{
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(&core.Data{
 		ID:        dataID,
 		Namespace: "ns1",
-		Blob: &fftypes.BlobRef{
+		Blob: &core.BlobRef{
 			Hash: blobHash,
 		},
 	}, nil)
-	mdi.On("GetBlobMatchingHash", ctx, blobHash).Return(nil, nil)
+	mdi.On("GetBlobs", ctx, "ns1", mock.Anything).Return(nil, nil, nil)
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	_, _, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.Regexp(t, "FF10239", err)
 
 }
@@ -313,16 +338,16 @@ func TestDownloadBlobLookupErr(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(&fftypes.Data{
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(&core.Data{
 		ID:        dataID,
 		Namespace: "ns1",
-		Blob: &fftypes.BlobRef{
+		Blob: &core.BlobRef{
 			Hash: blobHash,
 		},
 	}, nil)
-	mdi.On("GetBlobMatchingHash", ctx, blobHash).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetBlobs", ctx, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	_, _, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.Regexp(t, "pop", err)
 
 }
@@ -335,18 +360,18 @@ func TestDownloadBlobNoBlob(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(&fftypes.Data{
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(&core.Data{
 		ID:        dataID,
 		Namespace: "ns1",
-		Blob:      &fftypes.BlobRef{},
+		Blob:      &core.BlobRef{},
 	}, nil)
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	_, _, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.Regexp(t, "FF10241", err)
 
 }
 
-func TestDownloadBlobNSMismatch(t *testing.T) {
+func TestDownloadBlobNoData(t *testing.T) {
 
 	dm, ctx, cancel := newTestDataManager(t)
 	defer cancel()
@@ -354,13 +379,9 @@ func TestDownloadBlobNSMismatch(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(&fftypes.Data{
-		ID:        dataID,
-		Namespace: "ns2",
-		Blob:      &fftypes.BlobRef{},
-	}, nil)
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(nil, nil)
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	_, _, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.Regexp(t, "FF10143", err)
 
 }
@@ -373,22 +394,10 @@ func TestDownloadBlobDataLookupErr(t *testing.T) {
 	dataID := fftypes.NewUUID()
 
 	mdi := dm.database.(*databasemocks.Plugin)
-	mdi.On("GetDataByID", ctx, dataID, false).Return(nil, fmt.Errorf("pop"))
+	mdi.On("GetDataByID", ctx, "ns1", dataID, false).Return(nil, fmt.Errorf("pop"))
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", dataID.String())
+	_, _, err := dm.DownloadBlob(ctx, dataID.String())
 	assert.Regexp(t, "pop", err)
-
-}
-
-func TestDownloadBlobBadNS(t *testing.T) {
-
-	dm, ctx, cancel := newTestDataManager(t)
-	defer cancel()
-
-	dataID := fftypes.NewUUID()
-
-	_, _, err := dm.DownloadBlob(ctx, "!wrong", dataID.String())
-	assert.Regexp(t, "FF00140.*namespace", err)
 
 }
 
@@ -397,7 +406,160 @@ func TestDownloadBlobBadID(t *testing.T) {
 	dm, ctx, cancel := newTestDataManager(t)
 	defer cancel()
 
-	_, _, err := dm.DownloadBlob(ctx, "ns1", "!uuid")
+	_, _, err := dm.DownloadBlob(ctx, "!uuid")
 	assert.Regexp(t, "FF00138", err)
 
+}
+
+func TestDeleteBlob(t *testing.T) {
+	dm, ctx, cancel := newTestDataManager(t)
+	mdb := dm.database.(*databasemocks.Plugin)
+	mdx := dm.exchange.(*dataexchangemocks.Plugin)
+
+	defer cancel()
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	mdb.On("GetBlobs", ctx, "ns1", mock.Anything).Return([]*core.Blob{}, &ffapi.FilterResult{}, nil)
+	mdx.On("DeleteBlob", ctx, "payloadref").Return(nil)
+	mdb.On("DeleteBlob", ctx, int64(1)).Return(nil)
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.NoError(t, err)
+	mdb.AssertExpectations(t)
+	mdx.AssertExpectations(t)
+}
+
+func TestDeleteBlobFailDX(t *testing.T) {
+	dm, ctx, cancel := newTestDataManager(t)
+	mdb := dm.database.(*databasemocks.Plugin)
+	mdx := dm.exchange.(*dataexchangemocks.Plugin)
+
+	defer cancel()
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	mdb.On("GetBlobs", ctx, "ns1", mock.Anything).Return([]*core.Blob{}, &ffapi.FilterResult{}, nil)
+	mdx.On("DeleteBlob", ctx, "payloadref").Return(fmt.Errorf("pop"))
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.Equal(t, "pop", err.Error())
+	mdb.AssertExpectations(t)
+	mdx.AssertExpectations(t)
+}
+
+func TestDeleteBlobFailDB(t *testing.T) {
+	dm, ctx, cancel := newTestDataManager(t)
+	mdb := dm.database.(*databasemocks.Plugin)
+	mdx := dm.exchange.(*dataexchangemocks.Plugin)
+
+	defer cancel()
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	mdb.On("GetBlobs", ctx, "ns1", mock.Anything).Return([]*core.Blob{}, &ffapi.FilterResult{}, nil)
+	mdx.On("DeleteBlob", ctx, "payloadref").Return(nil)
+	mdb.On("DeleteBlob", ctx, int64(1)).Return(fmt.Errorf("pop"))
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.Equal(t, "pop", err.Error())
+	mdb.AssertExpectations(t)
+	mdx.AssertExpectations(t)
+}
+
+func TestDeleteBlobDisabled(t *testing.T) {
+
+	dm, ctx, cancel := newTestDataManager(t)
+	defer cancel()
+	dm.exchange = nil
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.Regexp(t, "FF10414", err)
+}
+
+func TestDeleteBlobBackwardCompatibility(t *testing.T) {
+	dm, ctx, cancel := newTestDataManager(t)
+	mdb := dm.database.(*databasemocks.Plugin)
+
+	defer cancel()
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	mdb.On("GetBlobs", ctx, "ns1", mock.Anything).Return([]*core.Blob{{}, {}}, &ffapi.FilterResult{}, nil)
+	mdb.On("DeleteBlob", ctx, int64(1)).Return(nil)
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.NoError(t, err)
+	mdb.AssertExpectations(t)
+}
+
+func TestDeleteBlobBackwardCompatibilityFail(t *testing.T) {
+	dm, ctx, cancel := newTestDataManager(t)
+	mdb := dm.database.(*databasemocks.Plugin)
+
+	defer cancel()
+
+	blob := &core.Blob{
+		Sequence:   1,
+		Namespace:  "ns1",
+		Hash:       fftypes.NewRandB32(),
+		PayloadRef: "payloadref",
+		Created:    fftypes.Now(),
+		Peer:       "peer",
+		Size:       123456,
+		DataID:     fftypes.NewUUID(),
+	}
+
+	mdb.On("GetBlobs", ctx, "ns1", mock.Anything).Return(nil, nil, fmt.Errorf("pop"))
+
+	err := dm.DeleteBlob(ctx, blob)
+	assert.Regexp(t, "pop", err)
+	mdb.AssertExpectations(t)
 }

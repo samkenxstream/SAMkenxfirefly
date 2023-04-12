@@ -1,7 +1,7 @@
 ---
 layout: default
 title: ③ Use the Sandbox
-parent: Getting Started
+parent: pages.getting_started
 nav_order: 3
 ---
 
@@ -26,9 +26,9 @@ Now that you have a full network of three Supernodes running on your machine, le
 ## Video walkthrough
 
 <iframe width="736" height="414" src="https://www.youtube.com/embed/mmY7Vhwu-yk?start=2787" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
-This video is a walkthrough of the FireFly Sandbox and FireFly Explorer from the FireFly 1.0 launch webinar. At this point you should be able to follow along and try all these same things on your own machine. 
+This video is a walkthrough of the FireFly Sandbox and FireFly Explorer from the FireFly 1.0 launch webinar. At this point you should be able to follow along and try all these same things on your own machine.
 
-## What is the FireFly Sandbox?
+<!-- ## What is the FireFly Sandbox?
 
 ![FireFly Sandbox](../images/sandbox/sandbox_broadcast.png)
 
@@ -40,7 +40,7 @@ The FireFly Sandbox sits logically outside the Supernode, and it acts like an "e
 
 The FireFly explorer is a part of FireFly Core itself. It is a view into the system that allows operators to monitor the current state of the system and investigate specific transactions, messages, and events. It is also a great way for developers to see the results of running their code against FireFly's API.
 
-![FireFly Explorer](../images/firefly_explorer.png)
+![FireFly Explorer](../images/firefly_explorer.png) -->
 
 ## Open the FireFly Sandbox for the first member
 
@@ -99,7 +99,7 @@ The Messages tab is where we can send broadcast and private messages to other me
 
 ## Tokens
 
-The Tokens tab is where you can create token pools, and mint, burn, or transfer tokens. This works with both fungible and non-fungible tokens (NFTs). For more details, please see the tutorial on [Minting some tokens](../tutorials/mint_tokens.md).
+The Tokens tab is where you can create token pools, and mint, burn, or transfer tokens. This works with both fungible and non-fungible tokens (NFTs). For more details, please see the [Tokens tutorials](../tutorials/tokens).
 
 ### Things to try out
 
@@ -113,7 +113,7 @@ The Tokens tab is where you can create token pools, and mint, burn, or transfer 
 
 ## Contracts
 
-The Contracts section of the Sandbox lets you interact with custom smart contracts, right from your web browser! The Sandbox also provides some helpful tips on deploying your smart contract to the blockchain. For more details, please see the tutorial on [Working with custom smart contracts](../tutorials/custom_contracts.md).
+The Contracts section of the Sandbox lets you interact with custom smart contracts, right from your web browser! The Sandbox also provides some helpful tips on deploying your smart contract to the blockchain. For more details, please see the tutorial on [Working with custom smart contracts](../tutorials/custom_contracts/index.md).
 
 ![Sandbox Tokens](../images/sandbox/sandbox_contracts_api.png)
 

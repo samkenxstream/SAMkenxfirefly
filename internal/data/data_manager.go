@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,54 +20,54 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/ffapi"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly/internal/cache"
 	"github.com/hyperledger/firefly/internal/coreconfig"
 	"github.com/hyperledger/firefly/internal/coremsgs"
-	"github.com/hyperledger/firefly/pkg/config"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
 	"github.com/hyperledger/firefly/pkg/dataexchange"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
-	"github.com/hyperledger/firefly/pkg/sharedstorage"
-	"github.com/karlseguin/ccache"
 )
 
 type Manager interface {
-	CheckDatatype(ctx context.Context, ns string, datatype *fftypes.Datatype) error
-	ValidateAll(ctx context.Context, data fftypes.DataArray) (valid bool, err error)
-	GetMessageWithDataCached(ctx context.Context, msgID *fftypes.UUID, options ...CacheReadOption) (msg *fftypes.Message, data fftypes.DataArray, foundAllData bool, err error)
-	GetMessageDataCached(ctx context.Context, msg *fftypes.Message, options ...CacheReadOption) (data fftypes.DataArray, foundAll bool, err error)
-	PeekMessageCache(ctx context.Context, id *fftypes.UUID, options ...CacheReadOption) (msg *fftypes.Message, data fftypes.DataArray)
-	UpdateMessageCache(msg *fftypes.Message, data fftypes.DataArray)
-	UpdateMessageIfCached(ctx context.Context, msg *fftypes.Message)
-	UpdateMessageStateIfCached(ctx context.Context, id *fftypes.UUID, state fftypes.MessageState, confirmed *fftypes.FFTime)
+	CheckDatatype(ctx context.Context, datatype *core.Datatype) error
+	ValidateAll(ctx context.Context, data core.DataArray) (valid bool, err error)
+	GetMessageWithDataCached(ctx context.Context, msgID *fftypes.UUID, options ...CacheReadOption) (msg *core.Message, data core.DataArray, foundAllData bool, err error)
+	GetMessageDataCached(ctx context.Context, msg *core.Message, options ...CacheReadOption) (data core.DataArray, foundAll bool, err error)
+	PeekMessageCache(ctx context.Context, id *fftypes.UUID, options ...CacheReadOption) (msg *core.Message, data core.DataArray)
+	UpdateMessageCache(msg *core.Message, data core.DataArray)
+	UpdateMessageIfCached(ctx context.Context, msg *core.Message)
+	UpdateMessageStateIfCached(ctx context.Context, id *fftypes.UUID, state core.MessageState, confirmed *fftypes.FFTime)
 	ResolveInlineData(ctx context.Context, msg *NewMessage) error
 	WriteNewMessage(ctx context.Context, newMsg *NewMessage) error
-	VerifyNamespaceExists(ctx context.Context, ns string) error
+	BlobsEnabled() bool
 
-	UploadJSON(ctx context.Context, ns string, inData *fftypes.DataRefOrValue) (*fftypes.Data, error)
-	UploadBlob(ctx context.Context, ns string, inData *fftypes.DataRefOrValue, blob *fftypes.Multipart, autoMeta bool) (*fftypes.Data, error)
-	DownloadBlob(ctx context.Context, ns, dataID string) (*fftypes.Blob, io.ReadCloser, error)
-	HydrateBatch(ctx context.Context, persistedBatch *fftypes.BatchPersisted) (*fftypes.Batch, error)
+	UploadJSON(ctx context.Context, inData *core.DataRefOrValue) (*core.Data, error)
+	UploadBlob(ctx context.Context, inData *core.DataRefOrValue, blob *ffapi.Multipart, autoMeta bool) (*core.Data, error)
+	DownloadBlob(ctx context.Context, dataID string) (*core.Blob, io.ReadCloser, error)
+	DeleteData(ctx context.Context, dataID string) error
+	HydrateBatch(ctx context.Context, persistedBatch *core.BatchPersisted) (*core.Batch, error)
+	Start()
 	WaitStop()
 }
 
 type dataManager struct {
 	blobStore
-	database          database.Plugin
-	exchange          dataexchange.Plugin
-	validatorCache    *ccache.Cache
-	validatorCacheTTL time.Duration
-	messageCache      *ccache.Cache
-	messageCacheTTL   time.Duration
-	messageWriter     *messageWriter
+	namespace      *core.Namespace
+	database       database.Plugin
+	validatorCache cache.CInterface
+	messageCache   cache.CInterface
+	messageWriter  *messageWriter
 }
 
 type messageCacheEntry struct {
-	msg  *fftypes.Message
-	data []*fftypes.Data
+	msg  *core.Message
+	data []*core.Data
 	size int64
 }
 
@@ -93,103 +93,107 @@ const (
 	CRORequireBatchID
 )
 
-func NewDataManager(ctx context.Context, di database.Plugin, pi sharedstorage.Plugin, dx dataexchange.Plugin) (Manager, error) {
-	if di == nil || pi == nil || dx == nil {
-		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError)
+func NewDataManager(ctx context.Context, ns *core.Namespace, di database.Plugin, dx dataexchange.Plugin, cacheManager cache.Manager) (Manager, error) {
+	if di == nil {
+		return nil, i18n.NewError(ctx, coremsgs.MsgInitializationNilDepError, "DataManager")
 	}
 	dm := &dataManager{
-		database:          di,
-		exchange:          dx,
-		validatorCacheTTL: config.GetDuration(coreconfig.ValidatorCacheTTL),
-		messageCacheTTL:   config.GetDuration(coreconfig.MessageCacheTTL),
+		namespace: ns,
+		database:  di,
 	}
 	dm.blobStore = blobStore{
-		dm:            dm,
-		database:      di,
-		sharedstorage: pi,
-		exchange:      dx,
+		dm:       dm,
+		database: di,
+		exchange: dx,
 	}
-	dm.validatorCache = ccache.New(
-		// We use a LRU cache with a size-aware max
-		ccache.Configure().
-			MaxSize(config.GetByteSize(coreconfig.ValidatorCacheSize)),
+
+	validatorCache, err := cacheManager.GetCache(
+		cache.NewCacheConfig(
+			ctx,
+			coreconfig.CacheValidatorSize,
+			coreconfig.CacheValidatorTTL,
+			ns.Name,
+		),
 	)
-	dm.messageCache = ccache.New(
-		// We use a LRU cache with a size-aware max
-		ccache.Configure().
-			MaxSize(config.GetByteSize(coreconfig.MessageCacheSize)),
+	if err != nil {
+		return nil, err
+	}
+	dm.validatorCache = validatorCache
+
+	messageCache, err := cacheManager.GetCache(
+		cache.NewCacheConfig(
+			ctx,
+			coreconfig.CacheMessageSize,
+			coreconfig.CacheMessageTTL,
+			ns.Name,
+		),
 	)
+	if err != nil {
+		return nil, err
+	}
+	dm.messageCache = messageCache
 	dm.messageWriter = newMessageWriter(ctx, di, &messageWriterConf{
 		workerCount:  config.GetInt(coreconfig.MessageWriterCount),
 		batchTimeout: config.GetDuration(coreconfig.MessageWriterBatchTimeout),
 		maxInserts:   config.GetInt(coreconfig.MessageWriterBatchMaxInserts),
 	})
-	dm.messageWriter.start()
 	return dm, nil
 }
 
-func (dm *dataManager) CheckDatatype(ctx context.Context, ns string, datatype *fftypes.Datatype) error {
-	_, err := newJSONValidator(ctx, ns, datatype)
+func (dm *dataManager) Start() {
+	dm.messageWriter.start()
+}
+
+func (dm *dataManager) BlobsEnabled() bool {
+	return dm.blobStore.exchange != nil
+}
+
+func (dm *dataManager) CheckDatatype(ctx context.Context, datatype *core.Datatype) error {
+	_, err := newJSONValidator(ctx, dm.namespace.Name, datatype)
 	return err
 }
 
-func (dm *dataManager) VerifyNamespaceExists(ctx context.Context, ns string) error {
-	err := fftypes.ValidateFFNameField(ctx, ns, "namespace")
-	if err != nil {
-		return err
-	}
-	namespace, err := dm.database.GetNamespace(ctx, ns)
-	if err != nil {
-		return err
-	}
-	if namespace == nil {
-		return i18n.NewError(ctx, coremsgs.MsgNamespaceNotExist)
-	}
-	return nil
-}
-
 // getValidatorForDatatype only returns database errors - not found (of all kinds) is a nil
-func (dm *dataManager) getValidatorForDatatype(ctx context.Context, ns string, validator fftypes.ValidatorType, datatypeRef *fftypes.DatatypeRef) (Validator, error) {
+func (dm *dataManager) getValidatorForDatatype(ctx context.Context, validator core.ValidatorType, datatypeRef *core.DatatypeRef) (Validator, error) {
 	if validator == "" {
-		validator = fftypes.ValidatorTypeJSON
+		validator = core.ValidatorTypeJSON
 	}
 
-	if ns == "" || datatypeRef == nil || datatypeRef.Name == "" || datatypeRef.Version == "" {
-		log.L(ctx).Warnf("Invalid datatype reference '%s:%s:%s'", validator, ns, datatypeRef)
+	if datatypeRef == nil || datatypeRef.Name == "" || datatypeRef.Version == "" {
+		log.L(ctx).Warnf("Invalid datatype reference '%s:%s:%s'", validator, dm.namespace.Name, datatypeRef)
 		return nil, nil
 	}
 
-	key := fmt.Sprintf("%s:%s:%s", validator, ns, datatypeRef)
-	if cached := dm.validatorCache.Get(key); cached != nil {
-		cached.Extend(dm.validatorCacheTTL)
-		return cached.Value().(Validator), nil
+	key := fmt.Sprintf("%s:%s:%s", validator, dm.namespace.Name, datatypeRef)
+	if cachedValue := dm.validatorCache.Get(key); cachedValue != nil {
+		return cachedValue.(Validator), nil
 	}
 
-	datatype, err := dm.database.GetDatatypeByName(ctx, ns, datatypeRef.Name, datatypeRef.Version)
+	datatype, err := dm.database.GetDatatypeByName(ctx, dm.namespace.Name, datatypeRef.Name, datatypeRef.Version)
 	if err != nil {
 		return nil, err
 	}
 	if datatype == nil {
 		return nil, nil
 	}
-	v, err := newJSONValidator(ctx, ns, datatype)
+	v, err := newJSONValidator(ctx, dm.namespace.Name, datatype)
 	if err != nil {
-		log.L(ctx).Errorf("Invalid validator stored for '%s:%s:%s': %s", validator, ns, datatypeRef, err)
+		log.L(ctx).Errorf("Invalid validator stored for '%s:%s:%s': %s", validator, dm.namespace.Name, datatypeRef, err)
 		return nil, nil
 	}
 
-	dm.validatorCache.Set(key, v, dm.validatorCacheTTL)
+	dm.validatorCache.Set(key, v)
 	return v, err
 }
 
 // GetMessageWithData performs a cached lookup of a message with all of the associated data.
-// - Use this in performance sensitive code, but note mutable fields like the status of the
-//   message CANNOT be relied upon (due to the caching).
-func (dm *dataManager) GetMessageWithDataCached(ctx context.Context, msgID *fftypes.UUID, options ...CacheReadOption) (msg *fftypes.Message, data fftypes.DataArray, foundAllData bool, err error) {
+//   - Use this in performance sensitive code, but note mutable fields like the status of the
+//     message CANNOT be relied upon (due to the caching).
+func (dm *dataManager) GetMessageWithDataCached(ctx context.Context, msgID *fftypes.UUID, options ...CacheReadOption) (msg *core.Message, data core.DataArray, foundAllData bool, err error) {
 	if mce := dm.queryMessageCache(ctx, msgID, options...); mce != nil {
 		return mce.msg, mce.data, true, nil
 	}
-	msg, err = dm.database.GetMessageByID(ctx, msgID)
+	msg, err = dm.database.GetMessageByID(ctx, dm.namespace.Name, msgID)
 	if err != nil || msg == nil {
 		return nil, nil, false, err
 	}
@@ -200,7 +204,7 @@ func (dm *dataManager) GetMessageWithDataCached(ctx context.Context, msgID *ffty
 // GetMessageData looks for all the data attached to the message, including caching.
 // It only returns persistence errors.
 // For all cases where the data is not found (or the hashes mismatch)
-func (dm *dataManager) GetMessageDataCached(ctx context.Context, msg *fftypes.Message, options ...CacheReadOption) (data fftypes.DataArray, foundAll bool, err error) {
+func (dm *dataManager) GetMessageDataCached(ctx context.Context, msg *core.Message, options ...CacheReadOption) (data core.DataArray, foundAll bool, err error) {
 	if mce := dm.queryMessageCache(ctx, msg.Header.ID, options...); mce != nil {
 		return mce.data, true, nil
 	}
@@ -208,7 +212,7 @@ func (dm *dataManager) GetMessageDataCached(ctx context.Context, msg *fftypes.Me
 }
 
 // cachedMessageAndDataLookup is the common function that can lookup and cache a message with its data
-func (dm *dataManager) dataLookupAndCache(ctx context.Context, msg *fftypes.Message) (data fftypes.DataArray, foundAllData bool, err error) {
+func (dm *dataManager) dataLookupAndCache(ctx context.Context, msg *core.Message) (data core.DataArray, foundAllData bool, err error) {
 	data, foundAllData, err = dm.getMessageData(ctx, msg)
 	if err != nil {
 		return nil, false, err
@@ -220,7 +224,7 @@ func (dm *dataManager) dataLookupAndCache(ctx context.Context, msg *fftypes.Mess
 	return data, true, nil
 }
 
-func (dm *dataManager) PeekMessageCache(ctx context.Context, id *fftypes.UUID, options ...CacheReadOption) (msg *fftypes.Message, data fftypes.DataArray) {
+func (dm *dataManager) PeekMessageCache(ctx context.Context, id *fftypes.UUID, options ...CacheReadOption) (msg *core.Message, data core.DataArray) {
 	mce := dm.queryMessageCache(ctx, id, options...)
 	if mce != nil {
 		return mce.msg, mce.data
@@ -229,12 +233,12 @@ func (dm *dataManager) PeekMessageCache(ctx context.Context, id *fftypes.UUID, o
 }
 
 func (dm *dataManager) queryMessageCache(ctx context.Context, id *fftypes.UUID, options ...CacheReadOption) *messageCacheEntry {
-	cached := dm.messageCache.Get(id.String())
-	if cached == nil {
+	cachedValue := dm.messageCache.Get(id.String())
+	if cachedValue == nil {
 		log.L(context.Background()).Debugf("Cache miss for message %s", id)
 		return nil
 	}
-	mce := cached.Value().(*messageCacheEntry)
+	mce := cachedValue.(*messageCacheEntry)
 	for _, opt := range options {
 		switch opt {
 		case CRORequirePublicBlobRefs:
@@ -257,33 +261,33 @@ func (dm *dataManager) queryMessageCache(ctx context.Context, id *fftypes.UUID, 
 		}
 	}
 	log.L(ctx).Debugf("Cache hit for message %s", id)
-	cached.Extend(dm.messageCacheTTL)
+	mce.msg.LocalNamespace = dm.namespace.Name // always populate LocalNamespace on the way out of the cache
 	return mce
 }
 
 // UpdateMessageCache pushes an entry to the message cache. It is exposed out of the package, so that
 // code which generates (or augments) message/data can populate the cache.
-func (dm *dataManager) UpdateMessageCache(msg *fftypes.Message, data fftypes.DataArray) {
+func (dm *dataManager) UpdateMessageCache(msg *core.Message, data core.DataArray) {
 	cacheEntry := &messageCacheEntry{
 		msg:  msg,
 		data: data,
 		size: msg.EstimateSize(true),
 	}
-	dm.messageCache.Set(msg.Header.ID.String(), cacheEntry, dm.messageCacheTTL)
+	dm.messageCache.Set(msg.Header.ID.String(), cacheEntry)
 	log.L(context.Background()).Debugf("Added to message cache: %s (topics=%d,pins=%d)", msg.Header.ID.String(), len(msg.Header.Topics), len(msg.Pins))
 }
 
 // UpdateMessageIfCached is used in order to notify the fields of a message that are not initially filled in, have been filled in.
 // It does not guarantee the cache is up to date, and the CacheReadOptions should be used to check you have the updated data.
-// But calling this should reduce the possiblity of the CROs missing
-func (dm *dataManager) UpdateMessageIfCached(ctx context.Context, msg *fftypes.Message) {
+// But calling this should reduce the possibility of the CROs missing
+func (dm *dataManager) UpdateMessageIfCached(ctx context.Context, msg *core.Message) {
 	mce := dm.queryMessageCache(ctx, msg.Header.ID)
 	if mce != nil {
 		dm.UpdateMessageCache(msg, mce.data)
 	}
 }
 
-func (dm *dataManager) UpdateMessageStateIfCached(ctx context.Context, id *fftypes.UUID, state fftypes.MessageState, confirmed *fftypes.FFTime) {
+func (dm *dataManager) UpdateMessageStateIfCached(ctx context.Context, id *fftypes.UUID, state core.MessageState, confirmed *fftypes.FFTime) {
 	mce := dm.queryMessageCache(ctx, id)
 	if mce != nil {
 		mce.msg.State = state
@@ -291,17 +295,17 @@ func (dm *dataManager) UpdateMessageStateIfCached(ctx context.Context, id *fftyp
 	}
 }
 
-func (dm *dataManager) getMessageData(ctx context.Context, msg *fftypes.Message) (data fftypes.DataArray, foundAll bool, err error) {
+func (dm *dataManager) getMessageData(ctx context.Context, msg *core.Message) (data core.DataArray, foundAll bool, err error) {
 	// Load all the data - must all be present for us to send
-	data = make(fftypes.DataArray, 0, len(msg.Data))
+	data = make(core.DataArray, 0, len(msg.Data))
 	foundAll = true
 	for i, dataRef := range msg.Data {
-		d, err := dm.resolveRef(ctx, msg.Header.Namespace, dataRef)
+		d, err := dm.resolveRef(ctx, dataRef)
 		if err != nil {
 			return nil, false, err
 		}
 		if d == nil {
-			log.L(ctx).Warnf("Message %v data %d mising", msg.Header.ID, i)
+			log.L(ctx).Warnf("Message %v data %d missing", msg.Header.ID, i)
 			foundAll = false
 			continue
 		}
@@ -310,10 +314,10 @@ func (dm *dataManager) getMessageData(ctx context.Context, msg *fftypes.Message)
 	return data, foundAll, nil
 }
 
-func (dm *dataManager) ValidateAll(ctx context.Context, data fftypes.DataArray) (valid bool, err error) {
+func (dm *dataManager) ValidateAll(ctx context.Context, data core.DataArray) (valid bool, err error) {
 	for _, d := range data {
-		if d.Datatype != nil && d.Validator != fftypes.ValidatorTypeNone {
-			v, err := dm.getValidatorForDatatype(ctx, d.Namespace, d.Validator, d.Datatype)
+		if d.Datatype != nil && d.Validator != core.ValidatorTypeNone {
+			v, err := dm.getValidatorForDatatype(ctx, d.Validator, d.Datatype)
 			if err != nil {
 				return false, err
 			}
@@ -330,18 +334,18 @@ func (dm *dataManager) ValidateAll(ctx context.Context, data fftypes.DataArray) 
 	return true, nil
 }
 
-func (dm *dataManager) resolveRef(ctx context.Context, ns string, dataRef *fftypes.DataRef) (*fftypes.Data, error) {
+func (dm *dataManager) resolveRef(ctx context.Context, dataRef *core.DataRef) (*core.Data, error) {
 	if dataRef == nil || dataRef.ID == nil {
 		log.L(ctx).Warnf("data is nil")
 		return nil, nil
 	}
-	d, err := dm.database.GetDataByID(ctx, dataRef.ID, true)
+	d, err := dm.database.GetDataByID(ctx, dm.namespace.Name, dataRef.ID, true)
 	if err != nil {
 		return nil, err
 	}
 	switch {
-	case d == nil || d.Namespace != ns:
-		log.L(ctx).Warnf("Data %s not found in namespace %s", dataRef.ID, ns)
+	case d == nil:
+		log.L(ctx).Warnf("Data %s not found", dataRef.ID)
 		return nil, nil
 	case d.Hash == nil || (dataRef.Hash != nil && *d.Hash != *dataRef.Hash):
 		log.L(ctx).Warnf("Data hash does not match. Hash=%v Expected=%v", d.Hash, dataRef.Hash)
@@ -351,34 +355,35 @@ func (dm *dataManager) resolveRef(ctx context.Context, ns string, dataRef *fftyp
 	}
 }
 
-func (dm *dataManager) resolveBlob(ctx context.Context, blobRef *fftypes.BlobRef) (*fftypes.Blob, error) {
+func (dm *dataManager) resolveBlob(ctx context.Context, namespace string, blobRef *core.BlobRef, dataID *fftypes.UUID) (*core.Blob, error) {
 	if blobRef != nil && blobRef.Hash != nil {
-		blob, err := dm.database.GetBlobMatchingHash(ctx, blobRef.Hash)
+		fb := database.BlobQueryFactory.NewFilter(ctx)
+		blobs, _, err := dm.database.GetBlobs(ctx, dm.dm.namespace.Name, fb.And(fb.Eq("data_id", dataID), fb.Eq("hash", blobRef.Hash)))
 		if err != nil {
 			return nil, err
 		}
-		if blob == nil {
+		if len(blobs) == 0 || blobs[0] == nil {
 			return nil, i18n.NewError(ctx, coremsgs.MsgBlobNotFound, blobRef.Hash)
 		}
-		return blob, nil
+		return blobs[0], nil
 	}
 	return nil, nil
 }
 
-func (dm *dataManager) checkValidation(ctx context.Context, ns string, validator fftypes.ValidatorType, datatype *fftypes.DatatypeRef, value *fftypes.JSONAny) error {
+func (dm *dataManager) checkValidation(ctx context.Context, validator core.ValidatorType, datatype *core.DatatypeRef, value *fftypes.JSONAny) error {
 	if validator == "" {
-		validator = fftypes.ValidatorTypeJSON
+		validator = core.ValidatorTypeJSON
 	}
-	if err := fftypes.CheckValidatorType(ctx, validator); err != nil {
+	if err := core.CheckValidatorType(ctx, validator); err != nil {
 		return err
 	}
 	// If a datatype is specified, we need to verify the payload conforms
-	if datatype != nil && validator != fftypes.ValidatorTypeNone {
+	if datatype != nil && validator != core.ValidatorTypeNone {
 		if datatype.Name == "" || datatype.Version == "" {
 			return i18n.NewError(ctx, coremsgs.MsgDatatypeNotFound, datatype)
 		}
-		if validator != fftypes.ValidatorTypeNone {
-			v, err := dm.getValidatorForDatatype(ctx, ns, validator, datatype)
+		if validator != core.ValidatorTypeNone {
+			v, err := dm.getValidatorForDatatype(ctx, validator, datatype)
 			if err != nil {
 				return err
 			}
@@ -394,27 +399,27 @@ func (dm *dataManager) checkValidation(ctx context.Context, ns string, validator
 	return nil
 }
 
-func (dm *dataManager) validateInputData(ctx context.Context, ns string, inData *fftypes.DataRefOrValue) (data *fftypes.Data, err error) {
+func (dm *dataManager) validateInputData(ctx context.Context, inData *core.DataRefOrValue) (data *core.Data, err error) {
 
 	validator := inData.Validator
 	datatype := inData.Datatype
 	value := inData.Value
 	blobRef := inData.Blob
 
-	if err := dm.checkValidation(ctx, ns, validator, datatype, value); err != nil {
+	if err := dm.checkValidation(ctx, validator, datatype, value); err != nil {
 		return nil, err
 	}
 
-	blob, err := dm.resolveBlob(ctx, blobRef)
+	blob, err := dm.resolveBlob(ctx, dm.namespace.Name, blobRef, inData.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Ok, we're good to generate the full data payload and save it
-	data = &fftypes.Data{
+	data = &core.Data{
 		Validator: validator,
 		Datatype:  datatype,
-		Namespace: ns,
+		Namespace: dm.namespace.Name,
 		Value:     value,
 		Blob:      blobRef,
 	}
@@ -425,8 +430,8 @@ func (dm *dataManager) validateInputData(ctx context.Context, ns string, inData 
 	return data, nil
 }
 
-func (dm *dataManager) UploadJSON(ctx context.Context, ns string, inData *fftypes.DataRefOrValue) (*fftypes.Data, error) {
-	data, err := dm.validateInputData(ctx, ns, inData)
+func (dm *dataManager) UploadJSON(ctx context.Context, inData *core.DataRefOrValue) (*core.Data, error) {
+	data, err := dm.validateInputData(ctx, inData)
 	if err != nil {
 		return nil, err
 	}
@@ -447,26 +452,25 @@ func (dm *dataManager) ResolveInlineData(ctx context.Context, newMessage *NewMes
 	}
 
 	inData := newMessage.Message.InlineData
-	msg := newMessage.Message
-	newMessage.AllData = make(fftypes.DataArray, len(newMessage.Message.InlineData))
+	newMessage.AllData = make(core.DataArray, len(newMessage.Message.InlineData))
 	for i, dataOrValue := range inData {
-		var d *fftypes.Data
+		var d *core.Data
 		switch {
 		case dataOrValue.ID != nil:
 			// If an ID is supplied, then it must be a reference to existing data
-			d, err = dm.resolveRef(ctx, msg.Header.Namespace, &dataOrValue.DataRef)
+			d, err = dm.resolveRef(ctx, &dataOrValue.DataRef)
 			if err != nil {
 				return err
 			}
 			if d == nil {
 				return i18n.NewError(ctx, coremsgs.MsgDataReferenceUnresolvable, i)
 			}
-			if _, err = dm.resolveBlob(ctx, d.Blob); err != nil {
+			if _, err = dm.resolveBlob(ctx, dm.namespace.Name, d.Blob, d.ID); err != nil {
 				return err
 			}
 		case dataOrValue.Value != nil || dataOrValue.Blob != nil:
 			// We've got a Value, so we can validate + store it
-			if d, err = dm.validateInputData(ctx, msg.Header.Namespace, dataOrValue); err != nil {
+			if d, err = dm.validateInputData(ctx, dataOrValue); err != nil {
 				return err
 			}
 			newMessage.NewData = append(newMessage.NewData, d)
@@ -482,18 +486,18 @@ func (dm *dataManager) ResolveInlineData(ctx context.Context, newMessage *NewMes
 }
 
 // HydrateBatch fetches the full messages for a persisted batch, ready for transmission
-func (dm *dataManager) HydrateBatch(ctx context.Context, persistedBatch *fftypes.BatchPersisted) (*fftypes.Batch, error) {
+func (dm *dataManager) HydrateBatch(ctx context.Context, persistedBatch *core.BatchPersisted) (*core.Batch, error) {
 
-	var manifest fftypes.BatchManifest
+	var manifest core.BatchManifest
 	err := persistedBatch.Manifest.Unmarshal(ctx, &manifest)
 	if err != nil {
 		return nil, i18n.WrapError(ctx, err, i18n.MsgJSONObjectParseFailed, fmt.Sprintf("batch %s manifest", persistedBatch.ID))
 	}
 
-	batch := persistedBatch.GenInflight(make([]*fftypes.Message, len(manifest.Messages)), make(fftypes.DataArray, len(manifest.Data)))
+	batch := persistedBatch.GenInflight(make([]*core.Message, len(manifest.Messages)), make(core.DataArray, len(manifest.Data)))
 
 	for i, mr := range manifest.Messages {
-		m, err := dm.database.GetMessageByID(ctx, mr.ID)
+		m, err := dm.database.GetMessageByID(ctx, dm.namespace.Name, mr.ID)
 		if err != nil || m == nil {
 			return nil, i18n.WrapError(ctx, err, coremsgs.MsgFailedToRetrieve, "message", mr.ID)
 		}
@@ -501,7 +505,7 @@ func (dm *dataManager) HydrateBatch(ctx context.Context, persistedBatch *fftypes
 		batch.Payload.Messages[i] = m.BatchMessage()
 	}
 	for i, dr := range manifest.Data {
-		d, err := dm.database.GetDataByID(ctx, dr.ID, true)
+		d, err := dm.database.GetDataByID(ctx, dm.namespace.Name, dr.ID, true)
 		if err != nil || d == nil {
 			return nil, i18n.WrapError(ctx, err, coremsgs.MsgFailedToRetrieve, "data", dr.ID)
 		}
@@ -536,4 +540,45 @@ func (dm *dataManager) WriteNewMessage(ctx context.Context, newMsg *NewMessage) 
 
 func (dm *dataManager) WaitStop() {
 	dm.messageWriter.close()
+}
+
+func (dm *dataManager) DeleteData(ctx context.Context, dataID string) error {
+	id, err := fftypes.ParseUUID(ctx, dataID)
+	if err != nil {
+		return err
+	}
+
+	data, err := dm.database.GetDataByID(ctx, dm.namespace.Name, id, false)
+	if err != nil {
+		return err
+	}
+	if data == nil {
+		return i18n.NewError(ctx, coremsgs.Msg404NoResult)
+	}
+	if data.Blob != nil && data.Blob.Hash != nil {
+		fb := database.BlobQueryFactory.NewFilter(ctx)
+		blobs, _, err := dm.database.GetBlobs(ctx, dm.namespace.Name, fb.And(fb.Eq("data_id", data.ID), fb.Eq("hash", data.Blob.Hash)))
+		if err != nil {
+			return err
+		}
+		for _, blob := range blobs {
+			if blob != nil {
+				err = dm.DeleteBlob(ctx, blob)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Invalidate cache entries for any messages that had these data refs
+	msgs, _, err := dm.database.GetMessagesForData(ctx, dm.namespace.Name, data.ID, database.MessageQueryFactory.NewFilter(ctx).And())
+	if err != nil {
+		return err
+	}
+	for _, msg := range msgs {
+		dm.messageCache.Set(msg.Header.ID.String(), nil)
+	}
+
+	return dm.database.DeleteData(ctx, data.Namespace, data.ID)
 }

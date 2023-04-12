@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -23,15 +23,17 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/hyperledger/firefly-common/pkg/config"
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"github.com/hyperledger/firefly-common/pkg/log"
 	"github.com/hyperledger/firefly/internal/apiserver"
 	"github.com/hyperledger/firefly/internal/coreconfig"
-	"github.com/hyperledger/firefly/internal/orchestrator"
-	"github.com/hyperledger/firefly/pkg/config"
-	"github.com/hyperledger/firefly/pkg/i18n"
-	"github.com/hyperledger/firefly/pkg/log"
+	"github.com/hyperledger/firefly/internal/namespace"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -42,11 +44,11 @@ var sigs = make(chan os.Signal, 1)
 
 var rootCmd = &cobra.Command{
 	Use:   "firefly",
-	Short: "Firefly is an API toolkit for building enterprise grade multi-party systems",
-	Long: `You build great user experiences and business logic in your favorite language,
-and let Firefly take care of the REST. The event-driven programming model gives you the
-building blocks needed for high performance, scalable multi-party systems, and the power
-to digital transformation your business ecosystem.`,
+	Short: "FireFly is a complete stack for enterprises to build and scale secure Web3 applications",
+	Long: `Hyperledger FireFly is the first open source Supernode: a complete stack for
+enterprises to build and scale secure Web3 applications. The FireFly API for digital
+assets, data flows, and blockchain transactions makes it radically faster to build
+production-ready apps on popular chains and protocols.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return run()
 	},
@@ -58,7 +60,8 @@ var showConfigCommand = &cobra.Command{
 	Short:   "List out the configuration options",
 	Run: func(cmd *cobra.Command, args []string) {
 		// Initialize config of all plugins
-		getOrchestrator()
+		resetConfig()
+		getRootManager()
 		_ = config.ReadConfig(configSuffix, cfgFile)
 
 		// Print it all out
@@ -72,82 +75,121 @@ var showConfigCommand = &cobra.Command{
 
 var cfgFile string
 
-var _utOrchestrator orchestrator.Orchestrator
+var _utManager namespace.Manager
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "f", "", "config file")
 	rootCmd.AddCommand(showConfigCommand)
 }
 
-func getOrchestrator() orchestrator.Orchestrator {
-	if _utOrchestrator != nil {
-		return _utOrchestrator
+func resetConfig() {
+	coreconfig.Reset()
+	namespace.InitConfig()
+	apiserver.InitConfig()
+}
+
+func reloadConfig() error {
+	resetConfig()
+	return config.ReadConfig(configSuffix, cfgFile)
+}
+func getRootManager() namespace.Manager {
+	if _utManager != nil {
+		return _utManager
 	}
-	return orchestrator.NewOrchestrator()
+	return namespace.NewNamespaceManager()
 }
 
 // Execute is called by the main method of the package
 func Execute() error {
-	apiserver.InitConfig()
 	return rootCmd.Execute()
 }
 
 func run() error {
 
 	// Read the configuration
-	coreconfig.Reset()
-	err := config.ReadConfig(configSuffix, cfgFile)
+	err := reloadConfig()
 
 	// Setup logging after reading config (even if failed), to output header correctly
-	ctx, cancelCtx := context.WithCancel(context.Background())
-	ctx = log.WithLogger(ctx, logrus.WithField("pid", fmt.Sprintf("%d", os.Getpid())))
-	ctx = log.WithLogger(ctx, logrus.WithField("prefix", config.GetString(coreconfig.NodeName)))
+	rootCtx, cancelRootCtx := context.WithCancel(context.Background())
+	rootCtx = log.WithLogger(rootCtx, logrus.WithField("pid", fmt.Sprintf("%d", os.Getpid())))
 
-	config.SetupLogging(ctx)
-	log.L(ctx).Infof("Project Firefly")
-	log.L(ctx).Infof("© Copyright 2021 Kaleido, Inc.")
+	info := &Info{
+		Date:    BuildDate,
+		Commit:  BuildCommit,
+		Version: BuildVersionOverride,
+		License: "Apache-2.0",
+	}
+	// Where you are using go install, we will get good version information usefully from Go
+	// When we're in go-releaser in a Github action, we will have the version passed in explicitly
+	if info.Version == "" {
+		buildInfo, ok := debug.ReadBuildInfo()
+		setBuildInfo(info, buildInfo, ok)
+	}
+
+	config.SetupLogging(rootCtx)
+	log.L(rootCtx).Infof("Hyperledger FireFly")
+	log.L(rootCtx).Infof("© Copyright 2023 Kaleido, Inc.")
+	_, ok := debug.ReadBuildInfo()
+	if ok {
+		log.L(rootCtx).Infof("Version: %s", info.Version)
+		log.L(rootCtx).Infof("Build date: %s", info.Date)
+	}
 
 	// Deferred error return from reading config
 	if err != nil {
-		cancelCtx()
-		return i18n.WrapError(ctx, err, i18n.MsgConfigFailed)
+		cancelRootCtx()
+		return i18n.WrapError(rootCtx, err, i18n.MsgConfigFailed)
 	}
 
 	// Setup signal handling to cancel the context, which shuts down the API Server
-	errChan := make(chan error)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
-		orchestratorCtx, cancelOrchestratorCtx := context.WithCancel(ctx)
-		o := getOrchestrator()
+		log.L(rootCtx).Infof("Starting up")
+		runCtx, cancelRunCtx := context.WithCancel(rootCtx)
+		mgr := getRootManager()
 		as := apiserver.NewAPIServer()
-		go startFirefly(orchestratorCtx, cancelOrchestratorCtx, o, as, errChan)
+		errChan := make(chan error, 1)
+		resetChan := make(chan bool, 1)
+		ffDone := make(chan struct{})
+		go startFirefly(runCtx, cancelRootCtx, mgr, as, errChan, resetChan, ffDone)
 		select {
 		case sig := <-sigs:
-			log.L(ctx).Infof("Shutting down due to %s", sig.String())
-			cancelCtx()
-			o.WaitStop()
+			log.L(rootCtx).Infof("Shutting down due to %s", sig.String())
+			cancelRunCtx()
+			mgr.WaitStop()
 			return nil
-		case <-orchestratorCtx.Done():
-			log.L(ctx).Infof("Restarting due to configuration change")
-			o.WaitStop()
+		case <-rootCtx.Done():
+			log.L(rootCtx).Infof("Shutting down due to cancelled context")
+			cancelRunCtx()
+			mgr.WaitStop()
+			return nil
+		case <-resetChan:
+			// This API that performs a full stop/restart reset, is deprecated
+			// in favor of selective reload of namespaces based on listening to changes
+			// in the configuration file.
+			log.L(rootCtx).Infof("Restarting due to configuration change")
+			cancelRunCtx()
+			mgr.WaitStop()
+			// Must wait for the server to close before we restart
+			<-ffDone
 			// Re-read the configuration
-			coreconfig.Reset()
-			if err := config.ReadConfig(configSuffix, cfgFile); err != nil {
-				cancelCtx()
+			if err = reloadConfig(); err != nil {
 				return err
 			}
 		case err := <-errChan:
-			cancelCtx()
+			cancelRunCtx()
 			return err
 		}
 	}
 }
 
-func startFirefly(ctx context.Context, cancelCtx context.CancelFunc, o orchestrator.Orchestrator, as apiserver.Server, errChan chan error) {
+func startFirefly(ctx context.Context, cancelCtx context.CancelFunc, mgr namespace.Manager, as apiserver.Server, errChan chan error, resetChan chan bool, ffDone chan struct{}) {
 	var err error
 	// Start debug listener
+	var debugServer *http.Server
 	debugPort := config.GetInt(coreconfig.DebugPort)
+	debugAddress := config.GetString(coreconfig.DebugAddress)
 	if debugPort >= 0 {
 		r := mux.NewRouter()
 		r.PathPrefix("/debug/pprof/cmdline").HandlerFunc(pprof.Cmdline)
@@ -155,24 +197,32 @@ func startFirefly(ctx context.Context, cancelCtx context.CancelFunc, o orchestra
 		r.PathPrefix("/debug/pprof/symbol").HandlerFunc(pprof.Symbol)
 		r.PathPrefix("/debug/pprof/trace").HandlerFunc(pprof.Trace)
 		r.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
+		debugServer = &http.Server{Addr: fmt.Sprintf("%s:%d", debugAddress, debugPort), Handler: r, ReadHeaderTimeout: 30 * time.Second}
 		go func() {
-			_ = http.ListenAndServe(fmt.Sprintf("localhost:%d", debugPort), r)
+			_ = debugServer.ListenAndServe()
 		}()
-		log.L(ctx).Debugf("Debug HTTP endpoint listening on localhost:%d", debugPort)
+		log.L(ctx).Debugf("Debug HTTP endpoint listening on %s:%d", debugAddress, debugPort)
 	}
 
-	if err = o.Init(ctx, cancelCtx); err != nil {
+	defer func() {
+		if debugServer != nil {
+			_ = debugServer.Close()
+		}
+		close(ffDone)
+	}()
+
+	if err = mgr.Init(ctx, cancelCtx, resetChan, reloadConfig); err != nil {
 		errChan <- err
 		return
 	}
-	if err = o.Start(); err != nil {
+	if err = mgr.Start(); err != nil {
 		errChan <- err
 		return
 	}
 
 	// Run the API Server
 
-	if err = as.Serve(ctx, o); err != nil {
+	if err = as.Serve(ctx, mgr); err != nil {
 		errChan <- err
 	}
 }

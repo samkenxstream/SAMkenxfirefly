@@ -23,9 +23,10 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/hyperledger/firefly-common/pkg/fftypes"
+	"github.com/hyperledger/firefly-common/pkg/log"
+	"github.com/hyperledger/firefly/pkg/core"
 	"github.com/hyperledger/firefly/pkg/database"
-	"github.com/hyperledger/firefly/pkg/fftypes"
-	"github.com/hyperledger/firefly/pkg/log"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,69 +38,57 @@ func TestNextPinsE2EWithDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a new nextpin entry
-	nextpin := &fftypes.NextPin{
-		Context:  fftypes.NewRandB32(),
-		Identity: "0x12345",
-		Hash:     fftypes.NewRandB32(),
-		Nonce:    int64(12345),
+	nextpin := &core.NextPin{
+		Namespace: "ns",
+		Context:   fftypes.NewRandB32(),
+		Identity:  "0x12345",
+		Hash:      fftypes.NewRandB32(),
+		Nonce:     int64(12345),
 	}
 	err := s.InsertNextPin(ctx, nextpin)
 	assert.NoError(t, err)
 
 	// Check we get the exact same nextpin back
-	nextpinRead, err := s.GetNextPinByContextAndIdentity(ctx, nextpin.Context, nextpin.Identity)
+	nextpinRead, err := s.GetNextPinsForContext(ctx, "ns", nextpin.Context)
 	assert.NoError(t, err)
-	assert.NotNil(t, nextpinRead)
-	nextpinJson, _ := json.Marshal(&nextpin)
-	nextpinReadJson, _ := json.Marshal(&nextpinRead)
+	assert.Len(t, nextpinRead, 1)
+	nextpinJson, _ := json.Marshal(nextpin)
+	nextpinReadJson, _ := json.Marshal(nextpinRead[0])
 	assert.Equal(t, string(nextpinJson), string(nextpinReadJson))
 
-	// Attempt with wrong ID
-	var nextpinUpdated fftypes.NextPin
+	var nextpinUpdated core.NextPin
 	nextpinUpdated = *nextpin
 	nextpinUpdated.Nonce = 1111111
 	nextpinUpdated.Hash = fftypes.NewRandB32()
-	err = s.UpdateNextPin(context.Background(), nextpin.Sequence, database.NextPinQueryFactory.NewUpdate(ctx).
+	err = s.UpdateNextPin(context.Background(), "ns", nextpin.Sequence, database.NextPinQueryFactory.NewUpdate(ctx).
 		Set("hash", nextpinUpdated.Hash).
 		Set("nonce", nextpinUpdated.Nonce),
 	)
+	nextpinJson, _ = json.Marshal(nextpinUpdated)
 
-	// Check we get the exact same data back - note the removal of one of the nextpin elements
-	nextpinRead, err = s.GetNextPinByHash(ctx, nextpinUpdated.Hash)
+	// Check we get the exact same data back
+	nextpinRead, err = s.GetNextPinsForContext(ctx, "ns", nextpin.Context)
 	assert.NoError(t, err)
-	nextpinJson, _ = json.Marshal(&nextpinUpdated)
-	nextpinReadJson, _ = json.Marshal(&nextpinRead)
+	assert.Len(t, nextpinRead, 1)
+	nextpinReadJson, _ = json.Marshal(nextpinRead[0])
 	assert.Equal(t, string(nextpinJson), string(nextpinReadJson))
 
-	// Query back the nextpin
-	fb := database.NextPinQueryFactory.NewFilter(ctx)
-	filter := fb.And(
-		fb.Eq("context", nextpinUpdated.Context),
-		fb.Eq("hash", nextpinUpdated.Hash),
-		fb.Eq("identity", nextpinUpdated.Identity),
-		fb.Eq("nonce", nextpinUpdated.Nonce),
-	)
-	nextpinRes, res, err := s.GetNextPins(ctx, filter.Count(true))
+	// Check we get the exact same data back querying with filter
+	nextpinRead, _, err = s.GetNextPins(ctx, "ns", database.NextPinQueryFactory.NewFilter(ctx).Eq(
+		"identity", "0x12345",
+	))
 	assert.NoError(t, err)
-	assert.Equal(t, 1, len(nextpinRes))
-	assert.Equal(t, int64(1), *res.TotalCount)
-	nextpinReadJson, _ = json.Marshal(nextpinRes[0])
+	assert.Len(t, nextpinRead, 1)
+	nextpinReadJson, _ = json.Marshal(nextpinRead[0])
 	assert.Equal(t, string(nextpinJson), string(nextpinReadJson))
-
-	// Test delete
-	err = s.DeleteNextPin(ctx, nextpinUpdated.Sequence)
-	assert.NoError(t, err)
-	nextpins, _, err := s.GetNextPins(ctx, filter)
-	assert.NoError(t, err)
-	assert.Equal(t, 0, len(nextpins))
 
 }
 
 func TestUpsertNextPinFailBegin(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.InsertNextPin(context.Background(), &fftypes.NextPin{})
-	assert.Regexp(t, "FF10114", err)
+	err := s.InsertNextPin(context.Background(), &core.NextPin{})
+	assert.Regexp(t, "FF00175", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -108,8 +97,8 @@ func TestUpsertNextPinFailInsert(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
-	err := s.InsertNextPin(context.Background(), &fftypes.NextPin{Context: fftypes.NewRandB32()})
-	assert.Regexp(t, "FF10116", err)
+	err := s.InsertNextPin(context.Background(), &core.NextPin{Context: fftypes.NewRandB32()})
+	assert.Regexp(t, "FF00177", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -118,32 +107,23 @@ func TestUpsertNextPinFailCommit(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT .*").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit().WillReturnError(fmt.Errorf("pop"))
-	err := s.InsertNextPin(context.Background(), &fftypes.NextPin{Context: fftypes.NewRandB32()})
-	assert.Regexp(t, "FF10119", err)
+	err := s.InsertNextPin(context.Background(), &core.NextPin{Context: fftypes.NewRandB32()})
+	assert.Regexp(t, "FF00180", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestGetNextPinByIDSelectFail(t *testing.T) {
+func TestGetNextPinsForContextQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
-	_, err := s.GetNextPinByContextAndIdentity(context.Background(), fftypes.NewRandB32(), "0x12345")
-	assert.Regexp(t, "FF10115", err)
+	_, err := s.GetNextPinsForContext(context.Background(), "ns", fftypes.NewRandB32())
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestGetNextPinByIDNotFound(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{}))
-	msg, err := s.GetNextPinByContextAndIdentity(context.Background(), fftypes.NewRandB32(), "0x12345")
-	assert.NoError(t, err)
-	assert.Nil(t, msg)
-	assert.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestGetNextPinByIDScanFail(t *testing.T) {
+func TestGetNextPinsForContextReadMessageFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"context"}).AddRow("only one"))
-	_, err := s.GetNextPinByContextAndIdentity(context.Background(), fftypes.NewRandB32(), "0x12345")
+	_, err := s.GetNextPinsForContext(context.Background(), "ns", fftypes.NewRandB32())
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -151,24 +131,19 @@ func TestGetNextPinByIDScanFail(t *testing.T) {
 func TestGetNextPinQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnError(fmt.Errorf("pop"))
-	f := database.NextPinQueryFactory.NewFilter(context.Background()).Eq("context", "")
-	_, _, err := s.GetNextPins(context.Background(), f)
-	assert.Regexp(t, "FF10115", err)
+	_, _, err := s.GetNextPins(context.Background(), "ns", database.NextPinQueryFactory.NewFilter(context.Background()).Eq(
+		"identity", "0x12345",
+	))
+	assert.Regexp(t, "FF00176", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestGetNextPinBuildQueryFail(t *testing.T) {
-	s, _ := newMockProvider().init()
-	f := database.NextPinQueryFactory.NewFilter(context.Background()).Eq("context", map[bool]bool{true: false})
-	_, _, err := s.GetNextPins(context.Background(), f)
-	assert.Regexp(t, "FF00143.*type", err)
 }
 
 func TestGetNextPinReadMessageFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectQuery("SELECT .*").WillReturnRows(sqlmock.NewRows([]string{"context"}).AddRow("only one"))
-	f := database.NextPinQueryFactory.NewFilter(context.Background()).Eq("context", "")
-	_, _, err := s.GetNextPins(context.Background(), f)
+	_, _, err := s.GetNextPins(context.Background(), "ns", database.NextPinQueryFactory.NewFilter(context.Background()).Eq(
+		"identity", "0x12345",
+	))
 	assert.Regexp(t, "FF10121", err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -177,15 +152,15 @@ func TestNextPinUpdateBeginFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
 	u := database.NextPinQueryFactory.NewUpdate(context.Background()).Set("context", "anything")
-	err := s.UpdateNextPin(context.Background(), 12345, u)
-	assert.Regexp(t, "FF10114", err)
+	err := s.UpdateNextPin(context.Background(), "ns", 12345, u)
+	assert.Regexp(t, "FF00175", err)
 }
 
 func TestNextPinUpdateBuildQueryFail(t *testing.T) {
 	s, mock := newMockProvider().init()
 	mock.ExpectBegin()
 	u := database.NextPinQueryFactory.NewUpdate(context.Background()).Set("context", map[bool]bool{true: false})
-	err := s.UpdateNextPin(context.Background(), 12345, u)
+	err := s.UpdateNextPin(context.Background(), "ns", 12345, u)
 	assert.Regexp(t, "FF00143.*context", err)
 }
 
@@ -195,22 +170,6 @@ func TestNextPinUpdateFail(t *testing.T) {
 	mock.ExpectExec("UPDATE .*").WillReturnError(fmt.Errorf("pop"))
 	mock.ExpectRollback()
 	u := database.NextPinQueryFactory.NewUpdate(context.Background()).Set("context", fftypes.NewRandB32())
-	err := s.UpdateNextPin(context.Background(), 12345, u)
-	assert.Regexp(t, "FF10117", err)
-}
-
-func TestNextPinDeleteBeginFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectBegin().WillReturnError(fmt.Errorf("pop"))
-	err := s.DeleteNextPin(context.Background(), 12345)
-	assert.Regexp(t, "FF10114", err)
-}
-
-func TestNextPinDeleteFail(t *testing.T) {
-	s, mock := newMockProvider().init()
-	mock.ExpectBegin()
-	mock.ExpectExec("DELETE .*").WillReturnError(fmt.Errorf("pop"))
-	mock.ExpectRollback()
-	err := s.DeleteNextPin(context.Background(), 12345)
-	assert.Regexp(t, "FF10118", err)
+	err := s.UpdateNextPin(context.Background(), "ns", 12345, u)
+	assert.Regexp(t, "FF00178", err)
 }

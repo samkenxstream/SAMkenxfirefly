@@ -18,7 +18,7 @@ package e2e
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
 )
 
 type Stack struct {
@@ -27,6 +27,7 @@ type Stack struct {
 	BlockchainProvider    string    `json:"blockchainProvider"`
 	TokenProviders        []string  `json:"tokenProviders"`
 	Members               []*Member `json:"members,omitempty"`
+	Database              string    `json:"database"`
 }
 
 type StackState struct {
@@ -35,6 +36,7 @@ type StackState struct {
 
 type Member struct {
 	ExposedFireflyPort   int         `json:"exposedFireflyPort,omitempty"`
+	ExposedAdminPort     int         `json:"exposedFireflyAdminPort,omitempty"`
 	FireflyHostname      string      `json:"fireflyHostname,omitempty"`
 	Username             string      `json:"username,omitempty"`
 	Password             string      `json:"password,omitempty"`
@@ -45,7 +47,7 @@ type Member struct {
 }
 
 func GetMemberPort(filename string, n int) (int, error) {
-	jsonBytes, err := ioutil.ReadFile(filename)
+	jsonBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return 0, err
 	}
@@ -60,7 +62,7 @@ func GetMemberPort(filename string, n int) (int, error) {
 }
 
 func GetMemberHostname(filename string, n int) (string, error) {
-	jsonBytes, err := ioutil.ReadFile(filename)
+	jsonBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
@@ -74,8 +76,8 @@ func GetMemberHostname(filename string, n int) (string, error) {
 	return stack.Members[n].FireflyHostname, nil
 }
 
-func ReadStack(filename string) (*Stack, error) {
-	jsonBytes, err := ioutil.ReadFile(filename)
+func ReadStackFile(filename string) (*Stack, error) {
+	jsonBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +99,8 @@ func ReadStack(filename string) (*Stack, error) {
 	return stack, nil
 }
 
-func ReadStackState(filename string) (*StackState, error) {
-	jsonBytes, err := ioutil.ReadFile(filename)
+func ReadStackStateFile(filename string) (*StackState, error) {
+	jsonBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}

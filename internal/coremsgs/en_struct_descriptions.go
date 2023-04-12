@@ -1,4 +1,4 @@
-// Copyright © 2022 Kaleido, Inc.
+// Copyright © 2023 Kaleido, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -15,6 +15,11 @@
 // limitations under the License.
 
 package coremsgs
+
+import (
+	"github.com/hyperledger/firefly-common/pkg/i18n"
+	"golang.org/x/text/language"
+)
 
 //revive:disable
 
@@ -36,6 +41,11 @@ type Message struct {
 MessageHeader    = ffm("Message.header", "The message header")
 
 */
+
+var ffm = func(key, translation string) i18n.MessageKey {
+	return i18n.FFM(language.AmericanEnglish, key, translation)
+}
+
 var (
 	// MessageHeader field descriptions
 	MessageHeaderID        = ffm("MessageHeader.id", "The UUID of the message. Unique to each message")
@@ -43,20 +53,24 @@ var (
 	MessageHeaderType      = ffm("MessageHeader.type", "The type of the message")
 	MessageHeaderTxType    = ffm("MessageHeader.txtype", "The type of transaction used to order/deliver this message")
 	MessageHeaderCreated   = ffm("MessageHeader.created", "The creation time of the message")
-	MessageHeaderNamespace = ffm("MessageHeader.namespace", "The namespace of the message")
+	MessageHeaderNamespace = ffm("MessageHeader.namespace", "The namespace of the message within the multiparty network")
 	MessageHeaderGroup     = ffm("MessageHeader.group", "Private messages only - the identifier hash of the privacy group. Derived from the name and member list of the group")
 	MessageHeaderTopics    = ffm("MessageHeader.topics", "A message topic associates this message with an ordered stream of data. A custom topic should be assigned - using the default topic is discouraged")
 	MessageHeaderTag       = ffm("MessageHeader.tag", "The message tag indicates the purpose of the message to the applications that process it")
 	MessageHeaderDataHash  = ffm("MessageHeader.datahash", "A single hash representing all data in the message. Derived from the array of data ids+hashes attached to this message")
+	MessageTxParent        = ffm("MessageHeader.txparent", "The parent transaction that originally triggered this message")
 
 	// Message field descriptions
-	MessageHeader    = ffm("Message.header", "The message header contains all fields that are used to build the message hash")
-	MessageHash      = ffm("Message.hash", "The hash of the message. Derived from the header, which includes the data hash")
-	MessageBatchID   = ffm("Message.batch", "The UUID of the batch in which the message was pinned/transferred")
-	MessageState     = ffm("Message.state", "The current state of the message")
-	MessageConfirmed = ffm("Message.confirmed", "The timestamp of when the message was confirmed/rejected")
-	MessageData      = ffm("Message.data", "The list of data elements attached to the message")
-	MessagePins      = ffm("Message.pins", "For private messages, a unique pin hash:nonce is assigned for each topic")
+	MessageHeader         = ffm("Message.header", "The message header contains all fields that are used to build the message hash")
+	MessageLocalNamespace = ffm("Message.localNamespace", "The local namespace of the message")
+	MessageHash           = ffm("Message.hash", "The hash of the message. Derived from the header, which includes the data hash")
+	MessageBatchID        = ffm("Message.batch", "The UUID of the batch in which the message was pinned/transferred")
+	MessageState          = ffm("Message.state", "The current state of the message")
+	MessageConfirmed      = ffm("Message.confirmed", "The timestamp of when the message was confirmed/rejected")
+	MessageData           = ffm("Message.data", "The list of data elements attached to the message")
+	MessagePins           = ffm("Message.pins", "For private messages, a unique pin hash:nonce is assigned for each topic")
+	MessageTransactionID  = ffm("Message.txid", "The ID of the transaction used to order/deliver this message")
+	MessageIdempotencyKey = ffm("Message.idempotencyKey", "An optional unique identifier for a message. Cannot be duplicated within a namespace, thus allowing idempotent submission of messages to the API. Local only - not transferred when the message is sent to other members of the network")
 
 	// MessageInOut field descriptions
 	MessageInOutData  = ffm("MessageInOut.data", "For input allows you to specify data in-line in the message, that will be turned into data attachments. For output when fetchdata is used on API calls, includes the in-line data payloads of all data attachments")
@@ -77,12 +91,13 @@ var (
 	MessageRefHash = ffm("MessageRef.hash", "The hash of the referenced message")
 
 	// Group field descriptions
-	GroupNamespace = ffm("Group.namespace", "The namespace of the group")
-	GroupName      = ffm("Group.name", "The optional name of the group, allowing multiple unique groups to exist with the same list of recipients")
-	GroupMembers   = ffm("Group.members", "The list of members in this privacy group")
-	GroupMessage   = ffm("Group.message", "The message used to broadcast this group privately to the members")
-	GroupHash      = ffm("Group.hash", "The identifier hash of this group. Derived from the name and group members")
-	GroupCreated   = ffm("Group.created", "The time when the group was first used to send a message in the network")
+	GroupNamespace      = ffm("Group.namespace", "The namespace of the group within the multiparty network")
+	GroupLocalNamespace = ffm("Group.localNamespace", "The local namespace of the group")
+	GroupName           = ffm("Group.name", "The optional name of the group, allowing multiple unique groups to exist with the same list of recipients")
+	GroupMembers        = ffm("Group.members", "The list of members in this privacy group")
+	GroupMessage        = ffm("Group.message", "The message used to broadcast this group privately to the members")
+	GroupHash           = ffm("Group.hash", "The identifier hash of this group. Derived from the name and group members")
+	GroupCreated        = ffm("Group.created", "The time when the group was first used to send a message in the network")
 
 	// MemberInput field descriptions
 	MemberInputIdentity = ffm("MemberInput.identity", "The DID of the group member. On input can be a UUID or org name, and will be resolved to a DID")
@@ -90,7 +105,7 @@ var (
 
 	// Member field descriptions
 	MemberIdentity = ffm("Member.identity", "The DID of the group member")
-	MembertNode    = ffm("Member.node", "The UUID of the node that receives a copy of the off-chain message for the identity")
+	MemberNode     = ffm("Member.node", "The UUID of the node that receives a copy of the off-chain message for the identity")
 
 	// DataRef field descriptions
 	DataRefID   = ffm("DataRef.id", "The UUID of the referenced data resource")
@@ -100,7 +115,8 @@ var (
 	BlobRefHash   = ffm("BlobRef.hash", "The hash of the binary blob data")
 	BlobRefSize   = ffm("BlobRef.size", "The size of the binary data")
 	BlobRefName   = ffm("BlobRef.name", "The name field from the metadata attached to the blob, commonly used as a path/filename, and indexed for search")
-	BlobRefPublic = ffm("BlobRef.public", "If this data has been published to shared storage, this field is the id of the data in the shared storage plugin (IPFS hash etc.)")
+	BlobRefPath   = ffm("BlobRef.path", "If a name is specified, this field stores the '/' prefixed and separated path extracted from the full name")
+	BlobRefPublic = ffm("BlobRef.public", "If the blob data has been published to shared storage, this field is the id of the data in the shared storage plugin (IPFS hash etc.)")
 
 	// Data field descriptions
 	DataID        = ffm("Data.id", "The UUID of the data resource")
@@ -111,6 +127,7 @@ var (
 	DataDatatype  = ffm("Data.datatype", "The optional datatype to use of validation of this data")
 	DataValue     = ffm("Data.value", "The value for the data, stored in the FireFly core database. Can be any JSON type - object, array, string, number or boolean. Can be combined with a binary blob attachment")
 	DataBlob      = ffm("Data.blob", "An optional hash reference to a binary blob attachment")
+	DataPublic    = ffm("Data.public", "If the JSON value has been published to shared storage, this field is the id of the data in the shared storage plugin (IPFS hash etc.)")
 
 	// DatatypeRef field descriptions
 	DatatypeRefName    = ffm("DatatypeRef.name", "The name of the datatype")
@@ -150,19 +167,20 @@ var (
 	BatchManifestData     = ffm("BatchManifest.data", "Array of manifest entries, succinctly summarizing the data in the batch")
 
 	// BatchPersisted field descriptions
-	BatchPersistedHash       = ffm("BatchPersisted.hash", "The hash of the manifest of the batch")
-	BatchPersistedManifest   = ffm("BatchPersisted.manifest", "The manifest of the batch")
-	BatchPersistedTX         = ffm("BatchPersisted.tx", "The FireFly transaction associated with this batch")
-	BatchPersistedPayloadRef = ffm("BatchPersisted.payloadRef", "For broadcast batches, this is the reference to the binary batch in shared storage")
-	BatchPersistedConfirmed  = ffm("BatchPersisted.confirmed", "The time when the batch was confirmed")
+	BatchPersistedHash       = ffm("Batch.hash", "The hash of the manifest of the batch")
+	BatchPersistedManifest   = ffm("Batch.manifest", "The manifest of the batch")
+	BatchPersistedTX         = ffm("Batch.tx", "The FireFly transaction associated with this batch")
+	BatchPersistedPayloadRef = ffm("Batch.payloadRef", "For broadcast batches, this is the reference to the binary batch in shared storage")
+	BatchPersistedConfirmed  = ffm("Batch.confirmed", "The time when the batch was confirmed")
 
 	// Transaction field descriptions
-	TransactionID            = ffm("Transaction.id", "The UUID of the FireFly transaction")
-	TransactionType          = ffm("Transaction.type", "The type of the FireFly transaction")
-	TransactionNamespace     = ffm("Transaction.namespace", "The namespace of the FireFly transaction")
-	TransactionCreated       = ffm("Transaction.created", "The time the transaction was created on this node. Note the transaction is individually created with the same UUID on each participant in the FireFly transaction")
-	TransactionBlockchainID  = ffm("Transaction.blockchainId", "The blockchain transaction ID, in the format specific to the blockchain involved in the transaction. Not all FireFly transactions include a blockchain")
-	TransactionBlockchainIDs = ffm("Transaction.blockchainIds", "The blockchain transaction ID, in the format specific to the blockchain involved in the transaction. Not all FireFly transactions include a blockchain. FireFly transactions are extensible to support multiple blockchain transactions")
+	TransactionID             = ffm("Transaction.id", "The UUID of the FireFly transaction")
+	TransactionType           = ffm("Transaction.type", "The type of the FireFly transaction")
+	TransactionNamespace      = ffm("Transaction.namespace", "The namespace of the FireFly transaction")
+	TransactionCreated        = ffm("Transaction.created", "The time the transaction was created on this node. Note the transaction is individually created with the same UUID on each participant in the FireFly transaction")
+	TransactionIdempotencyKey = ffm("Transaction.idempotencyKey", "An optional unique identifier for a transaction. Cannot be duplicated within a namespace, thus allowing idempotent submission of transactions to the API")
+	TransactionBlockchainID   = ffm("Transaction.blockchainId", "The blockchain transaction ID, in the format specific to the blockchain involved in the transaction. Not all FireFly transactions include a blockchain")
+	TransactionBlockchainIDs  = ffm("Transaction.blockchainIds", "The blockchain transaction ID, in the format specific to the blockchain involved in the transaction. Not all FireFly transactions include a blockchain. FireFly transactions are extensible to support multiple blockchain transactions")
 
 	// Operation field description
 	OperationID          = ffm("Operation.id", "The UUID of the operation")
@@ -177,6 +195,9 @@ var (
 	OperationCreated     = ffm("Operation.created", "The time the operation was created")
 	OperationUpdated     = ffm("Operation.updated", "The last update time of the operation")
 	OperationRetry       = ffm("Operation.retry", "If this operation was initiated as a retry to a previous operation, this field points to the UUID of the operation being retried")
+
+	// OperationWithDetail field description
+	OperationWithDetail = ffm("OperationWithDetail.detail", "Additional detailed information about an operation provided by the connector")
 
 	// BlockchainEvent field descriptions
 	BlockchainEventID         = ffm("BlockchainEvent.id", "The UUID assigned to the event by FireFly")
@@ -227,6 +248,7 @@ var (
 	FFIVersion     = ffm("FFI.version", "A version for the FFI - use of semantic versioning such as 'v1.0.1' is encouraged")
 	FFIMethods     = ffm("FFI.methods", "An array of smart contract method definitions")
 	FFIEvents      = ffm("FFI.events", "An array of smart contract event definitions")
+	FFIErrors      = ffm("FFI.errors", "An array of smart contract error definitions")
 
 	// FFIMethod field descriptions
 	FFIMethodID          = ffm("FFIMethod.id", "The UUID of the FFI method definition")
@@ -237,6 +259,7 @@ var (
 	FFIMethodDescription = ffm("FFIMethod.description", "A description of the smart contract method")
 	FFIMethodParams      = ffm("FFIMethod.params", "An array of method parameter/argument definitions")
 	FFIMethodReturns     = ffm("FFIMethod.returns", "An array of method return definitions")
+	FFIMethodDetails     = ffm("FFIMethod.details", "Additional blockchain specific fields about this method from the original smart contract. Used by the blockchain plugin and for documentation generation.")
 
 	// FFIEvent field descriptions
 	FFIEventID          = ffm("FFIEvent.id", "The UUID of the FFI event definition")
@@ -247,6 +270,18 @@ var (
 	FFIEventDescription = ffm("FFIEvent.description", "A description of the smart contract event")
 	FFIEventParams      = ffm("FFIEvent.params", "An array of event parameter/argument definitions")
 	FFIEventSignature   = ffm("FFIEvent.signature", "The stringified signature of the event, as computed by the blockchain plugin")
+	FFIEventDetails     = ffm("FFIEvent.details", "Additional blockchain specific fields about this event from the original smart contract. Used by the blockchain plugin and for documentation generation.")
+
+	// FFIError field descriptions
+	FFIErrorID          = ffm("FFIError.id", "The UUID of the FFI error definition")
+	FFIErrorInterface   = ffm("FFIError.interface", "The UUID of the FFI smart contract definition that this error is part of")
+	FFIErrorName        = ffm("FFIError.name", "The name of the error")
+	FFIErrorNamespace   = ffm("FFIError.namespace", "The namespace of the FFI")
+	FFIErrorPathname    = ffm("FFIError.pathname", "The unique name allocated to this error within the FFI for use on URL paths")
+	FFIErrorDescription = ffm("FFIError.description", "A description of the smart contract error")
+	FFIErrorParams      = ffm("FFIError.params", "An array of error parameter/argument definitions")
+	FFIErrorSignature   = ffm("FFIError.signature", "The stringified signature of the error, as computed by the blockchain plugin")
+	FFIErrorDetails     = ffm("FFIError.details", "Additional blockchain specific fields about this error from the original smart contract. Used by the blockchain plugin and for documentation generation.")
 
 	// FFIParam field descriptions
 	FFIParamName   = ffm("FFIParam.name", "The name of the parameter. Note that parameters must be ordered correctly on the FFI, according to the order in the blockchain smart contract")
@@ -272,6 +307,7 @@ var (
 	ContractListenerOptions   = ffm("ContractListener.options", "Options that control how the listener subscribes to events from the underlying blockchain")
 	ContractListenerEventPath = ffm("ContractListener.eventPath", "When creating a listener from an existing FFI, this is the pathname of the event on that FFI to be detected by this listener")
 	ContractListenerSignature = ffm("ContractListener.signature", "The stringified signature of the event, as computed by the blockchain plugin")
+	ContractListenerState     = ffm("ContractListener.state", "This field is provided for the event listener implementation of the blockchain provider to record state, such as checkpoint information")
 
 	// ContractListenerOptions field descriptions
 	ContractListenerOptionsFirstEvent = ffm("ContractListenerOptions.firstEvent", "A blockchain specific string, such as a block number, to start listening from. The special strings 'oldest' and 'newest' are supported by all blockchain connectors. Default is 'newest'")
@@ -361,46 +397,63 @@ var (
 	VerifierCreated   = ffm("Verifier.created", "The time this verifier was created on this node")
 
 	// Namespace field descriptions
-	NamespaceID          = ffm("Namespace.id", "The UUID of the namespace. For locally established namespaces will be different on each node in the network. For broadcast namespaces, will be the same on every node")
-	NamespaceMessage     = ffm("Namespace.message", "The UUID of broadcast message used to establish the namespace. Unset for local namespaces")
-	NamespaceName        = ffm("Namespace.name", "The namespace name")
-	NamespaceDescription = ffm("Namespace.description", "A description of the namespace")
-	NamespaceType        = ffm("Namespace.type", "The type of the namespace")
-	NamespaceCreated     = ffm("Namespace.created", "The time the namespace was created")
+	NamespaceName                  = ffm("Namespace.name", "The local namespace name")
+	NamespaceNetworkName           = ffm("Namespace.networkName", "The shared namespace name within the multiparty network")
+	NamespaceDescription           = ffm("Namespace.description", "A description of the namespace")
+	NamespaceCreated               = ffm("Namespace.created", "The time the namespace was created")
+	MultipartyContractsActive      = ffm("MultipartyContracts.active", "The currently active FireFly smart contract")
+	MultipartyContractsTerminated  = ffm("MultipartyContracts.terminated", "Previously-terminated FireFly smart contracts")
+	MultipartyContractIndex        = ffm("MultipartyContract.index", "The index of this contract in the config file")
+	MultipartyContractVersion      = ffm("MultipartyContract.version", "The version of this multiparty contract")
+	MultipartyContractFinalEvent   = ffm("MultipartyContract.finalEvent", "The identifier for the final blockchain event received from this contract before termination")
+	MultipartyContractFirstEvent   = ffm("MultipartyContract.firstEvent", "A blockchain specific string, such as a block number, to start listening from. The special strings 'oldest' and 'newest' are supported by all blockchain connectors")
+	MultipartyContractLocation     = ffm("MultipartyContract.location", "A blockchain specific contract identifier. For example an Ethereum contract address, or a Fabric chaincode name and channel")
+	MultipartyContractSubscription = ffm("MultipartyContract.subscription", "The backend identifier of the subscription for the FireFly BatchPin contract")
+	MultipartyContractInfo         = ffm("MultipartyContract.info", "Additional info about the current status of the multi-party contract")
+	NetworkActionType              = ffm("NetworkAction.type", "The action to be performed")
 
-	// NodeStatus field descriptions
-	NodeStatusNode = ffm("NodeStatus.node", "Details of the local node")
-	NodeStatusOrg  = ffm("NodeStatus.org", "Details of the organization identity that operates this node")
-	NodeDefaults   = ffm("NodeStatus.defaults", "Information about defaults configured on this node that appplications might need to query on startup")
-	NodePlugins    = ffm("NodeStatus.plugins", "Information about plugins configured on this node")
+	// NamespaceWithInitStatus field descriptions
+	NamespaceWithInitStatusInitializing        = ffm("NamespaceWithInitStatus.initializing", "Set to true if the namespace is still initializing")
+	NamespaceWithInitStatusInitializationError = ffm("NamespaceWithInitStatus.initializationError", "Set to a non-empty string in the case that the namespace is currently failing to initialize")
 
-	// NodeStatusNode field descriptions
-	NodeStatusNodeName       = ffm("NodeStatusNode.name", "The name of this node, as specified in the local configuration")
-	NodeStatusNodeRegistered = ffm("NodeStatusNode.registered", "Whether the node has been successfully registered")
-	NodeStatusNodeID         = ffm("NodeStatusNode.id", "The UUID of the node, if registered")
+	// NamespaceStatus field descriptions
+	NodeNamespace       = ffm("NamespaceStatus.namespace", "The namespace that this status applies to")
+	NamespaceStatusNode = ffm("NamespaceStatus.node", "Details of the local node")
+	NamespaceStatusOrg  = ffm("NamespaceStatus.org", "Details of the root organization identity registered for this namespace on the local node")
+	NamespacePlugins    = ffm("NamespaceStatus.plugins", "Information about plugins configured on this namespace")
+	NamespaceMultiparty = ffm("NamespaceStatus.multiparty", "Information about the multi-party system configured on this namespace")
 
-	// NodeStatusOrg field descriptions
-	NodeStatusOrgName       = ffm("NodeStatusOrg.name", "The name of the node operator organization, as specified in the local configuration")
-	NodeStatusOrgRegistered = ffm("NodeStatusOrg.registered", "Whether the organization has been successfully registered")
-	NodeStatusOrgDID        = ffm("NodeStatusOrg.did", "The DID of the organization identity, if registered")
-	NodeStatusOrgID         = ffm("NodeStatusOrg.id", "The UUID of the organization, if registered")
-	NodeStatusOrgVerifiers  = ffm("NodeStatusOrg.verifiers", "Array of verifiers (blockchain keys) owned by this identity")
+	// NamespaceStatusNode field descriptions
+	NamespaceStatusNodeName       = ffm("NamespaceStatusNode.name", "The name of this node, as specified in the local configuration")
+	NamespaceStatusNodeRegistered = ffm("NamespaceStatusNode.registered", "Whether the node has been successfully registered")
+	NamespaceStatusNodeID         = ffm("NamespaceStatusNode.id", "The UUID of the node, if registered")
 
-	// NodeStatusDefaults field descriptions
-	NodeStatusDefaultsNamespace = ffm("NodeStatusDefaults.namespace", "The default namespace on this node")
+	// NamespaceStatusOrg field descriptions
+	NamespaceStatusOrgName       = ffm("NamespaceStatusOrg.name", "The name of the node operator organization, as specified in the local configuration")
+	NamespaceStatusOrgRegistered = ffm("NamespaceStatusOrg.registered", "Whether the organization has been successfully registered")
+	NamespaceStatusOrgDID        = ffm("NamespaceStatusOrg.did", "The DID of the organization identity, if registered")
+	NamespaceStatusOrgID         = ffm("NamespaceStatusOrg.id", "The UUID of the organization, if registered")
+	NamespaceStatusOrgVerifiers  = ffm("NamespaceStatusOrg.verifiers", "Array of verifiers (blockchain keys) owned by this identity")
 
-	// NodeStatusPlugins field descriptions
-	NodeStatusPluginsBlockchain    = ffm("NodeStatusPlugins.blockchain", "The blockchain plugins on this node")
-	NodeStatusPluginsDatabase      = ffm("NodeStatusPlugins.database", "The database plugins on this node")
-	NodeStatusPluginsDataExchange  = ffm("NodeStatusPlugins.dataExchange", "The data exchange plugins on this node")
-	Events                         = ffm("NodeStatusPlugins.events", "The event plugins on this node")
-	NodeStatusPluginsIdentity      = ffm("NodeStatusPlugins.identity", "The identity plugins on this node")
-	NodeStatusPluginsSharedStorage = ffm("NodeStatusPlugins.sharedStorage", "The shared storage plugins on this node")
-	NodeStatusPluginsTokens        = ffm("NodeStatusPlugins.tokens", "The token plugins on this node")
+	// NamespaceStatusDefaults field descriptions
+	NamespaceStatusDefaultsNamespace = ffm("NamespaceStatusDefaults.namespace", "The default namespace on this node")
 
-	// NodeStatusPlugin field descriptions
-	NodeStatusPluginName = ffm("NodeStatusPlugin.name", "The name of the plugin")
-	NodeStatusPluginType = ffm("NodeStatusPlugin.pluginType", "The type of the plugin")
+	// NamespaceStatusPlugins field descriptions
+	NamespaceStatusPluginsBlockchain    = ffm("NamespaceStatusPlugins.blockchain", "The blockchain plugins on this namespace")
+	NamespaceStatusPluginsDatabase      = ffm("NamespaceStatusPlugins.database", "The database plugins on this namespace")
+	NamespaceStatusPluginsDataExchange  = ffm("NamespaceStatusPlugins.dataExchange", "The data exchange plugins on this namespace")
+	NamespacePluginsEvents              = ffm("NamespaceStatusPlugins.events", "The event plugins on this namespace")
+	NamespaceStatusPluginsIdentity      = ffm("NamespaceStatusPlugins.identity", "The identity plugins on this namespace")
+	NamespaceStatusPluginsSharedStorage = ffm("NamespaceStatusPlugins.sharedStorage", "The shared storage plugins on this namespace")
+	NamespaceStatusPluginsTokens        = ffm("NamespaceStatusPlugins.tokens", "The token plugins on this namespace")
+
+	// NamespaceStatusPlugin field descriptions
+	NamespaceStatusPluginName = ffm("NamespaceStatusPlugin.name", "The name of the plugin")
+	NamespaceStatusPluginType = ffm("NamespaceStatusPlugin.pluginType", "The type of the plugin")
+
+	// NamespaceStatusMultiparty field descriptions
+	NamespaceMultipartyEnabled  = ffm("NamespaceStatusMultiparty.enabled", "Whether multi-party mode is enabled for this namespace")
+	NamespaceMultipartyContract = ffm("NamespaceStatusMultiparty.contract", "Information about the multi-party smart contract configured for this namespace")
 
 	// BatchManagerStatus field descriptions
 	BatchManagerStatusProcessors = ffm("BatchManagerStatus.processors", "An array of currently active batch processors")
@@ -424,15 +477,25 @@ var (
 	BatchFlushStatusTotalErrors          = ffm("BatchFlushStatus.totalErrors", "The total count of error flushed encountered by this processor since it started")
 
 	// Pin field descriptions
-	PinSequence   = ffm("Pin.sequence", "The order of the pin in the local FireFly database, which matches the order in which pins were delivered to FireFly by the blockchain connector event stream")
-	PinMasked     = ffm("Pin.masked", "True if the pin is for a private message, and hence is masked with the group ID and salted with a nonce so observers of the blockchain cannot use pin hash to match this transaction to other transactions or participants")
-	PinHash       = ffm("Pin.hash", "The hash represents a topic within a message in the batch. If a message has multiple topics, then multiple pins are created. If the message is private, the hash is masked for privacy")
-	PinBatch      = ffm("Pin.batch", "The UUID of the batch of messages this pin is part of")
-	PinBatchHash  = ffm("Pin.batchHash", "The manifest hash batch of messages this pin is part of")
-	PinIndex      = ffm("Pin.index", "The index of this pin within the batch. One pin is created for each topic, of each message in the batch")
-	PinDispatched = ffm("Pin.dispatched", "Once true, this pin has been processed and will not be processed again")
-	PinSigner     = ffm("Pin.signer", "The blockchain signing key that submitted this transaction, as passed through to FireFly by the smart contract that emitted the blockchain event")
-	PinCreated    = ffm("Pin.created", "The time the FireFly node created the pin")
+	PinSequence       = ffm("Pin.sequence", "The order of the pin in the local FireFly database, which matches the order in which pins were delivered to FireFly by the blockchain connector event stream")
+	PinNamespace      = ffm("Pin.namespace", "The namespace of the pin")
+	PinMasked         = ffm("Pin.masked", "True if the pin is for a private message, and hence is masked with the group ID and salted with a nonce so observers of the blockchain cannot use pin hash to match this transaction to other transactions or participants")
+	PinHash           = ffm("Pin.hash", "The hash represents a topic within a message in the batch. If a message has multiple topics, then multiple pins are created. If the message is private, the hash is masked for privacy")
+	PinBatch          = ffm("Pin.batch", "The UUID of the batch of messages this pin is part of")
+	PinBatchHash      = ffm("Pin.batchHash", "The manifest hash batch of messages this pin is part of")
+	PinIndex          = ffm("Pin.index", "The index of this pin within the batch. One pin is created for each topic, of each message in the batch")
+	PinDispatched     = ffm("Pin.dispatched", "Once true, this pin has been processed and will not be processed again")
+	PinSigner         = ffm("Pin.signer", "The blockchain signing key that submitted this transaction, as passed through to FireFly by the smart contract that emitted the blockchain event")
+	PinCreated        = ffm("Pin.created", "The time the FireFly node created the pin")
+	PinRewindSequence = ffm("PinRewind.sequence", "The sequence of the pin to which the event aggregator should rewind. Either sequence or batch must be specified")
+	PinRewindBatch    = ffm("PinRewind.batch", "The ID of the batch to which the event aggregator should rewind. Either sequence or batch must be specified")
+
+	// NextPin field descriptions
+	NextPinNamespace = ffm("NextPin.namespace", "The namespace of the next-pin")
+	NextPinContext   = ffm("NextPin.context", "The context the next-pin applies to - the hash of the privacy group-hash + topic. The group-hash is only known to the participants (can itself contain a salt in the group-name). This context is combined with the member and nonce to determine the final hash that is written on-chain")
+	NextPinIdentity  = ffm("NextPin.identity", "The member of the privacy group the next-pin applies to")
+	NextPinHash      = ffm("NextPin.hash", "The unique masked pin string")
+	NextPinNonce     = ffm("NextPin.nonce", "The numeric index - which is monotonically increasing for each member of the privacy group")
 
 	// Subscription field descriptions
 	SubscriptionID        = ffm("Subscription.id", "The UUID of the subscription")
@@ -469,14 +532,13 @@ var (
 	SubscriptionBlockchainEventFilterListener = ffm("SubscriptionBlockchainEventFilter.listener", "Regular expression to apply to the blockchain event 'listener' field, which is the UUID of the event listener. So you can restrict your subscription to certain blockchain listeners. Alternatively to avoid your application need to know listener UUIDs you can set the 'topic' field of blockchain event listeners, and use a topic filter on your subscriptions")
 
 	// SubscriptionCoreOptions field descriptions
-	SubscriptionCoreOptionsFirstEvent = ffm("SubscriptionCoreOptions.firstEvent", "Whether your appplication would like to receive events from the 'oldest' event emitted by your FireFly node (from the beginning of time), or the 'newest' event (from now), or a specific event sequence. Default is 'newest'")
+	SubscriptionCoreOptionsFirstEvent = ffm("SubscriptionCoreOptions.firstEvent", "Whether your application would like to receive events from the 'oldest' event emitted by your FireFly node (from the beginning of time), or the 'newest' event (from now), or a specific event sequence. Default is 'newest'")
 	SubscriptionCoreOptionsReadAhead  = ffm("SubscriptionCoreOptions.readAhead", "The number of events to stream ahead to your application, while waiting for confirmation of consumption of those events. At least once delivery semantics are used in FireFly, so if your application crashes/reconnects this is the maximum number of events you would expect to be redelivered after it restarts")
 	SubscriptionCoreOptionsWithData   = ffm("SubscriptionCoreOptions.withData", "Whether message events delivered over the subscription, should be packaged with the full data of those messages in-line as part of the event JSON payload. Or if the application should make separate REST calls to download that data. May not be supported on some transports.")
 
 	// TokenApproval field descriptions
 	TokenApprovalLocalID         = ffm("TokenApproval.localId", "The UUID of this token approval, in the local FireFly node")
 	TokenApprovalPool            = ffm("TokenApproval.pool", "The UUID the token pool this approval applies to")
-	TokenApprovalTokenIndex      = ffm("TokenApproval.tokenIndex", "The index of the token within the pool that this approval applies to")
 	TokenApprovalConnector       = ffm("TokenApproval.connector", "The name of the token connector, as specified in the FireFly core configuration file. Required on input when there are more than one token connectors configured")
 	TokenApprovalKey             = ffm("TokenApproval.key", "The blockchain signing key for the approval request. On input defaults to the first signing key of the organization that operates the node")
 	TokenApprovalOperator        = ffm("TokenApproval.operator", "The blockchain identity that is granted the approval")
@@ -486,13 +548,17 @@ var (
 	TokenApprovalProtocolID      = ffm("TokenApproval.protocolId", "An alphanumerically sortable string that represents this event uniquely with respect to the blockchain")
 	TokenApprovalSubject         = ffm("TokenApproval.subject", "A string identifying the parties and entities in the scope of this approval, as provided by the token connector")
 	TokenApprovalActive          = ffm("TokenApproval.active", "Indicates if this approval is currently active (only one approval can be active per subject)")
+	TokenApprovalMessage         = ffm("TokenApproval.message", "The UUID of a message that has been correlated with this approval using the data field of the approval in a compatible token connector")
+	TokenApprovalMessageHash     = ffm("TokenApproval.messageHash", "The hash of a message that has been correlated with this approval using the data field of the approval in a compatible token connector")
 	TokenApprovalCreated         = ffm("TokenApproval.created", "The creation time of the token approval")
 	TokenApprovalTX              = ffm("TokenApproval.tx", "If submitted via FireFly, this will reference the UUID of the FireFly transaction (if the token connector in use supports attaching data)")
 	TokenApprovalBlockchainEvent = ffm("TokenApproval.blockchainEvent", "The UUID of the blockchain event")
 	TokenApprovalConfig          = ffm("TokenApproval.config", "Input only field, with token connector specific configuration of the approval.  See your chosen token connector documentation for details")
 
-	// TokenApprovalInputInput field descriptions
-	TokenApprovalInputInputPool = ffm("TokenApprovalInput.pool", "The name or UUID of a token pool. Required if more than one pool exists.")
+	// TokenApprovalInput field descriptions
+	TokenApprovalInputMessage        = ffm("TokenApprovalInput.message", "You can specify a message to correlate with the approval, which can be of type broadcast or private. Your chosen token connector and on-chain smart contract must support on-chain/off-chain correlation by taking a `data` input on the approval")
+	TokenApprovalInputPool           = ffm("TokenApprovalInput.pool", "The name or UUID of a token pool. Required if more than one pool exists.")
+	TokenApprovalInputIdempotencyKey = ffm("TokenApprovalInput.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
 
 	// TokenBalance field descriptions
 	TokenBalancePool       = ffm("TokenBalance.pool", "The UUID the token pool this balance entry applies to")
@@ -508,22 +574,28 @@ var (
 	TokenConnectorName = ffm("TokenConnector.name", "The name of the token connector, as configured in the FireFly core configuration file")
 
 	// TokenPool field descriptions
-	TokenPoolID        = ffm("TokenPool.id", "The UUID of the token pool")
-	TokenPoolType      = ffm("TokenPool.type", "The type of token the pool contains, such as fungible/non-fungible")
-	TokenPoolNamespace = ffm("TokenPool.namespace", "The namespace for the token pool")
-	TokenPoolName      = ffm("TokenPool.name", "The name of the token pool. Note the name is not validated against the description of the token on the blockchain")
-	TokenPoolStandard  = ffm("TokenPool.standard", "The ERC standard the token pool conforms to, as reported by the token connector")
-	TokenPoolLocator   = ffm("TokenPool.locator", "A unique identifier for the pool, as provided by the token connector")
-	TokenPoolKey       = ffm("TokenPool.key", "The signing key used to create the token pool. On input for token connectors that support on-chain deployment of new tokens (vs. only index existing ones) this determines the signing key used to create the token on-chain")
-	TokenPoolSymbol    = ffm("TokenPool.symbol", "The token symbol. If supplied on input for an existing on-chain token, this must match the on-chain information")
-	TokenPoolDecimals  = ffm("TokenPool.decimals", "Number of decimal places that this token has")
-	TokenPoolConnector = ffm("TokenPool.connector", "The name of the token connector, as specified in the FireFly core configuration file that is responsible for the token pool. Required on input when multiple token connectors are configured")
-	TokenPoolMessage   = ffm("TokenPool.message", "The UUID of the broadcast message used to inform the network to index this pool")
-	TokenPoolState     = ffm("TokenPool.state", "The current state of the token pool")
-	TokenPoolCreated   = ffm("TokenPool.created", "The creation time of the pool")
-	TokenPoolConfig    = ffm("TokenPool.config", "Input only field, with token connector specific configuration of the pool, such as an existing Ethereum address and block number to used to index the pool. See your chosen token connector documentation for details")
-	TokenPoolInfo      = ffm("TokenPool.info", "Token connector specific information about the pool. See your chosen token connector documentation for details")
-	TokenPoolTX        = ffm("TokenPool.tx", "Reference to the FireFly transaction used to create and broadcast this pool to the network")
+	TokenPoolID              = ffm("TokenPool.id", "The UUID of the token pool")
+	TokenPoolType            = ffm("TokenPool.type", "The type of token the pool contains, such as fungible/non-fungible")
+	TokenPoolNamespace       = ffm("TokenPool.namespace", "The namespace for the token pool")
+	TokenPoolName            = ffm("TokenPool.name", "The name of the token pool. Note the name is not validated against the description of the token on the blockchain")
+	TokenPoolStandard        = ffm("TokenPool.standard", "The ERC standard the token pool conforms to, as reported by the token connector")
+	TokenPoolLocator         = ffm("TokenPool.locator", "A unique identifier for the pool, as provided by the token connector")
+	TokenPoolKey             = ffm("TokenPool.key", "The signing key used to create the token pool. On input for token connectors that support on-chain deployment of new tokens (vs. only index existing ones) this determines the signing key used to create the token on-chain")
+	TokenPoolSymbol          = ffm("TokenPool.symbol", "The token symbol. If supplied on input for an existing on-chain token, this must match the on-chain information")
+	TokenPoolDecimals        = ffm("TokenPool.decimals", "Number of decimal places that this token has")
+	TokenPoolConnector       = ffm("TokenPool.connector", "The name of the token connector, as specified in the FireFly core configuration file that is responsible for the token pool. Required on input when multiple token connectors are configured")
+	TokenPoolMessage         = ffm("TokenPool.message", "The UUID of the broadcast message used to inform the network to index this pool")
+	TokenPoolState           = ffm("TokenPool.state", "The current state of the token pool")
+	TokenPoolCreated         = ffm("TokenPool.created", "The creation time of the pool")
+	TokenPoolConfig          = ffm("TokenPool.config", "Input only field, with token connector specific configuration of the pool, such as an existing Ethereum address and block number to used to index the pool. See your chosen token connector documentation for details")
+	TokenPoolInfo            = ffm("TokenPool.info", "Token connector specific information about the pool. See your chosen token connector documentation for details")
+	TokenPoolTX              = ffm("TokenPool.tx", "Reference to the FireFly transaction used to create and broadcast this pool to the network")
+	TokenPoolInterface       = ffm("TokenPool.interface", "A reference to an existing FFI, containing pre-registered type information for the token contract")
+	TokenPoolInterfaceFormat = ffm("TokenPool.interfaceFormat", "The interface encoding format supported by the connector for this token pool")
+	TokenPoolMethods         = ffm("TokenPool.methods", "The method definitions resolved by the token connector to be used by each token operation")
+
+	// TokenPoolInput field descriptions
+	TokenPoolInputIdempotencyKey = ffm("TokenPoolInput.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
 
 	// TokenTransfer field descriptions
 	TokenTransferType            = ffm("TokenTransfer.type", "The type of transfer such as mint/burn/transfer")
@@ -543,10 +615,12 @@ var (
 	TokenTransferCreated         = ffm("TokenTransfer.created", "The creation time of the transfer")
 	TokenTransferTX              = ffm("TokenTransfer.tx", "If submitted via FireFly, this will reference the UUID of the FireFly transaction (if the token connector in use supports attaching data)")
 	TokenTransferBlockchainEvent = ffm("TokenTransfer.blockchainEvent", "The UUID of the blockchain event")
+	TokenTransferConfig          = ffm("TokenTransfer.config", "Input only field, with token connector specific configuration of the transfer. See your chosen token connector documentation for details")
 
 	// TokenTransferInput field descriptions
-	TokenTransferInputMessage = ffm("TokenTransferInput.message", "You can specify a message to correlate with the transfer, which can be of type broadcast or private. Your chosen token connector and on-chain smart contract must support on-chain/off-chain correlation by taking a `data` input on the transfer")
-	TokenTransferInputPool    = ffm("TokenTransferInput.pool", "The name or UUID of a token pool")
+	TokenTransferInputMessage        = ffm("TokenTransferInput.message", "You can specify a message to correlate with the transfer, which can be of type broadcast or private. Your chosen token connector and on-chain smart contract must support on-chain/off-chain correlation by taking a `data` input on the transfer")
+	TokenTransferInputPool           = ffm("TokenTransferInput.pool", "The name or UUID of a token pool")
+	TokenTransferInputIdempotencyKey = ffm("TokenTransferInput.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
 
 	// TransactionStatus field descriptions
 	TransactionStatusStatus  = ffm("TransactionStatus.status", "The overall computed status of the transaction, after analyzing the details during the API call")
@@ -561,6 +635,15 @@ var (
 	TransactionStatusDetailsError     = ffm("TransactionStatusDetails.error", "If an error occurred related to the detail entry, it is included here")
 	TransactionStatusDetailsInfo      = ffm("TransactionStatusDetails.info", "Output details for this entry")
 
+	// ContractDeployRequest field descriptions
+	ContractDeployRequestKey            = ffm("ContractDeployRequest.key", "The blockchain signing key that will be used to deploy the contract. Defaults to the first signing key of the organization that operates the node")
+	ContractDeployRequestInput          = ffm("ContractDeployRequest.input", "An optional array of inputs passed to the smart contract's constructor, if applicable")
+	ContractDeployRequestDefinition     = ffm("ContractDeployRequest.definition", "The definition of the smart contract")
+	ContractDeployRequestContract       = ffm("ContractDeployRequest.contract", "The smart contract to deploy. This should be pre-compiled if required by the blockchain connector")
+	ContractDeployRequestErrors         = ffm("ContractDeployRequest.errors", "An in-line FFI errors definition for the constructor")
+	ContractDeployRequestOptions        = ffm("ContractDeployRequest.options", "A map of named inputs that will be passed through to the blockchain connector")
+	ContractDeployRequestIdempotencyKey = ffm("ContractDeployRequest.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
+
 	// ContractCallRequest field descriptions
 	ContractCallRequestType       = ffm("ContractCallRequest.type", "Invocations cause transactions on the blockchain. Whereas queries simply execute logic in your local node to query data at a given current/historical block")
 	ContractCallRequestInterface  = ffm("ContractCallRequest.interface", "The UUID of a method within a pre-configured FireFly interface (FFI) definition for a smart contract. Required if the 'method' is omitted. Also see Contract APIs as a way to configure a dedicated API for your FFI, including all methods and an OpenAPI/Swagger interface")
@@ -568,7 +651,11 @@ var (
 	ContractCallRequestKey        = ffm("ContractCallRequest.key", "The blockchain signing key that will sign the invocation. Defaults to the first signing key of the organization that operates the node")
 	ContractCallRequestMethod     = ffm("ContractCallRequest.method", "An in-line FFI method definition for the method to invoke. Required when FFI is not specified")
 	ContractCallRequestMethodPath = ffm("ContractCallRequest.methodPath", "The pathname of the method on the specified FFI")
+	ContractCallRequestErrors     = ffm("ContractCallRequest.errors", "An in-line FFI errors definition for the method to invoke. Alternative to specifying FFI")
 	ContractCallRequestInput      = ffm("ContractCallRequest.input", "A map of named inputs. The name and type of each input must be compatible with the FFI description of the method, so that FireFly knows how to serialize it to the blockchain via the connector")
+	ContractCallRequestOptions    = ffm("ContractCallRequest.options", "A map of named inputs that will be passed through to the blockchain connector")
+	ContractCallMessage           = ffm("ContractCallRequest.message", "You can specify a message to correlate with the invocation, which can be of type broadcast or private. Your specified method must support on-chain/off-chain correlation by taking a data input on the call")
+	ContractCallIdempotencyKey    = ffm("ContractCallRequest.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
 
 	// WebSocketStatus field descriptions
 	WebSocketStatusEnabled     = ffm("WebSocketStatus.enabled", "Indicates whether the websockets plugin is enabled")
@@ -584,4 +671,23 @@ var (
 	WSSubscriptionStatusEphemeral = ffm("WSSubscriptionStatus.ephemeral", "Indicates whether the subscription is ephemeral (vs durable)")
 	WSSubscriptionStatusNamespace = ffm("WSSubscriptionStatus.namespace", "The subscription namespace")
 	WSSubscriptionStatusName      = ffm("WSSubscriptionStatus.name", "The subscription name (for durable subscriptions only)")
+
+	WebhooksOptJSON         = ffm("WebhookSubOptions.json", "Webhooks only: Whether to assume the response body is JSON, regardless of the returned Content-Type")
+	WebhooksOptReply        = ffm("WebhookSubOptions.reply", "Webhooks only: Whether to automatically send a reply event, using the body returned by the webhook")
+	WebhooksOptHeaders      = ffm("WebhookSubOptions.headers", "Webhooks only: Static headers to set on the webhook request")
+	WebhooksOptQuery        = ffm("WebhookSubOptions.query", "Webhooks only: Static query params to set on the webhook request")
+	WebhooksOptInput        = ffm("WebhookSubOptions.input", "Webhooks only: A set of options to extract data from the first JSON input data in the incoming message. Only applies if withData=true")
+	WebhooksOptFastAck      = ffm("WebhookSubOptions.fastack", "Webhooks only: When true the event will be acknowledged before the webhook is invoked, allowing parallel invocations")
+	WebhooksOptURL          = ffm("WebhookSubOptions.url", "Webhooks only: HTTP url to invoke. Can be relative if a base URL is set in the webhook plugin config")
+	WebhooksOptMethod       = ffm("WebhookSubOptions.method", "Webhooks only: HTTP method to invoke. Default=POST")
+	WebhooksOptReplyTag     = ffm("WebhookSubOptions.replytag", "Webhooks only: The tag to set on the reply message")
+	WebhooksOptReplyTx      = ffm("WebhookSubOptions.replytx", "Webhooks only: The transaction type to set on the reply message")
+	WebhooksOptInputQuery   = ffm("WebhookInputOptions.query", "A top-level property of the first data input, to use for query parameters")
+	WebhooksOptInputHeaders = ffm("WebhookInputOptions.headers", "A top-level property of the first data input, to use for headers")
+	WebhooksOptInputBody    = ffm("WebhookInputOptions.body", "A top-level property of the first data input, to use for the request body. Default is the whole first body")
+	WebhooksOptInputPath    = ffm("WebhookInputOptions.path", "A top-level property of the first data input, to use for a path to append with escaping to the webhook path")
+	WebhooksOptInputReplyTx = ffm("WebhookInputOptions.replytx", "A top-level property of the first data input, to use to dynamically set whether to pin the response (so the requester can choose)")
+
+	// PublishInput field descriptions
+	PublishInputIdempotencyKey = ffm("PublishInput.idempotencyKey", "An optional identifier to allow idempotent submission of requests. Stored on the transaction uniquely within a namespace")
 )
